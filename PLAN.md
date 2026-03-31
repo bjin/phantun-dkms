@@ -29,38 +29,38 @@
 
 ## Phase 2 - packet helpers
 
-- [ ] Add IPv4/TCP/UDP parsing helpers for skb-backed packets
-- [ ] Add fake-TCP packet builders for:
-  - [ ] `SYN`
-  - [ ] `SYN|ACK`
-  - [ ] `ACK`
-  - [ ] `ACK + payload`
-  - [ ] `RST`
-  - [ ] `RST|ACK`
-- [ ] Add checksum helpers for synthesized IPv4/TCP/UDP packets
-- [ ] Add helpers to copy payload bytes safely out of skb data
-- [ ] Add helpers to synthesize and transmit:
-  - [ ] outbound fake-TCP skb via local output path
-  - [ ] decapsulated UDP skb via local receive path
+- [x] Add IPv4/TCP/UDP parsing helpers for skb-backed packets
+- [x] Add fake-TCP packet builders for:
+  - [x] `SYN`
+  - [x] `SYN|ACK`
+  - [x] `ACK`
+  - [x] `ACK + payload`
+  - [x] `RST`
+  - [x] `RST|ACK`
+- [x] Add checksum helpers for synthesized IPv4/TCP/UDP packets
+- [x] Add helpers to copy payload bytes safely out of skb data
+- [x] Add helpers to synthesize and transmit:
+  - [x] outbound fake-TCP skb via local output path
+  - [x] decapsulated UDP skb via local receive path
 
 ## Phase 3 - flow table and timers
 
-- [ ] Define the canonical flow key and oriented endpoint fields
-- [ ] Define the per-flow object:
-  - [ ] role
-  - [ ] state
-  - [ ] seq / ack / last_ack
-  - [ ] queued skb pointer
-  - [ ] handshake verification flags
-  - [ ] retry / timeout bookkeeping
-  - [ ] last activity timestamp
-- [ ] Choose locking/refcount strategy
-  - [ ] one global table lock vs hashed buckets
-  - [ ] per-flow spinlock
-  - [ ] refcounted lifetime
-- [ ] Add lookup/create/delete helpers
-- [ ] Add idle GC timer/work
-- [ ] Add retransmit timer logic for half-open flows
+- [x] Define the canonical flow key and oriented endpoint fields
+- [x] Define the per-flow object:
+  - [x] role
+  - [x] state
+  - [x] seq / ack / last_ack
+  - [x] queued skb pointer
+  - [x] handshake verification flags
+  - [x] retry / timeout bookkeeping
+  - [x] last activity timestamp
+- [x] Choose locking/refcount strategy
+  - [x] one global table lock vs hashed buckets
+  - [x] per-flow spinlock
+  - [x] refcounted lifetime
+- [x] Add lookup/create/delete helpers
+- [x] Add idle GC timer/work
+- [x] Add retransmit timer logic for half-open flows
 
 ## Phase 4 - initiator path
 

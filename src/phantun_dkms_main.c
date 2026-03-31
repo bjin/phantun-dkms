@@ -9,6 +9,7 @@
 #include <linux/string.h>
 
 #include "phantun_dkms.h"
+#include "phantun_dkms_flow.h"
 
 static unsigned short managed_ports[PHANTUN_DKMS_MAX_MANAGED_PORTS];
 static int managed_ports_count;
@@ -48,6 +49,7 @@ MODULE_PARM_DESC(remote_port,
 	"Optional remote UDP/TCP port filter; 0 disables the filter");
 
 static struct phantun_dkms_config phantun_cfg;
+static struct pht_flow_table phantun_flows;
 
 static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
 				      const struct nf_hook_state *state)
@@ -160,10 +162,17 @@ static int __init phantun_init(void)
 	phantun_snapshot_config();
 	phantun_log_config();
 
+	ret = pht_flow_table_init(&phantun_flows, &phantun_cfg);
+	if (ret) {
+		pht_pr_err("failed to initialize flow table: %d\n", ret);
+		return ret;
+	}
+
 	ret = nf_register_net_hooks(&init_net, phantun_nf_ops,
 				    ARRAY_SIZE(phantun_nf_ops));
 	if (ret) {
 		pht_pr_err("failed to register netfilter hooks: %d\n", ret);
+		pht_flow_table_destroy(&phantun_flows);
 		return ret;
 	}
 
@@ -175,6 +184,7 @@ static void __exit phantun_exit(void)
 {
 	nf_unregister_net_hooks(&init_net, phantun_nf_ops,
 				 ARRAY_SIZE(phantun_nf_ops));
+	pht_flow_table_destroy(&phantun_flows);
 	pht_pr_info("unregistered netfilter hooks\n");
 }
 
