@@ -2,30 +2,30 @@
 
 ## Phase 0 - freeze the v1 contract
 
-- [ ] Confirm v1 scope is exactly:
-  - [ ] IPv4 only
-  - [ ] kernel module only
-  - [ ] symmetric initiator/responder flows
-  - [ ] mandatory `handshake_request` / `handshake_response`
-  - [ ] one queued UDP skb per half-open flow
-  - [ ] no userspace-Phantun compatibility promise
-- [ ] Convert the design assumptions into module constants / config knobs:
-  - [ ] managed local ports
-  - [ ] handshake request bytes
-  - [ ] handshake response bytes
-  - [ ] handshake timeout and retry count
-  - [ ] idle timeout
-  - [ ] optional remote IPv4 / remote port filters
+- [x] Confirm v1 scope is exactly:
+  - [x] IPv4 only
+  - [x] kernel module only
+  - [x] symmetric initiator/responder flows
+  - [x] mandatory `handshake_request` / `handshake_response`
+  - [x] one queued UDP skb per half-open flow
+  - [x] no userspace-Phantun compatibility promise
+- [x] Convert the design assumptions into module constants / config knobs:
+  - [x] managed local ports
+  - [x] handshake request bytes
+  - [x] handshake response bytes
+  - [x] handshake timeout and retry count
+  - [x] idle timeout
+  - [x] optional remote IPv4 / remote port filters
 
 ## Phase 1 - repository and build skeleton
 
-- [ ] Add DKMS-friendly kernel module layout
-- [ ] Add `Kbuild` / Makefile pieces for out-of-tree builds
-- [ ] Add a minimal module init/exit path
-- [ ] Register/unregister the two netfilter hooks:
-  - [ ] `NF_INET_LOCAL_OUT` for outbound UDP capture
-  - [ ] `NF_INET_PRE_ROUTING` for inbound fake-TCP capture
-- [ ] Add structured logging macros and a module name prefix
+- [x] Add DKMS-friendly kernel module layout
+- [x] Add `Kbuild` / Makefile pieces for out-of-tree builds
+- [x] Add a minimal module init/exit path
+- [x] Register/unregister the two netfilter hooks:
+  - [x] `NF_INET_LOCAL_OUT` for outbound UDP capture
+  - [x] `NF_INET_PRE_ROUTING` for inbound fake-TCP capture
+- [x] Add structured logging macros and a module name prefix
 
 ## Phase 2 - packet helpers
 
