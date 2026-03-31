@@ -32,6 +32,67 @@ static void pht_flow_free(struct pht_flow *flow)
 	kfree(flow);
 }
 
+static int pht_flow_send_local_rst(struct pht_flow *flow)
+{
+	if (!flow || !flow->table || !flow->table->net)
+		return -EINVAL;
+
+
+	return pht_emit_fake_tcp_v4(flow->table->net, &flow->oriented, flow->seq, 0,
+				 PHT_TCP_FLAG_RST, NULL, 0);
+}
+
+static int pht_flow_retransmit_now(struct pht_flow *flow)
+{
+	const struct phantun_dkms_config *cfg;
+	struct pht_ipv4_endpoint_pair ep;
+	u32 seq;
+	u32 ack;
+	enum pht_flow_state state;
+	size_t len = 0;
+	const char *payload = NULL;
+	u8 flags = 0;
+
+
+	if (!flow || !flow->table || !flow->table->net || !flow->table->cfg)
+		return -EINVAL;
+
+
+	cfg = flow->table->cfg;
+	spin_lock_bh(&flow->lock);
+	state = flow->state;
+	ep = flow->oriented;
+	seq = flow->seq;
+	ack = flow->ack;
+	if (state == PHT_FLOW_STATE_SYN_SENT) {
+		seq = flow->local_isn;
+		ack = 0;
+		flags = PHT_TCP_FLAG_SYN;
+	} else if (state == PHT_FLOW_STATE_SYN_RCVD ||
+		   state == PHT_FLOW_STATE_AWAIT_HS_REQ) {
+		seq = flow->local_isn;
+		ack = flow->peer_syn_next;
+		flags = PHT_TCP_FLAG_SYN | PHT_TCP_FLAG_ACK;
+	} else if (state == PHT_FLOW_STATE_HS_REQ_SENT) {
+		payload = cfg->handshake_request;
+		len = cfg->handshake_request_len;
+		seq = flow->local_isn + 1;
+		flags = PHT_TCP_FLAG_ACK;
+	} else if (state == PHT_FLOW_STATE_HS_RESP_SENT) {
+		payload = cfg->handshake_response;
+		len = cfg->handshake_response_len;
+		seq = flow->local_isn + 1;
+		flags = PHT_TCP_FLAG_ACK;
+	}
+	spin_unlock_bh(&flow->lock);
+
+
+	if (!flags)
+		return 0;
+
+	return pht_emit_fake_tcp_v4(flow->table->net, &ep, seq, ack, flags, payload, len);
+}
+
 static void pht_flow_timeout_work(struct work_struct *work);
 static void pht_flow_gc_worker(struct work_struct *work);
 
@@ -48,6 +109,7 @@ static void pht_flow_retransmit_timer(struct timer_list *timer)
 		return;
 	}
 
+
 	if (flow->retries_done >= flow->max_retries) {
 		flow->state = PHT_FLOW_STATE_DEAD;
 		expire = true;
@@ -56,11 +118,15 @@ static void pht_flow_retransmit_timer(struct timer_list *timer)
 		return;
 	}
 
+
 	flow->retries_done++;
 	next = jiffies + flow->table->handshake_timeout_jiffies;
 	flow->retransmit_at_jiffies = next;
 	spin_unlock_bh(&flow->lock);
 
+
+	if (pht_flow_retransmit_now(flow))
+		pht_pr_warn("failed to retransmit half-open flow packet\n");
 	pht_pr_debug("half-open flow retry %u/%u scheduled\n",
 		     flow->retries_done, flow->max_retries);
 	if (!expire)
@@ -114,7 +180,7 @@ bool pht_flow_state_is_half_open(enum pht_flow_state state)
 	}
 }
 
-int pht_flow_table_init(struct pht_flow_table *table,
+int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
 		const struct phantun_dkms_config *cfg)
 {
 	unsigned int i;
@@ -134,6 +200,8 @@ int pht_flow_table_init(struct pht_flow_table *table,
 	table->gc_interval_jiffies =
 		msecs_to_jiffies(PHT_FLOW_GC_INTERVAL_SEC * 1000U);
 	table->handshake_retries = cfg->handshake_retries;
+	table->net = net;
+	table->cfg = cfg;
 	INIT_DELAYED_WORK(&table->gc_work, pht_flow_gc_worker);
 	schedule_delayed_work(&table->gc_work, table->gc_interval_jiffies);
 	return 0;
@@ -211,6 +279,7 @@ static void pht_flow_gc_worker(struct work_struct *work)
 	pht_flow_gc_detach_expired(table, &expired);
 	list_for_each_entry_safe(flow, tmp, &expired, gc_node) {
 		list_del_init(&flow->gc_node);
+		pht_flow_send_local_rst(flow);
 		timer_delete_sync(&flow->retransmit_timer);
 		cancel_work_sync(&flow->timeout_work);
 		pht_flow_put(flow);
@@ -233,6 +302,7 @@ void pht_flow_table_destroy(struct pht_flow_table *table)
 
 	list_for_each_entry_safe(flow, tmp, &expired, gc_node) {
 		list_del_init(&flow->gc_node);
+		pht_flow_send_local_rst(flow);
 		timer_delete_sync(&flow->retransmit_timer);
 		cancel_work_sync(&flow->timeout_work);
 		pht_flow_put(flow);
@@ -496,5 +566,7 @@ static void pht_flow_timeout_work(struct work_struct *work)
 {
 	struct pht_flow *flow = container_of(work, struct pht_flow, timeout_work);
 
+
+	pht_flow_send_local_rst(flow);
 	__pht_flow_remove(flow, true);
 }

@@ -41,6 +41,7 @@ struct pht_flow_key {
 	__be16 high_port;
 };
 
+struct net;
 struct pht_flow_table;
 
 struct pht_flow {
@@ -81,6 +82,8 @@ struct pht_flow_table {
 	unsigned long handshake_timeout_jiffies;
 	unsigned long gc_interval_jiffies;
 	unsigned int handshake_retries;
+	struct net *net;
+	const struct phantun_dkms_config *cfg;
 };
 
 bool pht_flow_key_equal(const struct pht_flow_key *a,
@@ -90,7 +93,7 @@ void pht_flow_key_from_endpoints(struct pht_flow_key *key,
 			 bool *local_is_low);
 bool pht_flow_state_is_half_open(enum pht_flow_state state);
 
-int pht_flow_table_init(struct pht_flow_table *table,
+int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
 		const struct phantun_dkms_config *cfg);
 void pht_flow_table_destroy(struct pht_flow_table *table);
 

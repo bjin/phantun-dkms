@@ -25,6 +25,8 @@ struct phantun_dkms_config {
 	unsigned int managed_ports_count;
 	const char *handshake_request;
 	const char *handshake_response;
+	unsigned int handshake_request_len;
+	unsigned int handshake_response_len;
 	unsigned int handshake_timeout_ms;
 	unsigned int handshake_retries;
 	unsigned int idle_timeout_sec;

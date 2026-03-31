@@ -94,47 +94,47 @@
 
 ## Phase 6 - mandatory control payload handshake
 
-- [ ] Implement initiator `HS_REQ_SENT`
-  - [ ] after valid `SYN|ACK`, send `ACK + handshake_request`
-  - [ ] retransmit on timeout if needed
-  - [ ] resend `ACK + handshake_request` if a duplicate valid `SYN|ACK` arrives before response verification
-- [ ] Implement responder request verification
-  - [ ] exact length match
-  - [ ] exact byte-for-byte match
-  - [ ] mismatch => `RST` + destroy flow
-- [ ] Implement responder post-response state (`HS_RESP_SENT`)
-  - [ ] send `ACK + handshake_response`
-  - [ ] resend the same control response on duplicate exact `handshake_request`
-  - [ ] wait for later initiator traffic to acknowledge the response before flushing responder-owned queued UDP
-- [ ] Implement initiator response verification
-  - [ ] exact length match
-  - [ ] exact byte-for-byte match
-  - [ ] mismatch => `RST` + destroy flow
-- [ ] Ensure control payloads are consumed internally and never delivered to UDP sockets
-- [ ] Flush the initiator-owned queued UDP skb only after initiator response verification succeeds
-- [ ] Define the responder-owned queued UDP release/drop rule explicitly
-  - [ ] flush only after later initiator traffic acknowledges `handshake_response`
-  - [ ] drop on teardown or handshake timeout
+- [x] Implement initiator `HS_REQ_SENT`
+  - [x] after valid `SYN|ACK`, send `ACK + handshake_request`
+  - [x] retransmit on timeout if needed
+  - [x] resend `ACK + handshake_request` if a duplicate valid `SYN|ACK` arrives before response verification
+- [x] Implement responder request verification
+  - [x] exact length match
+  - [x] exact byte-for-byte match
+  - [x] mismatch => `RST` + destroy flow
+- [x] Implement responder post-response state (`HS_RESP_SENT`)
+  - [x] send `ACK + handshake_response`
+  - [x] resend the same control response on duplicate exact `handshake_request`
+  - [x] wait for later initiator traffic to acknowledge the response before flushing responder-owned queued UDP
+- [x] Implement initiator response verification
+  - [x] exact length match
+  - [x] exact byte-for-byte match
+  - [x] mismatch => `RST` + destroy flow
+- [x] Ensure control payloads are consumed internally and never delivered to UDP sockets
+- [x] Flush the initiator-owned queued UDP skb only after initiator response verification succeeds
+- [x] Define the responder-owned queued UDP release/drop rule explicitly
+  - [x] flush only after later initiator traffic acknowledges `handshake_response`
+  - [x] drop on teardown or handshake timeout
 
 ## Phase 7 - symmetric conflict resolution
 
-- [ ] Handle duplicate local-initiation attempts cleanly
-- [ ] Detect inbound bare `SYN` while local flow is `SYN_SENT`
-- [ ] Implement deterministic tie-break rule
-  - [ ] lower `(ip, port)` endpoint keeps initiator role
-  - [ ] higher endpoint tears down local half-open flow and becomes responder
-- [ ] Re-home the queued UDP skb when the local side loses the initiator race
-- [ ] Apply the responder-owned queued UDP release/drop rule after tie-loss handover
-- [ ] Add clear logging for collision decisions
+- [x] Handle duplicate local-initiation attempts cleanly
+- [x] Detect inbound bare `SYN` while local flow is `SYN_SENT`
+- [x] Implement deterministic tie-break rule
+  - [x] lower `(ip, port)` endpoint keeps initiator role
+  - [x] higher endpoint tears down local half-open flow and becomes responder
+- [x] Re-home the queued UDP skb when the local side loses the initiator race
+- [x] Apply the responder-owned queued UDP release/drop rule after tie-loss handover
+- [x] Add clear logging for collision decisions
 
 ## Phase 8 - established data path
 
-- [ ] Translate outbound UDP -> fake-TCP `ACK + payload`
-- [ ] Translate inbound fake-TCP payload -> local UDP reinjection
-- [ ] Keep seq/ack accounting identical to `fake-tcp`
-- [ ] Send idle ACKs only if still needed after the new in-kernel flow model is complete
-- [ ] Destroy flows on peer `RST`
-- [ ] Send local `RST` on teardown / timeout / validation failure
+- [x] Translate outbound UDP -> fake-TCP `ACK + payload`
+- [x] Translate inbound fake-TCP payload -> local UDP reinjection
+- [x] Keep seq/ack accounting identical to `fake-tcp`
+- [x] Send idle ACKs only if still needed after the new in-kernel flow model is complete
+- [x] Destroy flows on peer `RST`
+- [x] Send local `RST` on teardown / timeout / validation failure
 
 ## Phase 9 - policy and configuration surface
 
@@ -160,6 +160,8 @@
 - [ ] Add a debug dump path for active flows
 - [ ] Make teardown paths idempotent
 - [ ] Audit all skb allocations and frees
+- [ ] Re-audit atomic hook paths for no-sleep behavior and cached hot-path config use
+
 
 ## Phase 11 - testing
 
