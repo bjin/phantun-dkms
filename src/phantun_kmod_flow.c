@@ -5,7 +5,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
-#include "phantun_dkms_flow.h"
+#include "phantun_kmod_flow.h"
 
 static u32 pht_flow_hash_key(const struct pht_flow_key *key)
 {
@@ -44,7 +44,7 @@ static int pht_flow_send_local_rst(struct pht_flow *flow)
 
 static int pht_flow_retransmit_now(struct pht_flow *flow)
 {
-	const struct phantun_dkms_config *cfg;
+	const struct phantun_kmod_config *cfg;
 	struct pht_ipv4_endpoint_pair ep;
 	u32 seq;
 	u32 ack;
@@ -181,7 +181,7 @@ bool pht_flow_state_is_half_open(enum pht_flow_state state)
 }
 
 int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
-		const struct phantun_dkms_config *cfg)
+		const struct phantun_kmod_config *cfg)
 {
 	unsigned int i;
 

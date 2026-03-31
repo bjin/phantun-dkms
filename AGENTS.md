@@ -3,9 +3,9 @@
 This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kernel so UDP apps (especially WireGuard / wireguard-go) can use fake TCP without a TUN device.
 
 ## Layout
-- `src/phantun_dkms_main.c`: module entry, config, netfilter hooks, protocol state machine
-- `src/phantun_dkms_packet.[ch]`: IPv4/TCP/UDP parsing, packet build, checksum, tx/reinject helpers
-- `src/phantun_dkms_flow.[ch]`: flow table, timers, retries, queued skb handling
+- `src/phantun_kmod_main.c`: module entry, config, netfilter hooks, protocol state machine
+- `src/phantun_kmod_packet.[ch]`: IPv4/TCP/UDP parsing, packet build, checksum, tx/reinject helpers
+- `src/phantun_kmod_flow.[ch]`: flow table, timers, retries, queued skb handling
 - `Kbuild`, `Makefile`, `dkms.conf`: external module build / DKMS
 - `DESIGN.md`: protocol/design notes
 - `PLAN.md`: implementation checklist

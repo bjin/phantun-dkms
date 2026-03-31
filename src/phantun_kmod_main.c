@@ -10,25 +10,25 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
-#include "phantun_dkms.h"
-#include "phantun_dkms_flow.h"
-#include "phantun_dkms_packet.h"
+#include "phantun_kmod.h"
+#include "phantun_kmod_flow.h"
+#include "phantun_kmod_packet.h"
 
-static unsigned short managed_ports[PHANTUN_DKMS_MAX_MANAGED_PORTS];
+static unsigned short managed_ports[PHANTUN_KMOD_MAX_MANAGED_PORTS];
 static int managed_ports_count;
 static char *handshake_request;
 static char *handshake_response;
 static unsigned int handshake_timeout_ms =
-	PHANTUN_DKMS_DEFAULT_HANDSHAKE_TIMEOUT_MS;
-static unsigned int handshake_retries = PHANTUN_DKMS_DEFAULT_HANDSHAKE_RETRIES;
-static unsigned int idle_timeout_sec = PHANTUN_DKMS_DEFAULT_IDLE_TIMEOUT_SEC;
+	PHANTUN_KMOD_DEFAULT_HANDSHAKE_TIMEOUT_MS;
+static unsigned int handshake_retries = PHANTUN_KMOD_DEFAULT_HANDSHAKE_RETRIES;
+static unsigned int idle_timeout_sec = PHANTUN_KMOD_DEFAULT_IDLE_TIMEOUT_SEC;
 static char *remote_ipv4_cidr;
 static unsigned short remote_port;
 
 module_param_array_named(managed_ports, managed_ports, ushort,
 	&managed_ports_count, 0644);
 MODULE_PARM_DESC(managed_ports,
-	"Comma-separated local UDP/TCP ports managed by phantun_dkms");
+	"Comma-separated local UDP/TCP ports managed by phantun_kmod");
 module_param(handshake_request, charp, 0644);
 MODULE_PARM_DESC(handshake_request,
 	"Mandatory initiator control payload sent as the first fake-TCP payload");
@@ -51,7 +51,7 @@ module_param(remote_port, ushort, 0644);
 MODULE_PARM_DESC(remote_port,
 	"Optional remote UDP/TCP port filter; 0 disables the filter");
 
-static struct phantun_dkms_config phantun_cfg;
+static struct phantun_kmod_config phantun_cfg;
 static struct pht_flow_table phantun_flows;
 
 static bool phantun_managed_port(__be16 port)
@@ -915,13 +915,13 @@ static struct nf_hook_ops phantun_nf_ops[] = {
 		.hook = phantun_local_out,
 		.pf = NFPROTO_IPV4,
 		.hooknum = NF_INET_LOCAL_OUT,
-		.priority = PHANTUN_DKMS_CAPTURE_PRIORITY,
+		.priority = PHANTUN_KMOD_CAPTURE_PRIORITY,
 	},
 	{
 		.hook = phantun_pre_routing,
 		.pf = NFPROTO_IPV4,
 		.hooknum = NF_INET_PRE_ROUTING,
-		.priority = PHANTUN_DKMS_CAPTURE_PRIORITY,
+		.priority = PHANTUN_KMOD_CAPTURE_PRIORITY,
 	},
 };
 

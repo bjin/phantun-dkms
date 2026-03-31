@@ -1,5 +1,5 @@
-#ifndef PHANTUN_DKMS_FLOW_H
-#define PHANTUN_DKMS_FLOW_H
+#ifndef PHANTUN_KMOD_FLOW_H
+#define PHANTUN_KMOD_FLOW_H
 
 #include <linux/jiffies.h>
 #include <linux/list.h>
@@ -10,8 +10,8 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
-#include "phantun_dkms.h"
-#include "phantun_dkms_packet.h"
+#include "phantun_kmod.h"
+#include "phantun_kmod_packet.h"
 
 #define PHT_FLOW_BUCKETS 256U
 #define PHT_FLOW_GC_INTERVAL_SEC 30U
@@ -83,7 +83,7 @@ struct pht_flow_table {
 	unsigned long gc_interval_jiffies;
 	unsigned int handshake_retries;
 	struct net *net;
-	const struct phantun_dkms_config *cfg;
+	const struct phantun_kmod_config *cfg;
 };
 
 bool pht_flow_key_equal(const struct pht_flow_key *a,
@@ -94,7 +94,7 @@ void pht_flow_key_from_endpoints(struct pht_flow_key *key,
 bool pht_flow_state_is_half_open(enum pht_flow_state state);
 
 int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
-		const struct phantun_dkms_config *cfg);
+		const struct phantun_kmod_config *cfg);
 void pht_flow_table_destroy(struct pht_flow_table *table);
 
 struct pht_flow *pht_flow_lookup(struct pht_flow_table *table,

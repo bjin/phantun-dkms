@@ -1,5 +1,5 @@
-#ifndef PHANTUN_DKMS_PACKET_H
-#define PHANTUN_DKMS_PACKET_H
+#ifndef PHANTUN_KMOD_PACKET_H
+#define PHANTUN_KMOD_PACKET_H
 
 #include <linux/ip.h>
 #include <linux/netdevice.h>
