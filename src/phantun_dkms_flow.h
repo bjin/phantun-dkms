@@ -58,6 +58,8 @@ struct pht_flow {
 	u32 seq;
 	u32 ack;
 	u32 last_ack;
+	u32 local_isn;
+	u32 peer_syn_next;
 	struct sk_buff *queued_skb;
 	u8 handshake_flags;
 	unsigned int retries_done;
@@ -106,6 +108,7 @@ void pht_flow_remove(struct pht_flow *flow);
 void pht_flow_get(struct pht_flow *flow);
 void pht_flow_put(struct pht_flow *flow);
 void pht_flow_touch(struct pht_flow *flow);
+bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb);
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb);
 struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow);
 void pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state);

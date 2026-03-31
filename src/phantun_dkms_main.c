@@ -6,10 +6,13 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/net_namespace.h>
 #include <linux/skbuff.h>
+#include <linux/random.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 
 #include "phantun_dkms.h"
 #include "phantun_dkms_flow.h"
+#include "phantun_dkms_packet.h"
 
 static unsigned short managed_ports[PHANTUN_DKMS_MAX_MANAGED_PORTS];
 static int managed_ports_count;
@@ -51,16 +54,496 @@ MODULE_PARM_DESC(remote_port,
 static struct phantun_dkms_config phantun_cfg;
 static struct pht_flow_table phantun_flows;
 
+static bool phantun_managed_port(__be16 port)
+{
+	unsigned int i;
+
+
+	for (i = 0; i < phantun_cfg.managed_ports_count; i++) {
+		if (phantun_cfg.managed_ports[i] == ntohs(port))
+			return true;
+	}
+
+
+	return false;
+}
+
+static bool phantun_remote_port_allowed(__be16 port)
+{
+	return !phantun_cfg.remote_port || ntohs(port) == phantun_cfg.remote_port;
+}
+
+static void phantun_fill_udp_endpoint_pair(const struct pht_l4_view *view,
+				       struct pht_ipv4_endpoint_pair *ep)
+{
+	ep->local_addr = view->iph->saddr;
+	ep->remote_addr = view->iph->daddr;
+	ep->local_port = view->udp->source;
+	ep->remote_port = view->udp->dest;
+}
+
+static void phantun_fill_tcp_endpoint_pair(const struct pht_l4_view *view,
+				       struct pht_ipv4_endpoint_pair *ep)
+{
+	ep->local_addr = view->iph->daddr;
+	ep->remote_addr = view->iph->saddr;
+	ep->local_port = view->tcp->dest;
+	ep->remote_port = view->tcp->source;
+}
+
+static u32 phantun_random_aligned_seq(void)
+{
+	return (get_random_u32() / 4095U) * 4095U;
+}
+
+static u32 phantun_tcp_seq_advance(const struct tcphdr *th, unsigned int payload_len)
+{
+	u32 advance = payload_len;
+
+	if (th->syn)
+		advance++;
+	if (th->fin)
+		advance++;
+
+	return advance;
+}
+
+static bool phantun_payload_matches(const struct sk_buff *skb,
+				   const struct pht_l4_view *view,
+				   const char *expected)
+{
+	void *payload;
+	bool match;
+	size_t expected_len;
+	int ret;
+
+	if (!expected)
+		return false;
+
+	expected_len = strlen(expected);
+	if (view->payload_len != expected_len)
+		return false;
+	if (!expected_len)
+		return true;
+
+	payload = kmalloc(expected_len, GFP_ATOMIC);
+	if (!payload)
+		return false;
+
+	ret = pht_copy_l4_payload(skb, view, payload, expected_len);
+	match = !ret && !memcmp(payload, expected, expected_len);
+	kfree(payload);
+	return match;
+}
+
+static int phantun_send_established_udp(struct pht_flow *flow,
+			      const struct pht_ipv4_endpoint_pair *ep,
+			      const struct pht_l4_view *view,
+			      const struct sk_buff *skb,
+			      struct net *net)
+{
+	u32 seq;
+	u32 ack;
+	void *payload = NULL;
+	int ret;
+
+	if (view->payload_len) {
+		payload = kmalloc(view->payload_len, GFP_ATOMIC);
+		if (!payload)
+			return -ENOMEM;
+
+		ret = pht_copy_l4_payload(skb, view, payload, view->payload_len);
+		if (ret) {
+			kfree(payload);
+			return ret;
+		}
+	}
+
+	spin_lock_bh(&flow->lock);
+	if (flow->state != PHT_FLOW_STATE_ESTABLISHED) {
+		spin_unlock_bh(&flow->lock);
+		kfree(payload);
+		return -EAGAIN;
+	}
+	seq = flow->seq;
+	ack = flow->ack;
+	spin_unlock_bh(&flow->lock);
+
+	ret = pht_emit_fake_tcp_v4(net, ep, seq, ack, PHT_TCP_FLAG_ACK, payload,
+				 view->payload_len);
+	if (!ret) {
+		spin_lock_bh(&flow->lock);
+		if (flow->state == PHT_FLOW_STATE_ESTABLISHED) {
+			flow->seq += view->payload_len;
+			flow->last_activity_jiffies = jiffies;
+		}
+		spin_unlock_bh(&flow->lock);
+	}
+
+	kfree(payload);
+	return ret;
+}
+
+static int phantun_send_synack(struct pht_flow *flow, struct net *net)
+{
+	struct pht_ipv4_endpoint_pair ep;
+	u32 seq;
+	u32 ack;
+
+	spin_lock_bh(&flow->lock);
+	ep = flow->oriented;
+	seq = flow->local_isn;
+	ack = flow->peer_syn_next;
+	spin_unlock_bh(&flow->lock);
+
+	return pht_emit_fake_tcp_v4(net, &ep, seq, ack,
+				 PHT_TCP_FLAG_SYN | PHT_TCP_FLAG_ACK, NULL, 0);
+}
+
+static int phantun_send_rstack(struct net *net,
+			     const struct pht_ipv4_endpoint_pair *ep,
+			     const struct pht_l4_view *view, bool force_zero_seq)
+{
+	u32 seq = force_zero_seq ? 0 : ntohl(view->tcp->ack_seq);
+	u32 ack = ntohl(view->tcp->seq) +
+		  phantun_tcp_seq_advance(view->tcp, view->payload_len);
+
+	return pht_emit_fake_tcp_v4(net, ep, seq, ack,
+				 PHT_TCP_FLAG_RST | PHT_TCP_FLAG_ACK, NULL, 0);
+}
+
+static int phantun_respond_handshake_request(struct pht_flow *flow,
+				      const struct sk_buff *skb,
+				      const struct pht_l4_view *view,
+				      struct net *net)
+{
+	struct pht_ipv4_endpoint_pair ep;
+	u32 seq;
+	u32 ack;
+	size_t resp_len;
+	int ret;
+
+	if (!phantun_payload_matches(skb, view, phantun_cfg.handshake_request))
+		return -EPROTO;
+
+	resp_len = strlen(phantun_cfg.handshake_response);
+	spin_lock_bh(&flow->lock);
+	if (flow->seq == flow->local_isn)
+		flow->seq = flow->local_isn + 1;
+	flow->ack = ntohl(view->tcp->seq) + view->payload_len;
+	flow->last_ack = flow->ack;
+	flow->handshake_flags |= PHT_FLOW_HS_REQ_VERIFIED;
+	ep = flow->oriented;
+	seq = flow->seq;
+	ack = flow->ack;
+	spin_unlock_bh(&flow->lock);
+
+	ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_ACK,
+				 phantun_cfg.handshake_response, resp_len);
+	if (ret)
+		return ret;
+
+	spin_lock_bh(&flow->lock);
+	flow->seq = seq + resp_len;
+	flow->last_activity_jiffies = jiffies;
+	spin_unlock_bh(&flow->lock);
+	pht_flow_update_state(flow, PHT_FLOW_STATE_HS_RESP_SENT);
+	return 0;
+}
+
 static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
 				      const struct nf_hook_state *state)
 {
-	return NF_ACCEPT;
+	struct pht_l4_view view;
+	struct pht_ipv4_endpoint_pair ep;
+	struct pht_flow *flow;
+	struct pht_flow *new_flow;
+	enum pht_flow_state state_now;
+	u32 init_seq;
+	int ret;
+	bool queued;
+
+	if (!state || !skb)
+		return NF_ACCEPT;
+
+	ret = pht_parse_ipv4_udp(skb, &view);
+	if (ret)
+		return NF_ACCEPT;
+
+	if (!phantun_managed_port(view.udp->source))
+		return NF_ACCEPT;
+	if (!phantun_remote_port_allowed(view.udp->dest))
+		return NF_ACCEPT;
+
+	phantun_fill_udp_endpoint_pair(&view, &ep);
+
+retry_lookup:
+	flow = pht_flow_lookup_oriented(&phantun_flows, &ep);
+	if (flow) {
+		spin_lock_bh(&flow->lock);
+		state_now = flow->state;
+		spin_unlock_bh(&flow->lock);
+
+		if (state_now == PHT_FLOW_STATE_ESTABLISHED) {
+			ret = phantun_send_established_udp(flow, &ep, &view, skb,
+						 state->net);
+			if (ret)
+				pht_pr_warn("failed to emit fake-TCP payload for established flow: %d\n", ret);
+			pht_flow_put(flow);
+			kfree_skb(skb);
+			return NF_STOLEN;
+		}
+
+		if (pht_flow_state_is_half_open(state_now)) {
+			queued = pht_flow_queue_skb_if_empty(flow, skb);
+			if (!queued)
+				kfree_skb(skb);
+			pht_flow_put(flow);
+			return NF_STOLEN;
+		}
+
+		if (state_now == PHT_FLOW_STATE_DEAD) {
+			pht_flow_remove(flow);
+			pht_flow_put(flow);
+			goto retry_lookup;
+		}
+
+		pht_flow_put(flow);
+		kfree_skb(skb);
+		return NF_STOLEN;
+	}
+
+	new_flow = pht_flow_create(&phantun_flows, &ep, PHT_FLOW_ROLE_INITIATOR,
+				  PHT_FLOW_STATE_SYN_SENT);
+	if (IS_ERR(new_flow)) {
+		pht_pr_warn("failed to create initiator flow: %ld\n", PTR_ERR(new_flow));
+		kfree_skb(skb);
+		return NF_STOLEN;
+	}
+
+	init_seq = phantun_random_aligned_seq();
+	spin_lock_bh(&new_flow->lock);
+	new_flow->seq = init_seq;
+	new_flow->ack = 0;
+	new_flow->last_ack = 0;
+	new_flow->local_isn = init_seq;
+	new_flow->peer_syn_next = 0;
+	spin_unlock_bh(&new_flow->lock);
+	pht_flow_set_queued_skb(new_flow, skb);
+
+	ret = pht_flow_insert(&phantun_flows, new_flow);
+	if (ret == -EEXIST) {
+		pht_flow_put(new_flow);
+		goto retry_lookup;
+	}
+	if (ret) {
+		pht_pr_warn("failed to insert initiator flow: %d\n", ret);
+		pht_flow_put(new_flow);
+		return NF_STOLEN;
+	}
+
+	ret = pht_emit_fake_tcp_v4(state->net, &ep, init_seq, 0, PHT_TCP_FLAG_SYN,
+				 NULL, 0);
+	if (ret) {
+		pht_pr_warn("failed to emit fake-TCP SYN: %d\n", ret);
+		pht_flow_remove(new_flow);
+		return NF_STOLEN;
+	}
+
+	return NF_STOLEN;
 }
 
 static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 				       const struct nf_hook_state *state)
 {
-	return NF_ACCEPT;
+	struct pht_l4_view view;
+	struct pht_ipv4_endpoint_pair ep;
+	struct pht_flow *flow;
+	struct pht_flow *new_flow;
+	enum pht_flow_state state_now;
+	u32 expected_ack;
+	u32 responder_seq;
+	int ret;
+
+
+	if (!state || !skb)
+		return NF_ACCEPT;
+
+
+	ret = pht_parse_ipv4_tcp(skb, &view);
+	if (ret)
+		return NF_ACCEPT;
+
+
+	if (!phantun_managed_port(view.tcp->dest))
+		return NF_ACCEPT;
+	if (!phantun_remote_port_allowed(view.tcp->source))
+		return NF_ACCEPT;
+
+
+	phantun_fill_tcp_endpoint_pair(&view, &ep);
+
+
+	flow = pht_flow_lookup_oriented(&phantun_flows, &ep);
+	if (!flow) {
+		if (view.tcp->rst)
+			return NF_STOLEN;
+
+		if (!view.tcp->syn) {
+			ret = phantun_send_rstack(state->net, &ep, &view, false);
+			if (ret)
+				pht_pr_warn("failed to emit RST|ACK for unknown packet: %d\n", ret);
+			return NF_STOLEN;
+		}
+
+		if (ntohl(view.tcp->seq) % 4095U != 0) {
+			ret = phantun_send_rstack(state->net, &ep, &view, true);
+			if (ret)
+				pht_pr_warn("failed to emit RST|ACK for misaligned SYN: %d\n", ret);
+			return NF_STOLEN;
+		}
+
+		new_flow = pht_flow_create(&phantun_flows, &ep, PHT_FLOW_ROLE_RESPONDER,
+					  PHT_FLOW_STATE_SYN_RCVD);
+		if (IS_ERR(new_flow)) {
+			pht_pr_warn("failed to create responder flow: %ld\n", PTR_ERR(new_flow));
+			return NF_STOLEN;
+		}
+
+		responder_seq = get_random_u32();
+		spin_lock_bh(&new_flow->lock);
+		new_flow->seq = responder_seq;
+		new_flow->ack = ntohl(view.tcp->seq) + 1;
+		new_flow->last_ack = new_flow->ack;
+		new_flow->local_isn = responder_seq;
+		new_flow->peer_syn_next = new_flow->ack;
+		spin_unlock_bh(&new_flow->lock);
+
+		ret = pht_flow_insert(&phantun_flows, new_flow);
+		if (ret) {
+			pht_flow_put(new_flow);
+			return NF_STOLEN;
+		}
+
+		ret = phantun_send_synack(new_flow, state->net);
+		if (ret) {
+			pht_pr_warn("failed to emit SYN|ACK: %d\n", ret);
+			pht_flow_remove(new_flow);
+		}
+		return NF_STOLEN;
+	}
+
+	spin_lock_bh(&flow->lock);
+	state_now = flow->state;
+	expected_ack = flow->local_isn + 1;
+	spin_unlock_bh(&flow->lock);
+
+	if (view.tcp->rst) {
+		pht_flow_remove(flow);
+		pht_flow_put(flow);
+		return NF_STOLEN;
+	}
+
+	if ((state_now == PHT_FLOW_STATE_SYN_RCVD ||
+	     state_now == PHT_FLOW_STATE_AWAIT_HS_REQ) &&
+	    view.tcp->syn && !view.tcp->ack && view.payload_len == 0) {
+		ret = phantun_send_synack(flow, state->net);
+		if (ret)
+			pht_pr_warn("failed to re-emit SYN|ACK: %d\n", ret);
+		pht_flow_put(flow);
+		return NF_STOLEN;
+	}
+
+	if (state_now == PHT_FLOW_STATE_SYN_RCVD) {
+		if (!view.tcp->ack || ntohl(view.tcp->ack_seq) != expected_ack) {
+			ret = phantun_send_rstack(state->net, &ep, &view, false);
+			if (ret)
+				pht_pr_warn("failed to emit RST|ACK for bad final ACK: %d\n", ret);
+			pht_flow_remove(flow);
+			pht_flow_put(flow);
+			return NF_STOLEN;
+		}
+
+		if (view.payload_len == 0) {
+			spin_lock_bh(&flow->lock);
+			flow->seq = flow->local_isn + 1;
+			flow->ack = flow->peer_syn_next;
+			flow->last_ack = flow->ack;
+			spin_unlock_bh(&flow->lock);
+			pht_flow_update_state(flow, PHT_FLOW_STATE_AWAIT_HS_REQ);
+			pht_flow_put(flow);
+			return NF_STOLEN;
+		}
+
+		ret = phantun_respond_handshake_request(flow, skb, &view, state->net);
+		if (ret == -EPROTO) {
+			ret = phantun_send_rstack(state->net, &ep, &view, false);
+			if (ret)
+				pht_pr_warn("failed to emit RST|ACK for bad combined request: %d\n", ret);
+			pht_flow_remove(flow);
+			pht_flow_put(flow);
+			return NF_STOLEN;
+		}
+		if (ret) {
+			pht_pr_warn("failed to handle combined ACK+handshake request: %d\n", ret);
+			pht_flow_remove(flow);
+		}
+		pht_flow_put(flow);
+		return NF_STOLEN;
+	}
+
+	if (state_now == PHT_FLOW_STATE_AWAIT_HS_REQ) {
+		if (!view.tcp->ack) {
+			ret = phantun_send_rstack(state->net, &ep, &view, false);
+			if (ret)
+				pht_pr_warn("failed to emit RST|ACK in AWAIT_HS_REQ: %d\n", ret);
+			pht_flow_remove(flow);
+			pht_flow_put(flow);
+			return NF_STOLEN;
+		}
+
+		if (view.payload_len == 0) {
+			if (ntohl(view.tcp->ack_seq) == expected_ack) {
+				pht_flow_touch(flow);
+				pht_flow_put(flow);
+				return NF_STOLEN;
+			}
+			ret = phantun_send_rstack(state->net, &ep, &view, false);
+			if (ret)
+				pht_pr_warn("failed to emit RST|ACK for duplicate ACK mismatch: %d\n", ret);
+			pht_flow_remove(flow);
+			pht_flow_put(flow);
+			return NF_STOLEN;
+		}
+
+		if (ntohl(view.tcp->ack_seq) != expected_ack) {
+			ret = phantun_send_rstack(state->net, &ep, &view, false);
+			if (ret)
+				pht_pr_warn("failed to emit RST|ACK for bad handshake ACK: %d\n", ret);
+			pht_flow_remove(flow);
+			pht_flow_put(flow);
+			return NF_STOLEN;
+		}
+
+		ret = phantun_respond_handshake_request(flow, skb, &view, state->net);
+		if (ret == -EPROTO) {
+			ret = phantun_send_rstack(state->net, &ep, &view, false);
+			if (ret)
+				pht_pr_warn("failed to emit RST|ACK for bad delayed request: %d\n", ret);
+			pht_flow_remove(flow);
+			pht_flow_put(flow);
+			return NF_STOLEN;
+		}
+		if (ret) {
+			pht_pr_warn("failed to handle delayed handshake request: %d\n", ret);
+			pht_flow_remove(flow);
+		}
+		pht_flow_put(flow);
+		return NF_STOLEN;
+	}
+
+	pht_flow_put(flow);
+	return NF_STOLEN;
 }
 
 static struct nf_hook_ops phantun_nf_ops[] = {

@@ -391,6 +391,29 @@ void pht_flow_touch(struct pht_flow *flow)
 	spin_unlock_bh(&flow->lock);
 }
 
+bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb)
+
+
+{
+	bool queued = false;
+
+	if (!flow) {
+		kfree_skb(skb);
+		return false;
+	}
+
+	spin_lock_bh(&flow->lock);
+	if (!flow->queued_skb) {
+		flow->queued_skb = skb;
+		flow->last_activity_jiffies = jiffies;
+		queued = true;
+	}
+	spin_unlock_bh(&flow->lock);
+
+	return queued;
+}
+
+
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb)
 {
 	struct sk_buff *old;

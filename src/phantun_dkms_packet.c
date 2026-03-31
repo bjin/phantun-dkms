@@ -115,12 +115,14 @@ int pht_copy_l4_payload(const struct sk_buff *skb,
 			const struct pht_l4_view *view,
 			void *dst, size_t dst_len)
 {
-	if (!skb || !view || !dst)
+	if (!skb || !view)
+		return -EINVAL;
+	if (!view->payload_len)
+		return 0;
+	if (!dst)
 		return -EINVAL;
 	if (dst_len < view->payload_len)
 		return -EMSGSIZE;
-	if (!view->payload_len)
-		return 0;
 
 	return skb_copy_bits(skb, view->payload_offset, dst, view->payload_len);
 }

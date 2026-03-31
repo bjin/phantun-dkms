@@ -64,33 +64,33 @@
 
 ## Phase 4 - initiator path
 
-- [ ] In `LOCAL_OUT`, match managed outbound UDP
-- [ ] Lookup canonical tuple before creating a new flow
-- [ ] Reuse established flows instead of opening duplicates
-- [ ] If handshaking flow exists:
-  - [ ] queue one UDP skb if empty
-  - [ ] otherwise drop
-- [ ] If no valid flow exists:
-  - [ ] create initiator flow in `SYN_SENT`
-  - [ ] generate the initiator's initial seq from the `u32` range and align it so `seq % 4095 == 0`
-  - [ ] queue the triggering skb
-  - [ ] send `SYN`
-- [ ] Steal original UDP skb from the stack
+- [x] In `LOCAL_OUT`, match managed outbound UDP
+- [x] Lookup canonical tuple before creating a new flow
+- [x] Reuse established flows instead of opening duplicates
+- [x] If handshaking flow exists:
+  - [x] queue one UDP skb if empty
+  - [x] otherwise drop
+- [x] If no valid flow exists:
+  - [x] create initiator flow in `SYN_SENT`
+  - [x] generate the initiator's initial seq from the `u32` range and align it so `seq % 4095 == 0`
+  - [x] queue the triggering skb
+  - [x] send `SYN`
+- [x] Steal original UDP skb from the stack
 
 ## Phase 5 - responder path
 
-- [ ] In `PRE_ROUTING`, match inbound fake-TCP for managed ports
-- [ ] Reject unknown non-RST packets with `RST|ACK`
-- [ ] For new `SYN`:
-  - [ ] verify `seq % 4095 == 0`
-  - [ ] create responder flow in `SYN_RCVD`
-  - [ ] send `SYN|ACK`
-- [ ] For existing responder flow:
-  - [ ] validate final ACK number
-  - [ ] transition to `AWAIT_HS_REQ` or directly consume `ACK + handshake_request`
-  - [ ] resend `SYN|ACK` on duplicate/retransmitted `SYN` while still half-open
-  - [ ] tolerate pure duplicate `ACK` while waiting for the first control payload
-- [ ] Never let fake-TCP reach the real TCP stack
+- [x] In `PRE_ROUTING`, match inbound fake-TCP for managed ports
+- [x] Reject unknown non-RST packets with `RST|ACK`
+- [x] For new `SYN`:
+  - [x] verify `seq % 4095 == 0`
+  - [x] create responder flow in `SYN_RCVD`
+  - [x] send `SYN|ACK`
+- [x] For existing responder flow:
+  - [x] validate final ACK number
+  - [x] transition to `AWAIT_HS_REQ` or directly consume `ACK + handshake_request`
+  - [x] resend `SYN|ACK` on duplicate/retransmitted `SYN` while still half-open
+  - [x] tolerate pure duplicate `ACK` while waiting for the first control payload
+- [x] Never let fake-TCP reach the real TCP stack
 
 ## Phase 6 - mandatory control payload handshake
 
