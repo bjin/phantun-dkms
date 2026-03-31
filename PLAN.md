@@ -165,12 +165,6 @@
 
 ## Phase 11 - testing
 
-### Unit-ish / helper validation
-
-- [ ] Verify fake-TCP packet builders produce correct flags, seq, ack, and checksums
-- [ ] Verify control payload verification is exact and rejects prefix/suffix mismatches
-- [ ] Verify canonical tuple ordering and tie-break behavior
-
 ### Namespace / integration tests
 
 - [ ] Two network namespaces, one managed port, raw UDP echo
