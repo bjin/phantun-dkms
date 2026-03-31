@@ -21,3 +21,5 @@ modules.order
 compile_commands.json
 
 .cache
+vng.log
+dmesg.log
