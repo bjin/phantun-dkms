@@ -1,9 +1,7 @@
 KVER ?= $(shell uname -r)
 KDIR ?= $(patsubst %/,%,$(dir $(firstword $(wildcard \
  	/lib/modules/$(KVER)/build/Makefile \
- 	/run/current-system/kernel-modules/lib/modules/$(KVER)/build/Makefile \
- 	/nix/store/*-linux-$(KVER)-dev/lib/modules/$(KVER)/build/Makefile \
- 	/nix/store/*linux-$(KVER)-dev/lib/modules/$(KVER)/build/Makefile))))
+ 	/run/current-system/kernel-modules/lib/modules/$(KVER)/build/Makefile))))
 PWD := $(shell pwd)
 
 ifeq ($(strip $(KDIR)),)

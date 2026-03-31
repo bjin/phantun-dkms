@@ -5,15 +5,15 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
-#include "phantun_kmod_flow.h"
+#include "phantun_flow.h"
 
 static u32 pht_flow_hash_key(const struct pht_flow_key *key)
 {
 	return jhash(key, sizeof(*key), 0) & (PHT_FLOW_BUCKETS - 1);
 }
 
-static int pht_endpoint_cmp(__be32 addr_a, __be16 port_a,
-			   __be32 addr_b, __be16 port_b)
+static int pht_endpoint_cmp(__be32 addr_a, __be16 port_a, __be32 addr_b,
+			    __be16 port_b)
 {
 	if (ntohl(addr_a) < ntohl(addr_b))
 		return -1;
@@ -37,14 +37,13 @@ static int pht_flow_send_local_rst(struct pht_flow *flow)
 	if (!flow || !flow->table || !flow->table->net)
 		return -EINVAL;
 
-
-	return pht_emit_fake_tcp_v4(flow->table->net, &flow->oriented, flow->seq, 0,
-				 PHT_TCP_FLAG_RST, NULL, 0);
+	return pht_emit_fake_tcp_v4(flow->table->net, &flow->oriented,
+				    flow->seq, 0, PHT_TCP_FLAG_RST, NULL, 0);
 }
 
 static int pht_flow_retransmit_now(struct pht_flow *flow)
 {
-	const struct phantun_kmod_config *cfg;
+	const struct phantun_config *cfg;
 	struct pht_ipv4_endpoint_pair ep;
 	u32 seq;
 	u32 ack;
@@ -53,10 +52,8 @@ static int pht_flow_retransmit_now(struct pht_flow *flow)
 	const char *payload = NULL;
 	u8 flags = 0;
 
-
 	if (!flow || !flow->table || !flow->table->net || !flow->table->cfg)
 		return -EINVAL;
-
 
 	cfg = flow->table->cfg;
 	spin_lock_bh(&flow->lock);
@@ -86,11 +83,11 @@ static int pht_flow_retransmit_now(struct pht_flow *flow)
 	}
 	spin_unlock_bh(&flow->lock);
 
-
 	if (!flags)
 		return 0;
 
-	return pht_emit_fake_tcp_v4(flow->table->net, &ep, seq, ack, flags, payload, len);
+	return pht_emit_fake_tcp_v4(flow->table->net, &ep, seq, ack, flags,
+				    payload, len);
 }
 
 static void pht_flow_gc_worker(struct work_struct *work);
@@ -98,7 +95,8 @@ static void __pht_flow_remove(struct pht_flow *flow, bool from_timer);
 
 static void pht_flow_retransmit_timer(struct timer_list *timer)
 {
-	struct pht_flow *flow = timer_container_of(flow, timer, retransmit_timer);
+	struct pht_flow *flow =
+		timer_container_of(flow, timer, retransmit_timer);
 	unsigned long next;
 
 	spin_lock_bh(&flow->lock);
@@ -165,20 +163,20 @@ static void pht_flow_shutdown_retransmit_sync(struct pht_flow *flow)
 }
 
 bool pht_flow_key_equal(const struct pht_flow_key *a,
-		const struct pht_flow_key *b)
+			const struct pht_flow_key *b)
 {
 	return !memcmp(a, b, sizeof(*a));
 }
 
 void pht_flow_key_from_endpoints(struct pht_flow_key *key,
-			 const struct pht_ipv4_endpoint_pair *ep,
-			 bool *local_is_low)
+				 const struct pht_ipv4_endpoint_pair *ep,
+				 bool *local_is_low)
 {
 	bool is_low;
 	int cmp;
 
-	cmp = pht_endpoint_cmp(ep->local_addr, ep->local_port,
-			      ep->remote_addr, ep->remote_port);
+	cmp = pht_endpoint_cmp(ep->local_addr, ep->local_port, ep->remote_addr,
+			       ep->remote_port);
 	is_low = cmp <= 0;
 
 	if (is_low) {
@@ -212,7 +210,7 @@ bool pht_flow_state_is_half_open(enum pht_flow_state state)
 }
 
 int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
-		const struct phantun_kmod_config *cfg)
+			const struct phantun_config *cfg)
 {
 	unsigned int i;
 
@@ -227,7 +225,8 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
 
 	table->handshake_timeout_jiffies =
 		msecs_to_jiffies(cfg->handshake_timeout_ms);
-	table->idle_timeout_jiffies = msecs_to_jiffies(cfg->idle_timeout_sec * 1000U);
+	table->idle_timeout_jiffies =
+		msecs_to_jiffies(cfg->idle_timeout_sec * 1000U);
 	table->gc_interval_jiffies =
 		msecs_to_jiffies(PHT_FLOW_GC_INTERVAL_SEC * 1000U);
 	table->handshake_retries = cfg->handshake_retries;
@@ -238,8 +237,8 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
 	return 0;
 }
 
-static void pht_flow_detach_all(struct pht_flow_table *table, struct list_head *expired)
-
+static void pht_flow_detach_all(struct pht_flow_table *table,
+				struct list_head *expired)
 
 {
 	unsigned int i;
@@ -250,7 +249,8 @@ static void pht_flow_detach_all(struct pht_flow_table *table, struct list_head *
 		struct hlist_node *tmp;
 
 		spin_lock_bh(&bucket->lock);
-		hlist_for_each_entry_safe(flow, tmp, &bucket->head, hnode) {
+		hlist_for_each_entry_safe(flow, tmp, &bucket->head, hnode)
+		{
 			hlist_del_init(&flow->hnode);
 			spin_lock(&flow->lock);
 			flow->state = PHT_FLOW_STATE_DEAD;
@@ -260,7 +260,6 @@ static void pht_flow_detach_all(struct pht_flow_table *table, struct list_head *
 		spin_unlock_bh(&bucket->lock);
 	}
 }
-
 
 static bool pht_flow_gc_detach_expired(struct pht_flow_table *table,
 				       struct list_head *expired)
@@ -275,13 +274,17 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table,
 		struct hlist_node *tmp;
 
 		spin_lock_bh(&bucket->lock);
-		hlist_for_each_entry_safe(flow, tmp, &bucket->head, hnode) {
+		hlist_for_each_entry_safe(flow, tmp, &bucket->head, hnode)
+		{
 			bool expired_flow;
 
 			spin_lock(&flow->lock);
-			expired_flow = (flow->state == PHT_FLOW_STATE_DEAD) ||
-					 time_after_eq(now, flow->last_activity_jiffies +
-						     table->idle_timeout_jiffies);
+			expired_flow =
+				(flow->state == PHT_FLOW_STATE_DEAD) ||
+				time_after_eq(
+					now,
+					flow->last_activity_jiffies +
+						table->idle_timeout_jiffies);
 			if (expired_flow)
 				flow->state = PHT_FLOW_STATE_DEAD;
 			spin_unlock(&flow->lock);
@@ -301,14 +304,15 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table,
 
 static void pht_flow_gc_worker(struct work_struct *work)
 {
-	struct pht_flow_table *table =
-		container_of(to_delayed_work(work), struct pht_flow_table, gc_work);
+	struct pht_flow_table *table = container_of(
+		to_delayed_work(work), struct pht_flow_table, gc_work);
 	LIST_HEAD(expired);
 	struct pht_flow *flow;
 	struct pht_flow *tmp;
 
 	pht_flow_gc_detach_expired(table, &expired);
-	list_for_each_entry_safe(flow, tmp, &expired, gc_node) {
+	list_for_each_entry_safe(flow, tmp, &expired, gc_node)
+	{
 		list_del_init(&flow->gc_node);
 		pht_flow_send_local_rst(flow);
 		pht_flow_shutdown_retransmit_sync(flow);
@@ -330,7 +334,8 @@ void pht_flow_table_destroy(struct pht_flow_table *table)
 	cancel_delayed_work_sync(&table->gc_work);
 	pht_flow_detach_all(table, &expired);
 
-	list_for_each_entry_safe(flow, tmp, &expired, gc_node) {
+	list_for_each_entry_safe(flow, tmp, &expired, gc_node)
+	{
 		list_del_init(&flow->gc_node);
 		pht_flow_send_local_rst(flow);
 		pht_flow_shutdown_retransmit_sync(flow);
@@ -350,7 +355,7 @@ void pht_flow_put(struct pht_flow *flow)
 }
 
 struct pht_flow *pht_flow_lookup(struct pht_flow_table *table,
-		 const struct pht_flow_key *key)
+				 const struct pht_flow_key *key)
 {
 	struct pht_flow_bucket *bucket;
 	struct pht_flow *flow;
@@ -362,7 +367,8 @@ struct pht_flow *pht_flow_lookup(struct pht_flow_table *table,
 	idx = pht_flow_hash_key(key);
 	bucket = &table->buckets[idx];
 	spin_lock_bh(&bucket->lock);
-	hlist_for_each_entry(flow, &bucket->head, hnode) {
+	hlist_for_each_entry(flow, &bucket->head, hnode)
+	{
 		if (!pht_flow_key_equal(&flow->key, key))
 			continue;
 		if (!refcount_inc_not_zero(&flow->refs))
@@ -374,8 +380,9 @@ struct pht_flow *pht_flow_lookup(struct pht_flow_table *table,
 	return NULL;
 }
 
-struct pht_flow *pht_flow_lookup_oriented(struct pht_flow_table *table,
-				  const struct pht_ipv4_endpoint_pair *ep)
+struct pht_flow *
+pht_flow_lookup_oriented(struct pht_flow_table *table,
+			 const struct pht_ipv4_endpoint_pair *ep)
 {
 	struct pht_flow_key key;
 
@@ -387,9 +394,9 @@ struct pht_flow *pht_flow_lookup_oriented(struct pht_flow_table *table,
 }
 
 struct pht_flow *pht_flow_create(struct pht_flow_table *table,
-		 const struct pht_ipv4_endpoint_pair *ep,
-		 enum pht_flow_role role,
-		 enum pht_flow_state state)
+				 const struct pht_ipv4_endpoint_pair *ep,
+				 enum pht_flow_role role,
+				 enum pht_flow_state state)
 {
 	struct pht_flow *flow;
 
@@ -430,7 +437,8 @@ int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow)
 	idx = pht_flow_hash_key(&flow->key);
 	bucket = &table->buckets[idx];
 	spin_lock_bh(&bucket->lock);
-	hlist_for_each_entry(iter, &bucket->head, hnode) {
+	hlist_for_each_entry(iter, &bucket->head, hnode)
+	{
 		if (pht_flow_key_equal(&iter->key, &flow->key)) {
 			spin_unlock_bh(&bucket->lock);
 			return -EEXIST;

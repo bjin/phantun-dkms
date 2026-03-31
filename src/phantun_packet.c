@@ -13,11 +13,10 @@
 #include <net/route.h>
 #include <net/tcp.h>
 
-#include "phantun_kmod_packet.h"
+#include "phantun_packet.h"
 
 static int pht_parse_ipv4_l4(struct sk_buff *skb, u8 protocol,
-			     unsigned int min_l4_len,
-			     struct pht_l4_view *view)
+			     unsigned int min_l4_len, struct pht_l4_view *view)
 {
 	struct iphdr *iph;
 	unsigned int ip_hdr_len;
@@ -66,7 +65,8 @@ int pht_parse_ipv4_udp(struct sk_buff *skb, struct pht_l4_view *view)
 	iph = view->iph;
 	uh = udp_hdr(skb);
 	udp_len = ntohs(uh->len);
-	if (udp_len < sizeof(*uh) || view->ip_hdr_len + udp_len > ntohs(iph->tot_len))
+	if (udp_len < sizeof(*uh) ||
+	    view->ip_hdr_len + udp_len > ntohs(iph->tot_len))
 		return -EINVAL;
 
 	view->udp = uh;
@@ -112,8 +112,8 @@ int pht_parse_ipv4_tcp(struct sk_buff *skb, struct pht_l4_view *view)
 }
 
 int pht_copy_l4_payload(const struct sk_buff *skb,
-			const struct pht_l4_view *view,
-			void *dst, size_t dst_len)
+			const struct pht_l4_view *view, void *dst,
+			size_t dst_len)
 {
 	if (!skb || !view)
 		return -EINVAL;
@@ -146,19 +146,18 @@ void pht_tcp_v4_complete(struct iphdr *iph, struct tcphdr *th, u16 tcp_len)
 {
 	th->check = 0;
 	th->check = tcp_v4_check(tcp_len, iph->saddr, iph->daddr,
-				csum_partial(th, tcp_len, 0));
+				 csum_partial(th, tcp_len, 0));
 }
 
 void pht_udp_v4_complete(struct iphdr *iph, struct udphdr *uh, u16 udp_len)
 {
 	uh->check = 0;
-	uh->check = csum_tcpudp_magic(iph->saddr, iph->daddr, udp_len,
-				      IPPROTO_UDP,
-				      csum_partial(uh, udp_len, 0));
+	uh->check =
+		csum_tcpudp_magic(iph->saddr, iph->daddr, udp_len, IPPROTO_UDP,
+				  csum_partial(uh, udp_len, 0));
 }
 
-static struct sk_buff *pht_alloc_l3_skb(unsigned int l4_len,
-				       size_t payload_len)
+static struct sk_buff *pht_alloc_l3_skb(unsigned int l4_len, size_t payload_len)
 {
 	unsigned int total_len;
 	struct sk_buff *skb;
@@ -242,44 +241,48 @@ struct sk_buff *pht_build_fake_tcp_v4(const struct pht_ipv4_endpoint_pair *ep,
 	return skb;
 }
 
-struct sk_buff *pht_build_fake_tcp_syn_v4(const struct pht_ipv4_endpoint_pair *ep,
-					  u32 seq)
+struct sk_buff *
+pht_build_fake_tcp_syn_v4(const struct pht_ipv4_endpoint_pair *ep, u32 seq)
 {
 	return pht_build_fake_tcp_v4(ep, seq, 0, PHT_TCP_FLAG_SYN, NULL, 0);
 }
 
-struct sk_buff *pht_build_fake_tcp_synack_v4(const struct pht_ipv4_endpoint_pair *ep,
-					     u32 seq, u32 ack)
+struct sk_buff *
+pht_build_fake_tcp_synack_v4(const struct pht_ipv4_endpoint_pair *ep, u32 seq,
+			     u32 ack)
 {
-	return pht_build_fake_tcp_v4(ep, seq, ack,
-				     PHT_TCP_FLAG_SYN | PHT_TCP_FLAG_ACK, NULL, 0);
+	return pht_build_fake_tcp_v4(
+		ep, seq, ack, PHT_TCP_FLAG_SYN | PHT_TCP_FLAG_ACK, NULL, 0);
 }
 
-struct sk_buff *pht_build_fake_tcp_ack_v4(const struct pht_ipv4_endpoint_pair *ep,
-					  u32 seq, u32 ack)
+struct sk_buff *
+pht_build_fake_tcp_ack_v4(const struct pht_ipv4_endpoint_pair *ep, u32 seq,
+			  u32 ack)
 {
 	return pht_build_fake_tcp_v4(ep, seq, ack, PHT_TCP_FLAG_ACK, NULL, 0);
 }
 
-struct sk_buff *pht_build_fake_tcp_ack_payload_v4(
-	const struct pht_ipv4_endpoint_pair *ep, u32 seq, u32 ack,
-	const void *payload, size_t payload_len)
+struct sk_buff *
+pht_build_fake_tcp_ack_payload_v4(const struct pht_ipv4_endpoint_pair *ep,
+				  u32 seq, u32 ack, const void *payload,
+				  size_t payload_len)
 {
 	return pht_build_fake_tcp_v4(ep, seq, ack, PHT_TCP_FLAG_ACK, payload,
 				     payload_len);
 }
 
-struct sk_buff *pht_build_fake_tcp_rst_v4(const struct pht_ipv4_endpoint_pair *ep,
-					  u32 seq)
+struct sk_buff *
+pht_build_fake_tcp_rst_v4(const struct pht_ipv4_endpoint_pair *ep, u32 seq)
 {
 	return pht_build_fake_tcp_v4(ep, seq, 0, PHT_TCP_FLAG_RST, NULL, 0);
 }
 
-struct sk_buff *pht_build_fake_tcp_rstack_v4(const struct pht_ipv4_endpoint_pair *ep,
-					     u32 seq, u32 ack)
+struct sk_buff *
+pht_build_fake_tcp_rstack_v4(const struct pht_ipv4_endpoint_pair *ep, u32 seq,
+			     u32 ack)
 {
-	return pht_build_fake_tcp_v4(ep, seq, ack,
-				     PHT_TCP_FLAG_RST | PHT_TCP_FLAG_ACK, NULL, 0);
+	return pht_build_fake_tcp_v4(
+		ep, seq, ack, PHT_TCP_FLAG_RST | PHT_TCP_FLAG_ACK, NULL, 0);
 }
 
 struct sk_buff *pht_build_udp_v4(const struct pht_ipv4_endpoint_pair *ep,
@@ -319,7 +322,7 @@ struct sk_buff *pht_build_udp_v4(const struct pht_ipv4_endpoint_pair *ep,
 }
 
 int pht_tx_fake_tcp_v4(struct net *net, struct sk_buff *skb,
-		      const struct pht_ipv4_endpoint_pair *ep)
+		       const struct pht_ipv4_endpoint_pair *ep)
 {
 	struct flowi4 fl4;
 	struct rtable *rt;
@@ -331,9 +334,8 @@ int pht_tx_fake_tcp_v4(struct net *net, struct sk_buff *skb,
 
 	memset(&fl4, 0, sizeof(fl4));
 	flowi4_init_output(&fl4, 0, 0, 0, RT_SCOPE_UNIVERSE, IPPROTO_TCP, 0,
-			   ep->remote_addr, ep->local_addr,
-			   ep->remote_port, ep->local_port,
-			   GLOBAL_ROOT_UID);
+			   ep->remote_addr, ep->local_addr, ep->remote_port,
+			   ep->local_port, GLOBAL_ROOT_UID);
 	rt = ip_route_output_key(net, &fl4);
 	if (IS_ERR(rt)) {
 		kfree_skb(skb);
@@ -347,9 +349,9 @@ int pht_tx_fake_tcp_v4(struct net *net, struct sk_buff *skb,
 }
 
 int pht_emit_fake_tcp_v4(struct net *net,
-		 const struct pht_ipv4_endpoint_pair *ep,
-		 u32 seq, u32 ack, u8 flags,
-		 const void *payload, size_t payload_len)
+			 const struct pht_ipv4_endpoint_pair *ep, u32 seq,
+			 u32 ack, u8 flags, const void *payload,
+			 size_t payload_len)
 {
 	struct sk_buff *skb;
 
@@ -375,8 +377,8 @@ int pht_reinject_udp_v4(struct sk_buff *skb, struct net_device *dev)
 }
 
 int pht_reinject_udp_payload_v4(struct net_device *dev,
-			const struct pht_ipv4_endpoint_pair *ep,
-			const void *payload, size_t payload_len)
+				const struct pht_ipv4_endpoint_pair *ep,
+				const void *payload, size_t payload_len)
 {
 	struct sk_buff *skb;
 
