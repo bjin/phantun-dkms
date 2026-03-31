@@ -102,7 +102,8 @@ static void pht_flow_retransmit_timer(struct timer_list *timer)
 	unsigned long next;
 
 	spin_lock_bh(&flow->lock);
-	if (!pht_flow_state_is_half_open(flow->state) ||
+	if (!flow->retransmit_armed ||
+	    !pht_flow_state_is_half_open(flow->state) ||
 	    flow->state == PHT_FLOW_STATE_DEAD) {
 		flow->retransmit_armed = false;
 		spin_unlock_bh(&flow->lock);
@@ -127,6 +128,18 @@ static void pht_flow_retransmit_timer(struct timer_list *timer)
 
 	if (pht_flow_retransmit_now(flow))
 		pht_pr_warn("failed to retransmit half-open flow packet\n");
+
+	spin_lock_bh(&flow->lock);
+	if (!flow->retransmit_armed ||
+	    !pht_flow_state_is_half_open(flow->state) ||
+	    flow->state == PHT_FLOW_STATE_DEAD) {
+		flow->retransmit_armed = false;
+		spin_unlock_bh(&flow->lock);
+		pht_flow_put(flow);
+		return;
+	}
+	spin_unlock_bh(&flow->lock);
+
 	pht_pr_debug("half-open flow retry %u/%u scheduled\n",
 		     flow->retries_done, flow->max_retries);
 	mod_timer(&flow->retransmit_timer, next);
@@ -389,6 +402,7 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table,
 
 	refcount_set(&flow->refs, 1);
 	spin_lock_init(&flow->lock);
+	spin_lock_init(&flow->tx_lock);
 	INIT_HLIST_NODE(&flow->hnode);
 	INIT_LIST_HEAD(&flow->gc_node);
 	timer_setup(&flow->retransmit_timer, pht_flow_retransmit_timer, 0);
@@ -582,14 +596,14 @@ void pht_flow_cancel_retransmit(struct pht_flow *flow)
 	if (!flow)
 		return;
 
-	deleted = timer_delete(&flow->retransmit_timer);
 	spin_lock_bh(&flow->lock);
-	if (deleted > 0 && flow->retransmit_armed) {
+	if (flow->retransmit_armed) {
 		flow->retransmit_armed = false;
 		drop_ref = true;
 	}
 	spin_unlock_bh(&flow->lock);
 
-	if (drop_ref)
+	deleted = timer_delete(&flow->retransmit_timer);
+	if (deleted > 0 && drop_ref)
 		pht_flow_put(flow);
 }

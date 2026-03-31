@@ -47,6 +47,7 @@ struct pht_flow_table;
 struct pht_flow {
 	refcount_t refs;
 	spinlock_t lock;
+	spinlock_t tx_lock;
 	struct hlist_node hnode;
 	struct list_head gc_node;
 	struct timer_list retransmit_timer;

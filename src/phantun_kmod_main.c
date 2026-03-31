@@ -136,6 +136,22 @@ static bool phantun_payload_matches(const struct sk_buff *skb,
 	return match;
 }
 
+static int phantun_send_flow_rst(struct pht_flow *flow, struct net *net)
+{
+	struct pht_ipv4_endpoint_pair ep;
+	u32 seq;
+	u32 ack;
+
+	spin_lock_bh(&flow->lock);
+	ep = flow->oriented;
+	seq = flow->seq;
+	ack = flow->ack;
+	spin_unlock_bh(&flow->lock);
+
+	return pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_RST, NULL, 0);
+}
+
+
 static int phantun_send_established_udp(struct pht_flow *flow,
 			      const struct pht_ipv4_endpoint_pair *ep,
 			      const struct pht_l4_view *view,
@@ -159,9 +175,11 @@ static int phantun_send_established_udp(struct pht_flow *flow,
 		}
 	}
 
+	spin_lock_bh(&flow->tx_lock);
 	spin_lock_bh(&flow->lock);
 	if (flow->state != PHT_FLOW_STATE_ESTABLISHED) {
 		spin_unlock_bh(&flow->lock);
+		spin_unlock_bh(&flow->tx_lock);
 		kfree(payload);
 		return -EAGAIN;
 	}
@@ -177,7 +195,16 @@ static int phantun_send_established_udp(struct pht_flow *flow,
 		if (flow->state == PHT_FLOW_STATE_ESTABLISHED)
 			flow->last_activity_jiffies = jiffies;
 		spin_unlock_bh(&flow->lock);
+	} else {
+		spin_lock_bh(&flow->lock);
+		if (flow->state == PHT_FLOW_STATE_ESTABLISHED) {
+			if (flow->seq == seq + view->payload_len)
+				flow->seq = seq;
+			flow->state = PHT_FLOW_STATE_DEAD;
+		}
+		spin_unlock_bh(&flow->lock);
 	}
+	spin_unlock_bh(&flow->tx_lock);
 
 	kfree(payload);
 	return ret;
@@ -422,6 +449,7 @@ retry_lookup:
 						 state->net);
 			if (ret) {
 				pht_pr_warn("failed to emit fake-TCP payload for established flow: %d\n", ret);
+				phantun_send_flow_rst(flow, state->net);
 				pht_flow_remove(flow);
 			}
 			pht_flow_put(flow);
