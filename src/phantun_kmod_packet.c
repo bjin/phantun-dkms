@@ -172,6 +172,7 @@ static struct sk_buff *pht_alloc_l3_skb(unsigned int l4_len,
 		return NULL;
 
 	skb_reserve(skb, LL_MAX_HEADER);
+	skb_reset_mac_header(skb);
 	skb_reset_network_header(skb);
 	skb_put(skb, total_len);
 	memset(skb->data, 0, total_len);

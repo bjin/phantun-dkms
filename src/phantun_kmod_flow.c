@@ -93,44 +93,62 @@ static int pht_flow_retransmit_now(struct pht_flow *flow)
 	return pht_emit_fake_tcp_v4(flow->table->net, &ep, seq, ack, flags, payload, len);
 }
 
-static void pht_flow_timeout_work(struct work_struct *work);
 static void pht_flow_gc_worker(struct work_struct *work);
+static void __pht_flow_remove(struct pht_flow *flow, bool from_timer);
 
 static void pht_flow_retransmit_timer(struct timer_list *timer)
 {
 	struct pht_flow *flow = timer_container_of(flow, timer, retransmit_timer);
 	unsigned long next;
-	bool expire = false;
 
 	spin_lock_bh(&flow->lock);
 	if (!pht_flow_state_is_half_open(flow->state) ||
 	    flow->state == PHT_FLOW_STATE_DEAD) {
+		flow->retransmit_armed = false;
 		spin_unlock_bh(&flow->lock);
+		pht_flow_put(flow);
 		return;
 	}
-
 
 	if (flow->retries_done >= flow->max_retries) {
 		flow->state = PHT_FLOW_STATE_DEAD;
-		expire = true;
+		flow->retransmit_armed = false;
 		spin_unlock_bh(&flow->lock);
-		queue_work(system_unbound_wq, &flow->timeout_work);
+		pht_flow_send_local_rst(flow);
+		__pht_flow_remove(flow, true);
+		pht_flow_put(flow);
 		return;
 	}
-
 
 	flow->retries_done++;
 	next = jiffies + flow->table->handshake_timeout_jiffies;
 	flow->retransmit_at_jiffies = next;
 	spin_unlock_bh(&flow->lock);
 
-
 	if (pht_flow_retransmit_now(flow))
 		pht_pr_warn("failed to retransmit half-open flow packet\n");
 	pht_pr_debug("half-open flow retry %u/%u scheduled\n",
 		     flow->retries_done, flow->max_retries);
-	if (!expire)
-		mod_timer(&flow->retransmit_timer, next);
+	mod_timer(&flow->retransmit_timer, next);
+}
+
+static void pht_flow_shutdown_retransmit_sync(struct pht_flow *flow)
+{
+	bool drop_ref = false;
+
+	if (!flow)
+		return;
+
+	timer_shutdown_sync(&flow->retransmit_timer);
+	spin_lock_bh(&flow->lock);
+	if (flow->retransmit_armed) {
+		flow->retransmit_armed = false;
+		drop_ref = true;
+	}
+	spin_unlock_bh(&flow->lock);
+
+	if (drop_ref)
+		pht_flow_put(flow);
 }
 
 bool pht_flow_key_equal(const struct pht_flow_key *a,
@@ -280,8 +298,7 @@ static void pht_flow_gc_worker(struct work_struct *work)
 	list_for_each_entry_safe(flow, tmp, &expired, gc_node) {
 		list_del_init(&flow->gc_node);
 		pht_flow_send_local_rst(flow);
-		timer_delete_sync(&flow->retransmit_timer);
-		cancel_work_sync(&flow->timeout_work);
+		pht_flow_shutdown_retransmit_sync(flow);
 		pht_flow_put(flow);
 	}
 
@@ -303,8 +320,7 @@ void pht_flow_table_destroy(struct pht_flow_table *table)
 	list_for_each_entry_safe(flow, tmp, &expired, gc_node) {
 		list_del_init(&flow->gc_node);
 		pht_flow_send_local_rst(flow);
-		timer_delete_sync(&flow->retransmit_timer);
-		cancel_work_sync(&flow->timeout_work);
+		pht_flow_shutdown_retransmit_sync(flow);
 		pht_flow_put(flow);
 	}
 }
@@ -367,7 +383,7 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table,
 	if (!table || !ep)
 		return ERR_PTR(-EINVAL);
 
-	flow = kzalloc(sizeof(*flow), GFP_KERNEL);
+	flow = kzalloc(sizeof(*flow), GFP_ATOMIC);
 	if (!flow)
 		return ERR_PTR(-ENOMEM);
 
@@ -375,7 +391,6 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table,
 	spin_lock_init(&flow->lock);
 	INIT_HLIST_NODE(&flow->hnode);
 	INIT_LIST_HEAD(&flow->gc_node);
-	INIT_WORK(&flow->timeout_work, pht_flow_timeout_work);
 	timer_setup(&flow->retransmit_timer, pht_flow_retransmit_timer, 0);
 	flow->table = table;
 	flow->oriented = *ep;
@@ -384,6 +399,7 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table,
 	flow->max_retries = table->handshake_retries;
 	flow->last_activity_jiffies = jiffies;
 	flow->retransmit_at_jiffies = jiffies;
+	flow->retransmit_armed = false;
 	pht_flow_key_from_endpoints(&flow->key, ep, &flow->local_is_low);
 	return flow;
 }
@@ -415,7 +431,7 @@ int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow)
 	return 0;
 }
 
-static void __pht_flow_remove(struct pht_flow *flow, bool from_timeout_work)
+static void __pht_flow_remove(struct pht_flow *flow, bool from_timer)
 {
 	struct pht_flow_bucket *bucket;
 	u32 idx;
@@ -440,9 +456,8 @@ static void __pht_flow_remove(struct pht_flow *flow, bool from_timeout_work)
 	flow->state = PHT_FLOW_STATE_DEAD;
 	spin_unlock_bh(&flow->lock);
 
-	timer_delete_sync(&flow->retransmit_timer);
-	if (!from_timeout_work)
-		cancel_work_sync(&flow->timeout_work);
+	if (!from_timer)
+		pht_flow_cancel_retransmit(flow);
 	pht_flow_put(flow);
 }
 
@@ -462,8 +477,6 @@ void pht_flow_touch(struct pht_flow *flow)
 }
 
 bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb)
-
-
 {
 	bool queued = false;
 
@@ -482,7 +495,6 @@ bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb)
 
 	return queued;
 }
-
 
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb)
 {
@@ -538,6 +550,7 @@ void pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state)
 void pht_flow_arm_retransmit(struct pht_flow *flow)
 {
 	unsigned long when;
+	bool take_ref = false;
 
 	if (!flow || !flow->table)
 		return;
@@ -548,25 +561,35 @@ void pht_flow_arm_retransmit(struct pht_flow *flow)
 		spin_unlock_bh(&flow->lock);
 		return;
 	}
+	if (!flow->retransmit_armed) {
+		flow->retransmit_armed = true;
+		take_ref = true;
+	}
 	when = jiffies + flow->table->handshake_timeout_jiffies;
 	flow->retransmit_at_jiffies = when;
 	spin_unlock_bh(&flow->lock);
 
+	if (take_ref)
+		pht_flow_get(flow);
 	mod_timer(&flow->retransmit_timer, when);
 }
 
 void pht_flow_cancel_retransmit(struct pht_flow *flow)
 {
+	bool drop_ref = false;
+	int deleted;
+
 	if (!flow)
 		return;
-	timer_delete_sync(&flow->retransmit_timer);
-}
 
-static void pht_flow_timeout_work(struct work_struct *work)
-{
-	struct pht_flow *flow = container_of(work, struct pht_flow, timeout_work);
+	deleted = timer_delete(&flow->retransmit_timer);
+	spin_lock_bh(&flow->lock);
+	if (deleted > 0 && flow->retransmit_armed) {
+		flow->retransmit_armed = false;
+		drop_ref = true;
+	}
+	spin_unlock_bh(&flow->lock);
 
-
-	pht_flow_send_local_rst(flow);
-	__pht_flow_remove(flow, true);
+	if (drop_ref)
+		pht_flow_put(flow);
 }

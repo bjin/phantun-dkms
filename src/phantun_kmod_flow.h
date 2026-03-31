@@ -49,7 +49,6 @@ struct pht_flow {
 	spinlock_t lock;
 	struct hlist_node hnode;
 	struct list_head gc_node;
-	struct work_struct timeout_work;
 	struct timer_list retransmit_timer;
 	struct pht_flow_table *table;
 	struct pht_flow_key key;
@@ -68,6 +67,7 @@ struct pht_flow {
 	unsigned long last_activity_jiffies;
 	unsigned long retransmit_at_jiffies;
 	bool local_is_low;
+	bool retransmit_armed;
 };
 
 struct pht_flow_bucket {
