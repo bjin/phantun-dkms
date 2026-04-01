@@ -7,7 +7,9 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 - `src/phantun_packet.[ch]`: IPv4/TCP/UDP parsing, packet build, checksum, tx/reinject helpers
 - `src/phantun_flow.[ch]`: flow table, timers, retries, queued skb handling
 - `Kbuild`, `Makefile`, `dkms.conf`: external module build / DKMS
+- `prepare-kernels.py`: CLI to download/verify Ubuntu mainline kernels for matrix testing
 - `DESIGN.md`: protocol/design notes
+- `TESTING.md`: detailed integration testing instructions
 - `PLAN.md`: implementation checklist
 
 ## Build
@@ -15,6 +17,11 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 - Refresh compile database: `make compile_commands`
 - If autodetect fails, pass `KDIR=/path/to/kernel/build`
 * Format: `clang-format -i --style=file src/some_file.c` (only do this before staging changes)
+
+## Testing
+- Integration tests use `pytest` + `virtme-ng` (COW snapshots).
+- Prepare kernels: `python prepare-kernels.py <ver>`
+- Run: `pytest tests [-v] [--kernel host|<ver>]`
 
 ## Important reminders
 - This project is IPv4-only for now.
@@ -25,6 +32,7 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 
 ## Coding style / safety
 - Kernel style: tabs, small static helpers, explicit return-value checks.
+* Trailing whitespaces should by removed in C and Python code.
 - Do not sleep in hook/atomic paths; use `GFP_ATOMIC` there.
 - Prefer cached config/state in hot paths instead of reparsing strings.
 - Use clear cleanup paths; keep teardown idempotent and avoid `BUG()` for recoverable failures.
