@@ -1,7 +1,9 @@
 import json
 import shlex
+import subprocess
 import textwrap
 import uuid
+from pathlib import Path
 
 NS_A = "pht-a"
 NS_B = "pht-b"
@@ -12,6 +14,26 @@ NS_ADDR_B = "10.200.0.2"
 PORTS_A = (2222, 4444)
 PORTS_B = (3333, 5555)
 
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+GUEST_UDP_SCENARIOS = str(PROJECT_ROOT / 'tests/guest/udp_scenarios.py')
+
+
+class GuestProcess:
+    def __init__(self, proc):
+        self.proc = proc
+
+    def communicate(self, timeout=None):
+        stdout, stderr = self.proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(
+            args=self.proc.args,
+            returncode=self.proc.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    def terminate(self):
+        self.proc.terminate()
 
 class NetnsOutputProbe:
     def __init__(self, namespace, table_name):
@@ -58,6 +80,51 @@ def run_in_netns(vm, namespace, cmd, check=True, **kwargs):
         return vm.run(['ip', 'netns', 'exec', namespace, *cmd], check=check, **kwargs)
 
     return vm.run(f"ip netns exec {shlex.quote(namespace)} bash -c {shlex.quote(cmd)}", check=check, **kwargs)
+
+
+def guest_command(cmd):
+    if isinstance(cmd, list):
+        return ' '.join(shlex.quote(part) for part in cmd)
+
+    return cmd
+
+
+def spawn_guest_command(vm, cmd, **kwargs):
+    ssh_cmd = vm.base_ssh_cmd + [f"bash -c {shlex.quote(guest_command(cmd))}"]
+    proc = subprocess.Popen(
+        ssh_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        **kwargs,
+    )
+    return GuestProcess(proc)
+
+
+def run_netns_scenario(vm, namespace, scenario, config, check=True, **kwargs):
+    return run_in_netns(
+        vm,
+        namespace,
+        ['python3', GUEST_UDP_SCENARIOS, scenario, json.dumps(config)],
+        check=check,
+        **kwargs,
+    )
+
+
+def spawn_netns_scenario(vm, namespace, scenario, config, **kwargs):
+    return spawn_guest_command(
+        vm,
+        ['ip', 'netns', 'exec', namespace, 'python3', GUEST_UDP_SCENARIOS, scenario, json.dumps(config)],
+        **kwargs,
+    )
+
+
+def parse_guest_json(stdout, context):
+    body = stdout.strip()
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"{context}: invalid guest JSON: {exc}: {body}") from exc
 
 
 def require_guest_command(vm, command):
