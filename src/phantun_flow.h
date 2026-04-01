@@ -16,9 +16,6 @@
 #define PHT_FLOW_BUCKETS 256U
 #define PHT_FLOW_GC_INTERVAL_SEC 30U
 
-#define PHT_FLOW_HS_REQ_VERIFIED BIT(0)
-#define PHT_FLOW_HS_RESP_VERIFIED BIT(1)
-
 enum pht_flow_role {
 	PHT_FLOW_ROLE_INITIATOR = 0,
 	PHT_FLOW_ROLE_RESPONDER,
@@ -27,9 +24,6 @@ enum pht_flow_role {
 enum pht_flow_state {
 	PHT_FLOW_STATE_SYN_SENT = 0,
 	PHT_FLOW_STATE_SYN_RCVD,
-	PHT_FLOW_STATE_AWAIT_HS_REQ,
-	PHT_FLOW_STATE_HS_REQ_SENT,
-	PHT_FLOW_STATE_HS_RESP_SENT,
 	PHT_FLOW_STATE_ESTABLISHED,
 	PHT_FLOW_STATE_DEAD,
 };
@@ -62,12 +56,13 @@ struct pht_flow {
 	u32 local_isn;
 	u32 peer_syn_next;
 	struct sk_buff *queued_skb;
-	u8 handshake_flags;
 	unsigned int retries_done;
 	unsigned int max_retries;
 	unsigned long last_activity_jiffies;
 	unsigned long retransmit_at_jiffies;
 	bool local_is_low;
+	bool drop_next_rx_payload;
+	bool response_pending_ack;
 	bool retransmit_armed;
 };
 

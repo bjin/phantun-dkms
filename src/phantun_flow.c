@@ -43,19 +43,14 @@ static int pht_flow_send_local_rst(struct pht_flow *flow)
 
 static int pht_flow_retransmit_now(struct pht_flow *flow)
 {
-	const struct phantun_config *cfg;
 	struct pht_ipv4_endpoint_pair ep;
 	u32 seq;
 	u32 ack;
 	enum pht_flow_state state;
-	size_t len = 0;
-	const char *payload = NULL;
 	u8 flags = 0;
 
-	if (!flow || !flow->table || !flow->table->net || !flow->table->cfg)
+	if (!flow || !flow->table || !flow->table->net)
 		return -EINVAL;
-
-	cfg = flow->table->cfg;
 	spin_lock_bh(&flow->lock);
 	state = flow->state;
 	ep = flow->oriented;
@@ -65,21 +60,10 @@ static int pht_flow_retransmit_now(struct pht_flow *flow)
 		seq = flow->local_isn;
 		ack = 0;
 		flags = PHT_TCP_FLAG_SYN;
-	} else if (state == PHT_FLOW_STATE_SYN_RCVD ||
-		   state == PHT_FLOW_STATE_AWAIT_HS_REQ) {
+	} else if (state == PHT_FLOW_STATE_SYN_RCVD) {
 		seq = flow->local_isn;
 		ack = flow->peer_syn_next;
 		flags = PHT_TCP_FLAG_SYN | PHT_TCP_FLAG_ACK;
-	} else if (state == PHT_FLOW_STATE_HS_REQ_SENT) {
-		payload = cfg->handshake_request;
-		len = cfg->handshake_request_len;
-		seq = flow->local_isn + 1;
-		flags = PHT_TCP_FLAG_ACK;
-	} else if (state == PHT_FLOW_STATE_HS_RESP_SENT) {
-		payload = cfg->handshake_response;
-		len = cfg->handshake_response_len;
-		seq = flow->local_isn + 1;
-		flags = PHT_TCP_FLAG_ACK;
 	}
 	spin_unlock_bh(&flow->lock);
 
@@ -87,7 +71,7 @@ static int pht_flow_retransmit_now(struct pht_flow *flow)
 		return 0;
 
 	return pht_emit_fake_tcp_v4(flow->table->net, &ep, seq, ack, flags,
-				    payload, len);
+				    NULL, 0);
 }
 
 static void pht_flow_gc_worker(struct work_struct *work);
@@ -200,9 +184,6 @@ bool pht_flow_state_is_half_open(enum pht_flow_state state)
 	switch (state) {
 	case PHT_FLOW_STATE_SYN_SENT:
 	case PHT_FLOW_STATE_SYN_RCVD:
-	case PHT_FLOW_STATE_AWAIT_HS_REQ:
-	case PHT_FLOW_STATE_HS_REQ_SENT:
-	case PHT_FLOW_STATE_HS_RESP_SENT:
 		return true;
 	default:
 		return false;

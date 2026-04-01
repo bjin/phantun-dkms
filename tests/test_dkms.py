@@ -8,7 +8,7 @@ def test_kernel_version(vm):
 
 def test_module_load_success(phantun_module, dmesg, vm):
     """Test that the module loads successfully via DKMS installed modprobe."""
-    phantun_module.load(managed_ports="1234", handshake_request="hello", handshake_response="world")
+    phantun_module.load(managed_ports="1234")
 
     res = vm.run(['lsmod'])
     if 'phantun' not in res.stdout:
@@ -19,7 +19,7 @@ def test_module_load_success(phantun_module, dmesg, vm):
 
 def test_module_unload_success(phantun_module, dmesg, vm):
     """Test that the module unloads cleanly."""
-    phantun_module.load(managed_ports="4321", handshake_request="ping", handshake_response="pong")
+    phantun_module.load(managed_ports="4321")
 
     res = vm.run(['lsmod'])
     if 'phantun' not in res.stdout:
@@ -36,12 +36,12 @@ def test_module_unload_success(phantun_module, dmesg, vm):
 
 def test_module_reload_new_params(phantun_module, dmesg):
     """Test that the module can be reloaded with different parameters seamlessly."""
-    phantun_module.load(managed_ports="1111", handshake_request="req1", handshake_response="res1")
+    phantun_module.load(managed_ports="1111")
     if not dmesg.wait_for(r'registered IPv4 LOCAL_OUT and PRE_ROUTING hooks', timeout=5):
         pytest.fail("First load failed")
 
     # .load() automatically unloads before loading new options
-    phantun_module.load(managed_ports="2222", handshake_request="req2", handshake_response="res2")
+    phantun_module.load(managed_ports="2222")
 
     if not dmesg.wait_for(r'registered IPv4 LOCAL_OUT and PRE_ROUTING hooks', timeout=5):
         pytest.fail("Second load (reload) failed")

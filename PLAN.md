@@ -6,14 +6,13 @@
   - [x] IPv4 only
   - [x] kernel module only
   - [x] symmetric initiator/responder flows
-  - [x] mandatory `handshake_request` / `handshake_response`
+  - [x] optional best-effort `handshake_request` / `handshake_response`
   - [x] one queued UDP skb per half-open flow
   - [x] no userspace-Phantun compatibility promise
 - [x] Convert the design assumptions into module constants / config knobs:
   - [x] managed local ports
-  - [x] handshake request bytes
-  - [x] handshake response bytes
-  - [x] handshake timeout and retry count
+  - [x] optional handshake request / response bytes
+  - [x] SYN / `SYN|ACK` retransmit timeout and retry count
   - [x] idle timeout
   - [x] optional remote IPv4 / remote port filters
 
@@ -51,7 +50,7 @@
   - [x] state
   - [x] seq / ack / last_ack
   - [x] queued skb pointer
-  - [x] handshake verification flags
+  - [x] first-payload ignore / responder-response-pending flags
   - [x] retry / timeout bookkeeping
   - [x] last activity timestamp
 - [x] Choose locking/refcount strategy
@@ -87,34 +86,22 @@
   - [x] send `SYN|ACK`
 - [x] For existing responder flow:
   - [x] validate final ACK number
-  - [x] transition to `AWAIT_HS_REQ` or directly consume `ACK + handshake_request`
+  - [x] transition directly to `ESTABLISHED` after the three-way handshake
+  - [x] when `handshake_request` is configured, drop the first inbound payload without validating it
+  - [x] when both control payloads are configured, send `ACK + handshake_response` and hold responder-owned queued UDP until a later initiator ACK covers it
   - [x] resend `SYN|ACK` on duplicate/retransmitted `SYN` while still half-open
-  - [x] tolerate pure duplicate `ACK` while waiting for the first control payload
 - [x] Never let fake-TCP reach the real TCP stack
 
-## Phase 6 - mandatory control payload handshake
+## Phase 6 - optional handshake payload shaping
 
-- [x] Implement initiator `HS_REQ_SENT`
-  - [x] after valid `SYN|ACK`, send `ACK + handshake_request`
-  - [x] retransmit on timeout if needed
-  - [x] resend `ACK + handshake_request` if a duplicate valid `SYN|ACK` arrives before response verification
-- [x] Implement responder request verification
-  - [x] exact length match
-  - [x] exact byte-for-byte match
-  - [x] mismatch => `RST` + destroy flow
-- [x] Implement responder post-response state (`HS_RESP_SENT`)
-  - [x] send `ACK + handshake_response`
-  - [x] resend the same control response on duplicate exact `handshake_request`
-  - [x] wait for later initiator traffic to acknowledge the response before flushing responder-owned queued UDP
-- [x] Implement initiator response verification
-  - [x] exact length match
-  - [x] exact byte-for-byte match
-  - [x] mismatch => `RST` + destroy flow
-- [x] Ensure control payloads are consumed internally and never delivered to UDP sockets
-- [x] Flush the initiator-owned queued UDP skb only after initiator response verification succeeds
-- [x] Define the responder-owned queued UDP release/drop rule explicitly
-  - [x] flush only after later initiator traffic acknowledges `handshake_response`
-  - [x] drop on teardown or handshake timeout
+- [x] If `handshake_request` is set, initiator sends `ACK + handshake_request` as its first fake-TCP payload
+- [x] If `handshake_request` is not set, initiator flushes the queued first UDP packet immediately after `SYN|ACK` (or sends a pure `ACK` if nothing is queued)
+- [x] Responder never verifies the first inbound payload; when request shaping is enabled it drops the first inbound payload it sees
+- [x] If both `handshake_request` and `handshake_response` are set, responder sends `ACK + handshake_response` as its first responder payload
+- [x] If only `handshake_response` is set, treat it as disabled and keep normal data flow
+- [x] Initiator never verifies the first responder payload; when response shaping is enabled it drops the first inbound responder payload it sees
+- [x] Missing, duplicated, or unexpected request/response shaping payloads do not reset or tear down the flow
+- [x] Keep responder-owned queued UDP blocked only until a later initiator ACK covers an injected `handshake_response`
 
 ## Phase 7 - symmetric conflict resolution
 
@@ -151,11 +138,12 @@
 - [ ] Add counters for:
   - [ ] flows created
   - [ ] flows established
-  - [ ] handshake request mismatches
-  - [ ] handshake response mismatches
+  - [ ] optional request payloads injected
+  - [ ] optional response payloads injected
   - [ ] collisions won/lost
   - [ ] RST sent
-  - [ ] UDP packets queued/dropped during handshake
+  - [ ] UDP packets queued/dropped while half-open or while a responder control response is waiting for ACK
+  - [ ] first inbound payloads dropped by shaping logic
 - [ ] Add ratelimited warnings for malformed traffic
 - [ ] Add a debug dump path for active flows
 - [ ] Make teardown paths idempotent
@@ -165,27 +153,67 @@
 
 ## Phase 11 - testing
 
-### Namespace / integration tests
+### Current coverage / framework baseline
 
-- [ ] Two network namespaces, one managed port, raw UDP echo
-- [ ] Initiator-only handshake success path
-- [ ] Request mismatch => responder sends `RST`
-- [ ] Response mismatch => initiator sends `RST`
-- [ ] Duplicate outbound UDP while half-open => only one flow exists
+- [x] `tests/test_dkms.py` covers DKMS build, module load, module unload, and reload-with-new-params inside the virtme-ng guest
+- [x] `tests/conftest.py` provides the shared `vm`, `phantun_module`, and `dmesg` fixtures
+- [ ] Keep Phase 11 aligned with the current pytest + virtme-ng conventions instead of inventing a second harness
+
+### Shared test infrastructure additions
+
+- [ ] Extend the existing fixture-driven framework; do not duplicate VM, DKMS, or dmesg lifecycle code in individual tests
+- [ ] Add reusable guest-side helpers for common setup/teardown steps so `test_*.py` files stay short and readable:
+  - [ ] network namespace create/delete
+  - [ ] veth pair creation, addressing, link-up, and route setup
+  - [ ] small UDP send/receive/echo helpers invoked via `vm.run(...)`
+  - [ ] common wait/assert helpers for process completion and expected dmesg patterns
+- [ ] Keep shared helpers in the current `tests/` support code path (`conftest.py` and, if they grow beyond a few small helpers, a dedicated helper module imported by tests)
+- [ ] Keep assertions explicit: observable packet/result checks first, `dmesg` verification second, `pytest.fail(...)` for clear failures
+
+### Loopback UDP translation tests
+
+- [ ] Add `tests/test_loopback_udp.py` for same-VM coverage over `lo`
+- [ ] Cover loopback traffic between `127.0.0.2` and `127.0.0.3` on the same managed UDP port
+- [ ] Cover loopback traffic using the same loopback address but different UDP ports
+- [ ] Verify the plain no-hint path: with no `handshake_request` configured, the first queued UDP payload is delivered end-to-end
+- [ ] Verify idle timeout => flow is removed and the next UDP packet triggers a fresh handshake
+
+### Optional handshake behavior tests
+
+- [ ] Add `tests/test_handshakes.py` for focused first-payload-shaping coverage using the existing virtme-ng + pytest harness
+- [ ] Reuse the shared UDP/helper code so these tests describe behavior, not shell plumbing
+- [ ] `handshake_request` only => initiator injects the configured request, responder drops exactly one inbound payload, and later payloads continue normally
+- [ ] `handshake_request` + `handshake_response` => responder injects the configured response, initiator drops exactly one inbound responder payload, and the flow stays established
+- [ ] `handshake_response` without `handshake_request` => both sides behave like the no-hint path
+- [ ] Duplicate pure ACKs and unexpected first-payload contents do not trigger `RST` or teardown once the three-way handshake has completed
+
+### Namespace + veth UDP integration tests
+
+- [ ] Add `tests/test_netns_udp.py` that creates two guest network namespaces and connects them with a veth pair
+- [ ] Reuse the shared namespace/veth helpers so each test body describes topology plus expectations, not shell plumbing
+- [ ] End-to-end raw UDP echo/data with no optional handshake payloads configured
+- [ ] Request-only path across namespaces
+- [ ] Request+response path across namespaces
+- [ ] Duplicate outbound UDP while half-open => only one flow exists; one packet may be queued, later packets are dropped per design
 - [ ] Duplicate initiator `SYN` after lost `SYN|ACK` => responder re-sends `SYN|ACK` without creating a second flow
-- [ ] Duplicate responder `SYN|ACK` before response verification => initiator re-sends `ACK + handshake_request`
-- [ ] Lost `handshake_response` => initiator repeats request and responder re-sends the control response instead of treating it as user data
-- [ ] Simultaneous initiation => deterministic winner, one surviving flow
-- [ ] Simultaneous-initiation loser with a queued UDP skb => packet is either flushed by the responder rule or dropped on timeout, never retained indefinitely
-- [ ] Idle timeout => flow removed and next UDP triggers a new handshake
+- [ ] Responder-owned queued UDP is flushed only after a later initiator ACK covers an injected `handshake_response`
+- [ ] If an injected `handshake_request` is lost, the next payload seen by the responder is dropped once, but the flow stays established
+- [ ] If an injected `handshake_response` is lost, the initiator does not tear the flow down; later responder payloads still progress the flow
+- [ ] Simultaneous initiation => deterministic winner and exactly one surviving flow
+- [ ] Simultaneous-initiation loser with a queued UDP skb => packet is flushed by the responder rule or dropped on timeout, never retained indefinitely
+- [ ] Unknown inbound non-`RST` fake-TCP => module sends `RST|ACK`
+- [ ] Stray inbound `RST` or teardown path => local state is cleaned up without spurious flow recreation
 
-### WireGuard-specific tests
+### WireGuard end-to-end tests
 
-- [ ] kernel WireGuard peer-to-peer over the module
-- [ ] `wireguard-go` peer-to-peer over the module
-- [ ] mixed kernel WireGuard <-> `wireguard-go`
-- [ ] verify no endpoint rewrite to `127.0.0.1:*` is needed
-- [ ] verify roaming still works because the real peer IP/port stay visible to WireGuard
+- [ ] Add `tests/test_wireguard.py` using the same two-namespace veth topology, then create one kernel WireGuard gateway inside each namespace
+- [ ] Verify kernel WireGuard peer-to-peer handshake and bidirectional payload delivery over the module
+- [ ] Verify no endpoint rewrite to `127.0.0.1:*` is needed
+- [ ] Verify the real peer IP/port remain visible to WireGuard so roaming semantics are preserved
+- [ ] After the kernel-WireGuard path is stable, reuse the same topology helpers for `wireguard-go` peer-to-peer coverage
+- [ ] After that, add mixed kernel WireGuard <-> `wireguard-go` coverage without creating a separate topology harness
+- [ ] Run the fast loopback/handshake/netns suites first on `--kernel host`, then use the existing pytest kernel-matrix options for broader regression coverage of the stable scenarios
+
 
 ## Phase 12 - documentation
 
@@ -194,7 +222,7 @@
   - [ ] allow local inbound UDP delivery on the managed port for reinjected payloads
   - [ ] old TUN NAT rules are not required for this mode
 - [ ] Document MTU reduction requirements for WireGuard
-- [ ] Document that control payloads are internal and not delivered to the UDP app
+- [ ] Document when optional control payloads are injected/ignored and when they are not delivered to the UDP app
 - [ ] Document incompatibility with existing userspace client/server assumptions
 - [ ] Add operational examples for:
   - [ ] kernel WireGuard
@@ -210,10 +238,10 @@
 6. Phase 6
 7. Phase 7
 8. Phase 8
-9. Phase 11 basic namespace tests
+9. Phase 11 loopback + handshake + namespace UDP tests
 10. Phase 9
 11. Phase 10
-12. Phase 11 WireGuard coverage
+12. Phase 11 WireGuard end-to-end tests
 13. Phase 12
 
 ## Explicit deferrals

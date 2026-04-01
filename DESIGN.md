@@ -12,7 +12,7 @@ Primary goals:
 - IPv4 only in v1
 - No TUN-side DNAT/SNAT topology
 - Preserve the fake-TCP three-way handshake, sequence/ack behavior, and RST-on-error behavior from `fake-tcp`
-- Add mandatory first-payload verification so the first request/response packets contain configured ASCII-looking bytes
+- Add optional first-payload shaping so configured request/response bytes can make the opening packets look ASCII-like without becoming a required verified sub-protocol
 - Remove fixed client/server node roles; each flow has only:
   - initiator
   - responder
@@ -52,12 +52,12 @@ From `../phantun/phantun/src/bin/client.rs` and `server.rs`:
 - Phantun can inject a configured first payload via `--handshake-packet`
 - The peer can skip delivering that payload to UDP via `--ignore-first-packet`
 
-For the kernel design, that becomes stricter:
+For the kernel design, this becomes a best-effort shaping hint rather than a verified sub-protocol:
 
-- first payload is mandatory, not optional
-- both sides know exactly what first request and first response must be
-- those control payloads are consumed by the module and are never delivered to the local UDP socket
-- `ignore-first-packet` disappears because the module handles it internally
+- `handshake_request` can optionally replace the initiator's first user payload
+- `handshake_response` can optionally replace the responder's first user payload, but only when `handshake_request` is also configured
+- when those hints are active, the matching first inbound payload is ignored locally and is never delivered to the UDP socket
+- loss, duplication, or absence of those payloads does not break flow establishment
 
 ### `xt_wgobfs`
 
@@ -89,7 +89,7 @@ Implement the core as an out-of-tree C kernel module using raw netfilter hooks.
   - intercept outbound UDP
   - create fake-TCP packets
   - intercept inbound fake-TCP before the real TCP stack sees it
-  - verify the first payload request/response pair
+  - optionally inject/drop first-payload hints without enforcing them
   - reinject decapsulated UDP into the local stack
   - manage timers, retransmissions, GC, and conflict resolution
 - This fits netfilter + `sk_buff` directly.
@@ -128,38 +128,39 @@ Optional peer restrictions may narrow matching by remote IPv4 CIDR and/or remote
 
 ## 5. Protocol changes relative to today
 
-## 5.1 Mandatory control payloads
+## 5.1 Optional control-payload hints
 
-The old optional user-space handshake-packet feature becomes a protocol requirement.
+The old user-space handshake-packet feature remains available as an optional shaping hint, not as a protocol requirement.
 
-New module parameters / config:
+Module parameters / config:
 
-- `handshake_request`: required ASCII byte string
-- `handshake_response`: required ASCII byte string
+- `handshake_request`: optional byte string
+- `handshake_response`: optional byte string; only used when `handshake_request` is also configured
 
-Protocol rule:
+Protocol rules:
 
-- initiator must send `handshake_request` as the first fake-TCP payload
-- responder must verify it exactly
-- responder must then send `handshake_response` as its first fake-TCP payload
-- initiator must verify it exactly
-- mismatch or timeout => send `RST` and destroy flow
+- if `handshake_request` is configured, the initiator sends it as the first fake-TCP payload
+- if `handshake_request` is configured, the responder ignores the first inbound payload it sees for that flow
+- if `handshake_request` is not configured, the initiator sends the first queued UDP packet as its first fake-TCP payload; if no queued packet exists, it sends a pure final `ACK`
+- if both `handshake_request` and `handshake_response` are configured, the responder sends `handshake_response` as its first fake-TCP payload and the initiator ignores the first inbound payload it sees for that flow
+- if only `handshake_response` is configured, it has no effect
+- these payloads are best-effort shaping hints, not a verified handshake; missing, duplicated, or unexpected payloads do not trigger `RST` or teardown
 
-These control payloads are module-internal and are not delivered to UDP sockets.
+Only payloads intentionally ignored by the shaping logic are kept away from the UDP socket.
 
-## 5.2 ACK + first payload are combined
+## 5.2 ACK + optional first payload are combined
 
-To maximize the chance that the first request packet on the TCP connection looks like a plausible ASCII protocol exchange, the initiator should send the final handshake `ACK` together with `handshake_request` in the same TCP packet.
+When `handshake_request` is configured, module-generated initiator traffic still combines the final handshake `ACK` with `handshake_request` in the same TCP packet.
 
-So the normal path is:
+So the preferred path becomes:
 
 1. initiator: `SYN`
 2. responder: `SYN|ACK`
-3. initiator: `ACK + handshake_request`
-4. responder: `ACK + handshake_response`
-5. normal data packets begin
+3. initiator: `ACK + handshake_request` when configured, otherwise `ACK + first UDP payload` when a queued packet exists
+4. responder: `ACK + handshake_response` when both control payloads are configured, otherwise normal responder data may begin immediately
+5. normal data packets continue
 
-Responder should still be coded to tolerate a split final `ACK` followed immediately by a request payload, but module-generated traffic should always use the combined form.
+Responder code should still accept either a combined final `ACK + payload` or a pure final `ACK` followed by later payload, because the shaping hints are optional.
 
 ## 5.3 Symmetric role model
 
@@ -215,9 +216,9 @@ True simultaneous open is rejected.
 
 Reason:
 
-- it conflicts with the new requirement that the first payload from each role is predetermined (`request` from initiator, `response` from responder)
-- supporting TCP-style simultaneous open would require an additional role negotiation phase or ambiguous first payloads
-- that defeats the “first request/response should look like ASCII application traffic” goal
+- the translator still wants one surviving flow per canonical tuple
+- deterministic collapse keeps initiator/responder orientation stable without adding a second conflict-resolution handshake
+- optional first-payload shaping remains unambiguous once only one flow survives
 
 ### Chosen policy: deterministic collapse
 
@@ -240,8 +241,9 @@ Each flow contains:
 - send sequence number
 - receive acknowledgement number
 - last acknowledged value
-- `handshake_verified` flags
 - one queued UDP skb pointer
+- one-shot first-inbound-payload ignore flag
+- responder control-response pending-ACK flag
 - retransmit timer state
 - idle timestamp
 - refcount + lock
@@ -262,38 +264,26 @@ Actions:
 Accepts:
 
 - valid `SYN|ACK` with exact `ack = syn_seq + 1`
-- duplicate valid `SYN|ACK` while still waiting for the control response => resend `ACK + handshake_request`
 - collision `SYN` for deterministic tie-break handling
 - `RST` => destroy flow
 
-### `HS_REQ_SENT`
+On valid `SYN|ACK`:
 
-Entered after valid `SYN|ACK`.
-
-Actions:
-
-- advance seq for the sent `SYN`
 - set `ack = responder_seq + 1`
-- send `ACK + handshake_request`
-- advance seq by `handshake_request.len()`
-- restart retransmit/response timer
-
-Accepts:
-
-- duplicate valid `SYN|ACK` => resend `ACK + handshake_request`
-- exact first responder payload `handshake_response` => transition to `ESTABLISHED`
-- pure `ACK` with no payload => ignore and keep waiting
-- anything else => `RST` + destroy
+- if `handshake_request` is configured, send `ACK + handshake_request`
+- otherwise, if a queued UDP skb exists, send it as the first fake-TCP payload; if none exists, send a pure final `ACK`
+- if both `handshake_request` and `handshake_response` are configured, arm a one-shot drop for the first responder payload
+- transition immediately to `ESTABLISHED`
 
 ### `ESTABLISHED`
 
-Entered only after exact response verification.
+Entered as soon as the three-way handshake completes.
 
 Actions:
 
-- mark request/response exchange complete
-- flush the initiator-owned queued UDP skb as the first user-data payload
-- from now on translate UDP <-> fake-TCP normally
+- if `handshake_request` was configured, flush the initiator-owned queued UDP skb after the injected request packet
+- if the one-shot inbound ignore flag is armed, drop the first responder payload received and then clear the flag
+- from then on translate UDP <-> fake-TCP normally
 
 ## 7.2 Responder states
 
@@ -317,65 +307,36 @@ Actions:
 Accepts while still half-open:
 
 - duplicate inbound `SYN` retransmit => resend `SYN|ACK` and stay in `SYN_RCVD`
-- valid final `ACK` => transition to `AWAIT_HS_REQ`
-- valid combined `ACK + handshake_request` => verify request immediately and, if exact, transition to `HS_RESP_SENT`
+- valid final `ACK`
 
-### `AWAIT_HS_REQ`
+On valid final `ACK`:
 
-Entered after receiving a valid final `ACK` with no control payload.
+- advance local `seq` to `responder_seq + 1`
+- if `handshake_request` is configured and the final `ACK` already carries payload, drop that payload immediately
+- if `handshake_request` is configured and the final `ACK` carries no payload, arm a one-shot drop for the first later inbound payload
+- if both `handshake_request` and `handshake_response` are configured, send `ACK + handshake_response`, advance `seq` by `handshake_response.len()`, and keep responder-owned queued UDP blocked until a later initiator `ACK` covers the end of that injected response
+- otherwise transition directly to `ESTABLISHED`; responder-owned queued UDP may flow immediately
 
-The module should accept both:
-
-- pure duplicate `ACK`, then continue waiting for first payload
-- a later payload packet whose first payload is `handshake_request`
-
-Validation:
-
-- final ACK number must equal `responder_seq + 1`
-- duplicate `SYN` retransmit from the initiator => resend `SYN|ACK`
-- if the first payload is present, it must exactly equal `handshake_request`
-
-### `HS_RESP_SENT`
-
-Entered only after exact request verification and after sending `ACK + handshake_response`.
-
-Actions:
-
-- consume request control payload internally
-- send `ACK + handshake_response`
-- advance seq by `handshake_response.len()`
-- keep any responder-owned queued UDP skb, if present, until later initiator traffic acknowledges the control response
-
-Accepts:
-
-- duplicate exact `handshake_request` => resend `ACK + handshake_response` and stay in `HS_RESP_SENT`
-- the first later initiator packet whose ACK covers the end of `handshake_response` => transition to `ESTABLISHED`
-- if that same packet also carries user payload, process it as the first normal inbound UDP payload while transitioning
-- `RST` => destroy flow
-
-## 7.3 Common established behavior
+### `ESTABLISHED`
 
 After establishment:
 
 - outbound UDP becomes fake-TCP `ACK + payload`
-- incoming fake-TCP payload becomes local UDP
+- incoming fake-TCP payload becomes local UDP unless the one-shot ignore flag is still armed; if it is armed, drop that first payload and clear the flag
 - `seq` grows by payload length on send
 - `ack` tracks peer `seq + payload_len` on receive
-- initiator-owned queued UDP is flushed only after exact response verification
-- responder-owned queued UDP is flushed only after a later initiator packet acknowledges `handshake_response`; if teardown or timeout happens first, it is dropped
+- if an injected responder `handshake_response` is still waiting for acknowledgement, local responder UDP is queued/dropped by the one-skb rule until a later initiator `ACK` covers it; inbound initiator traffic is still processed normally
 - idle timeout destroys the flow and sends `RST`
 - explicit peer `RST` destroys the flow silently
 
 ## 8. Strict failure policy
 
-Mismatch handling is intentionally harsh.
+Optional first-payload hints are best-effort and are never validated.
 
 Cases that trigger immediate `RST` + flow destruction:
 
 - bad `SYN` alignment
-- wrong ACK number during handshake
-- first request payload != configured `handshake_request`
-- first response payload != configured `handshake_response`
+- wrong final `ACK` number during the three-way handshake
 - impossible flag/state combination
 - non-`RST` packet for unknown tuple
 
@@ -383,6 +344,8 @@ Cases that do not trigger a reply:
 
 - stray inbound `RST` for unknown tuple
 - inbound `RST` for an existing tuple: just destroy local state
+
+Missing, duplicated, or unexpected optional request/response payloads are tolerated; later packets continue to drive normal `seq`/`ack` state.
 
 ## 9. Packet path in the kernel
 
@@ -470,11 +433,11 @@ Use simple module configuration first, not rule-language integration.
 Required config:
 
 - managed local port list
-- `handshake_request`
-- `handshake_response`
 
 Recommended optional config:
 
+- `handshake_request`
+- `handshake_response` (effective only when `handshake_request` is also configured)
 - allowed remote IPv4 CIDRs
 - allowed remote ports
 - idle timeout
@@ -519,8 +482,8 @@ This design is intentionally not just “Phantun client/server in kernel”.
 It changes the contract in important ways:
 
 - no node-level client/server split
-- mandatory request/response control payload verification
-- internal consumption of those control payloads
+- optional best-effort request/response first-payload shaping instead of mandatory verification
+- local dropping of the first inbound payload when shaping is enabled
 - deterministic simultaneous-initiation collapse
 - no TUN topology
 
@@ -542,7 +505,7 @@ Everything beyond the first queued skb is dropped during handshake.
 
 ### Deterministic tie-break instead of simultaneous open
 
-Chosen because it preserves a single unambiguous initiator/responder pair and keeps the first payload semantics fixed.
+Chosen because it preserves a single unambiguous initiator/responder pair, keeps one translator per tuple, and leaves any optional first-payload shaping unambiguous.
 
 ### Managed local ports, not a fake TCP listener socket
 
