@@ -70,6 +70,84 @@ def echo_client(config):
     _emit({'sent': payloads, 'echoed': echoed})
 
 
+def recv_many(config):
+    received = []
+    target_count = config['count']
+
+    with _socket(config['bind_addr'], config['bind_port']) as sock:
+        while len(received) < target_count:
+            data, addr = sock.recvfrom(2048)
+            received.append({
+                'message': data.decode(),
+                'peer': [addr[0], addr[1]],
+            })
+
+    _emit({'received': received})
+
+
+def send_many(config):
+    payloads = config['payloads']
+    delay_ms = config.get('delay_ms', 0)
+
+    with _socket(config['bind_addr'], config['bind_port']) as sock:
+        for payload in payloads:
+            sock.sendto(payload.encode(), (config['target_addr'], config['target_port']))
+            if delay_ms:
+                import time
+                time.sleep(delay_ms / 1000.0)
+
+    _emit({'sent': payloads})
+
+
+def recv_many_reply(config):
+    received = []
+    replies = []
+    reply_payloads = config.get('replies', [])
+    target_count = config['count']
+
+    with _socket(config['bind_addr'], config['bind_port']) as sock:
+        while len(received) < target_count:
+            data, addr = sock.recvfrom(2048)
+            message = data.decode()
+            index = len(received)
+            received.append({
+                'message': message,
+                'peer': [addr[0], addr[1]],
+            })
+
+            if index < len(reply_payloads) and reply_payloads[index] is not None:
+                sock.sendto(reply_payloads[index].encode(), addr)
+                replies.append({
+                    'message': reply_payloads[index],
+                    'peer': [addr[0], addr[1]],
+                })
+
+    _emit({'received': received, 'replies': replies})
+
+
+def send_many_recv(config):
+    payloads = config['payloads']
+    recv_count = config['recv_count']
+    replies = []
+    delay_ms = config.get('delay_ms', 0)
+
+    with _socket(config['bind_addr'], config['bind_port']) as sock:
+        for payload in payloads:
+            sock.sendto(payload.encode(), (config['target_addr'], config['target_port']))
+            if delay_ms:
+                import time
+                time.sleep(delay_ms / 1000.0)
+
+        while len(replies) < recv_count:
+            data, addr = sock.recvfrom(2048)
+            replies.append({
+                'message': data.decode(),
+                'peer': [addr[0], addr[1]],
+            })
+
+    _emit({'sent': payloads, 'replies': replies})
+
+
 def multi_server(config):
     received = []
     target_count = config['count']
@@ -129,6 +207,10 @@ SCENARIOS = {
     'ping_client': ping_client,
     'echo_server': echo_server,
     'echo_client': echo_client,
+    'recv_many': recv_many,
+    'send_many': send_many,
+    'recv_many_reply': recv_many_reply,
+    'send_many_recv': send_many_recv,
     'multi_server': multi_server,
     'multi_client': multi_client,
 }

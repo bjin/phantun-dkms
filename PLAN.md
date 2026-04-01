@@ -165,24 +165,21 @@
 - [x] Add reusable guest-side helpers for common setup/teardown steps so `test_*.py` files stay short and readable:
   - [x] network namespace create/delete
   - [x] veth pair creation, addressing, link-up, and route setup
-  - [x] small UDP send/receive/echo helpers invoked via `vm.run(...)`
+  - [x] small UDP send/receive/echo helpers invoked via checked-in guest scripts under `tests/guest/`
   - [x] nftables OUTPUT-counter helpers for TCP-vs-UDP verification on managed tuples
-- [x] Keep shared helpers in the current `tests/` support code path via `tests/helpers.py`
+  - [x] namespace guest-scenario runner helpers for synchronous/asynchronous test roles
+- [x] Keep shared helpers in the current `tests/` support code path via `tests/helpers.py` and `tests/guest/udp_scenarios.py`
 - [x] Keep assertions explicit: observable packet/result checks first, `dmesg` verification second, `pytest.fail(...)` for clear failures
-
-### Loopback UDP translation tests
-
-- [x] Decide to defer same-host loopback coverage for now because it drives loopback-specific behavior that is not representative of the intended deployment path
-- [ ] Revisit loopback only if the module later grows an explicit requirement to support same-host fake-TCP translation semantics
 
 ### Optional handshake behavior tests
 
-- [ ] Add `tests/test_handshakes.py` for focused first-payload-shaping coverage using the existing virtme-ng + pytest harness
-- [ ] Reuse the shared UDP/helper code so these tests describe behavior, not shell plumbing
-- [ ] `handshake_request` only => initiator injects the configured request, responder drops exactly one inbound payload, and later payloads continue normally
-- [ ] `handshake_request` + `handshake_response` => responder injects the configured response, initiator drops exactly one inbound responder payload, and the flow stays established
-- [ ] `handshake_response` without `handshake_request` => both sides behave like the no-hint path
+- [x] Add `tests/test_handshakes.py` for focused first-payload-shaping coverage using the existing virtme-ng + pytest harness
+- [x] Reuse the shared guest-scenario/helper code so these tests describe behavior, not shell plumbing
+- [x] `handshake_request` only => initiator injects the configured request, responder drops the shaped packet from the UDP app view, and later payloads continue normally
+- [x] `handshake_request` + `handshake_response` => responder injects the configured response, initiator drops the shaped responder payload from the UDP app view, and the flow stays established
+- [x] `handshake_response` without `handshake_request` => both sides behave like the no-hint path
 - [ ] Duplicate pure ACKs and unexpected first-payload contents do not trigger `RST` or teardown once the three-way handshake has completed
+- [ ] Loss-injection cases for request/response shaping once the exact tolerated-loss behavior is locked down against the implementation
 
 ### Namespace + veth UDP integration tests
 
@@ -192,8 +189,8 @@
 - [x] End-to-end raw UDP ten-packet echo/data verification with exact payload matching (order independent)
 - [x] 2x2 multi-port coverage across `2222/4444 -> 3333/5555` with distinct payloads per channel
 - [x] TCP-only verification on the veth path: raw UDP is dropped/counted in nft OUTPUT rules while translated TCP is counted and the test still succeeds
-- [ ] Request-only path across namespaces
-- [ ] Request+response path across namespaces
+- [x] Request-only path across namespaces
+- [x] Request+response path across namespaces
 - [ ] Duplicate outbound UDP while half-open => only one flow exists; one packet may be queued, later packets are dropped per design
 - [ ] Duplicate initiator `SYN` after lost `SYN|ACK` => responder re-sends `SYN|ACK` without creating a second flow
 - [ ] Responder-owned queued UDP is flushed only after a later initiator ACK covers an injected `handshake_response`

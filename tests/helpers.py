@@ -187,6 +187,40 @@ def make_netns_output_probe(vm, namespace, channels):
     return NetnsOutputProbe(namespace, table_name)
 
 
+def payload_hex(payload):
+    if isinstance(payload, str):
+        payload = payload.encode()
+
+    return payload.hex()
+
+
+def make_netns_tcp_payload_probe(vm, namespace, payload_rules):
+    table_name = f"phantun_payload_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
+        f"nft add table inet {table_name}",
+        (
+            f"nft 'add chain inet {table_name} output "
+            "{ type filter hook output priority 0; policy accept; }'"
+        ),
+    ]
+
+    for rule in payload_rules:
+        payload_bits = len(rule['payload'].encode() if isinstance(rule['payload'], str) else rule['payload']) * 8
+        payload_value = payload_hex(rule['payload'])
+        action = rule.get('action', 'accept')
+        lines.append(
+            f'nft add rule inet {table_name} output '
+            f'ip saddr {rule["src_addr"]} ip daddr {rule["dst_addr"]} '
+            f'tcp sport {rule["src_port"]} tcp dport {rule["dst_port"]} '
+            f'@th,160,{payload_bits} 0x{payload_value} '
+            f'counter {action} comment "{rule["comment"]}"'
+        )
+
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsOutputProbe(namespace, table_name)
+
+
 def probe_comment(prefix, src_addr, src_port, dst_addr, dst_port):
     return f"{prefix}_{flow_tag(src_addr, src_port, dst_addr, dst_port)}"
 
