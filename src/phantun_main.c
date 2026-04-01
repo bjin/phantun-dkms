@@ -5,10 +5,11 @@
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/net_namespace.h>
-#include <linux/skbuff.h>
 #include <linux/random.h>
+#include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <net/netns/generic.h>
 
 #include "phantun.h"
 #include "phantun_flow.h"
@@ -53,7 +54,22 @@ MODULE_PARM_DESC(remote_port,
 		 "Optional remote UDP/TCP port filter; 0 disables the filter");
 
 static struct phantun_config phantun_cfg;
-static struct pht_flow_table phantun_flows;
+static unsigned int phantun_net_id;
+
+struct phantun_net {
+	struct pht_flow_table flows;
+};
+
+static struct pht_flow_table *phantun_net_flows(const struct net *net)
+{
+	struct phantun_net *pnet;
+
+	if (!net)
+		return NULL;
+
+	pnet = net_generic(net, phantun_net_id);
+	return pnet ? &pnet->flows : NULL;
+}
 
 static bool phantun_managed_port(__be16 port)
 {
@@ -405,6 +421,7 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
 {
 	struct pht_l4_view view;
 	struct pht_ipv4_endpoint_pair ep;
+	struct pht_flow_table *flows;
 	struct pht_flow *flow;
 	struct pht_flow *new_flow;
 	enum pht_flow_state state_now;
@@ -413,6 +430,10 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
 	bool queued;
 
 	if (!state || !skb)
+		return NF_ACCEPT;
+
+	flows = phantun_net_flows(state->net);
+	if (!flows)
 		return NF_ACCEPT;
 
 	ret = pht_parse_ipv4_udp(skb, &view);
@@ -427,7 +448,7 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
 	phantun_fill_udp_endpoint_pair(&view, &ep);
 
 retry_lookup:
-	flow = pht_flow_lookup_oriented(&phantun_flows, &ep);
+	flow = pht_flow_lookup_oriented(flows, &ep);
 	if (flow) {
 		spin_lock_bh(&flow->lock);
 		state_now = flow->state;
@@ -482,7 +503,7 @@ retry_lookup:
 		return NF_STOLEN;
 	}
 
-	new_flow = pht_flow_create(&phantun_flows, &ep, PHT_FLOW_ROLE_INITIATOR,
+	new_flow = pht_flow_create(flows, &ep, PHT_FLOW_ROLE_INITIATOR,
 				   PHT_FLOW_STATE_SYN_SENT);
 	if (IS_ERR(new_flow)) {
 		pht_pr_warn("failed to create initiator flow: %ld\n",
@@ -501,7 +522,7 @@ retry_lookup:
 	spin_unlock_bh(&new_flow->lock);
 	pht_flow_set_queued_skb(new_flow, skb);
 
-	ret = pht_flow_insert(&phantun_flows, new_flow);
+	ret = pht_flow_insert(flows, new_flow);
 	if (ret == -EEXIST) {
 		skb = pht_flow_take_queued_skb(new_flow);
 		pht_flow_put(new_flow);
@@ -529,6 +550,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 {
 	struct pht_l4_view view;
 	struct pht_ipv4_endpoint_pair ep;
+	struct pht_flow_table *flows;
 	struct pht_flow *flow;
 	struct pht_flow *new_flow;
 	struct sk_buff *queued_skb;
@@ -543,6 +565,10 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 	if (!state || !skb)
 		return NF_ACCEPT;
 
+	flows = phantun_net_flows(state->net);
+	if (!flows)
+		return NF_DROP;
+
 	ret = pht_parse_ipv4_tcp(skb, &view);
 	if (ret)
 		return NF_ACCEPT;
@@ -555,7 +581,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 	phantun_fill_tcp_endpoint_pair(&view, &ep);
 	in_dev = state->in ? state->in : skb->dev;
 
-	flow = pht_flow_lookup_oriented(&phantun_flows, &ep);
+	flow = pht_flow_lookup_oriented(flows, &ep);
 	if (!flow) {
 		if (view.tcp->rst)
 			return NF_DROP;
@@ -579,8 +605,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 			return NF_DROP;
 		}
 
-		new_flow = pht_flow_create(&phantun_flows, &ep,
-					   PHT_FLOW_ROLE_RESPONDER,
+		new_flow = pht_flow_create(flows, &ep, PHT_FLOW_ROLE_RESPONDER,
 					   PHT_FLOW_STATE_SYN_RCVD);
 		if (IS_ERR(new_flow)) {
 			pht_pr_warn("failed to create responder flow: %ld\n",
@@ -597,7 +622,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 		new_flow->peer_syn_next = new_flow->ack;
 		spin_unlock_bh(&new_flow->lock);
 
-		ret = pht_flow_insert(&phantun_flows, new_flow);
+		ret = pht_flow_insert(flows, new_flow);
 		if (ret) {
 			pht_flow_put(new_flow);
 			return NF_DROP;
@@ -652,7 +677,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 				return NF_DROP;
 			}
 
-			new_flow = pht_flow_create(&phantun_flows, &ep,
+			new_flow = pht_flow_create(flows, &ep,
 						   PHT_FLOW_ROLE_RESPONDER,
 						   PHT_FLOW_STATE_SYN_RCVD);
 			if (IS_ERR(new_flow)) {
@@ -671,7 +696,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 			if (queued_skb)
 				pht_flow_set_queued_skb(new_flow, queued_skb);
 
-			ret = pht_flow_insert(&phantun_flows, new_flow);
+			ret = pht_flow_insert(flows, new_flow);
 			if (ret) {
 				pht_flow_put(new_flow);
 				return NF_DROP;
@@ -886,6 +911,54 @@ static struct nf_hook_ops phantun_nf_ops[] = {
 	},
 };
 
+static int __net_init phantun_net_init(struct net *net)
+{
+	struct pht_flow_table *flows;
+	int ret;
+
+	flows = phantun_net_flows(net);
+	if (!flows)
+		return -EINVAL;
+
+	ret = pht_flow_table_init(flows, net, &phantun_cfg);
+	if (ret) {
+		pht_pr_err("failed to initialize flow table: %d\n", ret);
+		return ret;
+	}
+
+	ret = nf_register_net_hooks(net, phantun_nf_ops,
+				    ARRAY_SIZE(phantun_nf_ops));
+	if (ret) {
+		pht_pr_err("failed to register netfilter hooks: %d\n", ret);
+		pht_flow_table_destroy(flows);
+		return ret;
+	}
+
+	pht_pr_info("registered IPv4 LOCAL_OUT and PRE_ROUTING hooks\n");
+	return 0;
+}
+
+static void __net_exit phantun_net_exit(struct net *net)
+{
+	struct pht_flow_table *flows;
+
+	flows = phantun_net_flows(net);
+	if (!flows)
+		return;
+
+	nf_unregister_net_hooks(net, phantun_nf_ops,
+				ARRAY_SIZE(phantun_nf_ops));
+	pht_flow_table_destroy(flows);
+	pht_pr_info("unregistered netfilter hooks\n");
+}
+
+static struct pernet_operations phantun_pernet_ops = {
+	.id = &phantun_net_id,
+	.size = sizeof(struct phantun_net),
+	.init = phantun_net_init,
+	.exit = phantun_net_exit,
+};
+
 static int phantun_validate_config(void)
 {
 	if (!managed_ports_count) {
@@ -975,30 +1048,12 @@ static int __init phantun_init(void)
 	phantun_snapshot_config();
 	phantun_log_config();
 
-	ret = pht_flow_table_init(&phantun_flows, &init_net, &phantun_cfg);
-	if (ret) {
-		pht_pr_err("failed to initialize flow table: %d\n", ret);
-		return ret;
-	}
-
-	ret = nf_register_net_hooks(&init_net, phantun_nf_ops,
-				    ARRAY_SIZE(phantun_nf_ops));
-	if (ret) {
-		pht_pr_err("failed to register netfilter hooks: %d\n", ret);
-		pht_flow_table_destroy(&phantun_flows);
-		return ret;
-	}
-
-	pht_pr_info("registered IPv4 LOCAL_OUT and PRE_ROUTING hooks\n");
-	return 0;
+	return register_pernet_subsys(&phantun_pernet_ops);
 }
 
 static void __exit phantun_exit(void)
 {
-	nf_unregister_net_hooks(&init_net, phantun_nf_ops,
-				ARRAY_SIZE(phantun_nf_ops));
-	pht_flow_table_destroy(&phantun_flows);
-	pht_pr_info("unregistered netfilter hooks\n");
+	unregister_pernet_subsys(&phantun_pernet_ops);
 }
 
 module_init(phantun_init);

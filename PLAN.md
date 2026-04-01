@@ -157,26 +157,23 @@
 
 - [x] `tests/test_dkms.py` covers DKMS build, module load, module unload, and reload-with-new-params inside the virtme-ng guest
 - [x] `tests/conftest.py` provides the shared `vm`, `phantun_module`, and `dmesg` fixtures
-- [ ] Keep Phase 11 aligned with the current pytest + virtme-ng conventions instead of inventing a second harness
+- [x] Keep Phase 11 aligned with the current pytest + virtme-ng conventions instead of inventing a second harness
 
 ### Shared test infrastructure additions
 
-- [ ] Extend the existing fixture-driven framework; do not duplicate VM, DKMS, or dmesg lifecycle code in individual tests
-- [ ] Add reusable guest-side helpers for common setup/teardown steps so `test_*.py` files stay short and readable:
-  - [ ] network namespace create/delete
-  - [ ] veth pair creation, addressing, link-up, and route setup
-  - [ ] small UDP send/receive/echo helpers invoked via `vm.run(...)`
-  - [ ] common wait/assert helpers for process completion and expected dmesg patterns
-- [ ] Keep shared helpers in the current `tests/` support code path (`conftest.py` and, if they grow beyond a few small helpers, a dedicated helper module imported by tests)
-- [ ] Keep assertions explicit: observable packet/result checks first, `dmesg` verification second, `pytest.fail(...)` for clear failures
+- [x] Extend the existing fixture-driven framework; do not duplicate VM, DKMS, or dmesg lifecycle code in individual tests
+- [x] Add reusable guest-side helpers for common setup/teardown steps so `test_*.py` files stay short and readable:
+  - [x] network namespace create/delete
+  - [x] veth pair creation, addressing, link-up, and route setup
+  - [x] small UDP send/receive/echo helpers invoked via `vm.run(...)`
+  - [x] nftables OUTPUT-counter helpers for TCP-vs-UDP verification on managed tuples
+- [x] Keep shared helpers in the current `tests/` support code path via `tests/helpers.py`
+- [x] Keep assertions explicit: observable packet/result checks first, `dmesg` verification second, `pytest.fail(...)` for clear failures
 
 ### Loopback UDP translation tests
 
-- [ ] Add `tests/test_loopback_udp.py` for same-VM coverage over `lo`
-- [ ] Cover loopback traffic between `127.0.0.2` and `127.0.0.3` on the same managed UDP port
-- [ ] Cover loopback traffic using the same loopback address but different UDP ports
-- [ ] Verify the plain no-hint path: with no `handshake_request` configured, the first queued UDP payload is delivered end-to-end
-- [ ] Verify idle timeout => flow is removed and the next UDP packet triggers a fresh handshake
+- [x] Decide to defer same-host loopback coverage for now because it drives loopback-specific behavior that is not representative of the intended deployment path
+- [ ] Revisit loopback only if the module later grows an explicit requirement to support same-host fake-TCP translation semantics
 
 ### Optional handshake behavior tests
 
@@ -189,9 +186,12 @@
 
 ### Namespace + veth UDP integration tests
 
-- [ ] Add `tests/test_netns_udp.py` that creates two guest network namespaces and connects them with a veth pair
-- [ ] Reuse the shared namespace/veth helpers so each test body describes topology plus expectations, not shell plumbing
-- [ ] End-to-end raw UDP echo/data with no optional handshake payloads configured
+- [x] Add `tests/test_netns_udp.py` that creates two guest network namespaces and connects them with a veth pair
+- [x] Reuse the shared namespace/veth helpers so each test body describes topology plus expectations, not shell plumbing
+- [x] End-to-end raw UDP ping/pong across namespaces
+- [x] End-to-end raw UDP ten-packet echo/data verification with exact payload matching (order independent)
+- [x] 2x2 multi-port coverage across `2222/4444 -> 3333/5555` with distinct payloads per channel
+- [x] TCP-only verification on the veth path: raw UDP is dropped/counted in nft OUTPUT rules while translated TCP is counted and the test still succeeds
 - [ ] Request-only path across namespaces
 - [ ] Request+response path across namespaces
 - [ ] Duplicate outbound UDP while half-open => only one flow exists; one packet may be queued, later packets are dropped per design
@@ -212,7 +212,7 @@
 - [ ] Verify the real peer IP/port remain visible to WireGuard so roaming semantics are preserved
 - [ ] After the kernel-WireGuard path is stable, reuse the same topology helpers for `wireguard-go` peer-to-peer coverage
 - [ ] After that, add mixed kernel WireGuard <-> `wireguard-go` coverage without creating a separate topology harness
-- [ ] Run the fast loopback/handshake/netns suites first on `--kernel host`, then use the existing pytest kernel-matrix options for broader regression coverage of the stable scenarios
+- [ ] Run the fast handshake/netns suites first on `--kernel host`, then use the existing pytest kernel-matrix options for broader regression coverage of the stable scenarios
 
 
 ## Phase 12 - documentation
@@ -238,7 +238,7 @@
 6. Phase 6
 7. Phase 7
 8. Phase 8
-9. Phase 11 loopback + handshake + namespace UDP tests
+9. Phase 11 handshake + namespace UDP tests
 10. Phase 9
 11. Phase 10
 12. Phase 11 WireGuard end-to-end tests

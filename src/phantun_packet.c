@@ -364,6 +364,9 @@ int pht_emit_fake_tcp_v4(struct net *net,
 
 int pht_reinject_udp_v4(struct sk_buff *skb, struct net_device *dev)
 {
+	const struct iphdr *iph;
+	enum skb_drop_reason reason;
+
 	if (!skb || !dev) {
 		kfree_skb(skb);
 		return -EINVAL;
@@ -373,7 +376,16 @@ int pht_reinject_udp_v4(struct sk_buff *skb, struct net_device *dev)
 	skb->skb_iif = dev->ifindex;
 	skb->pkt_type = PACKET_HOST;
 	skb->protocol = htons(ETH_P_IP);
-	return netif_receive_skb(skb);
+
+	iph = ip_hdr(skb);
+	reason = ip_route_input(skb, iph->daddr, iph->saddr, ip4h_dscp(iph),
+				dev);
+	if (reason) {
+		kfree_skb(skb);
+		return -EINVAL;
+	}
+
+	return dst_input(skb);
 }
 
 int pht_reinject_udp_payload_v4(struct net_device *dev,
