@@ -210,10 +210,10 @@
 
 ### WireGuard end-to-end tests
 
-- [ ] Add `tests/test_wireguard.py` using the same two-namespace veth topology, then create one kernel WireGuard gateway inside each namespace
-- [ ] Verify kernel WireGuard peer-to-peer handshake and bidirectional payload delivery over the module
-- [ ] Verify no endpoint rewrite to `127.0.0.1:*` is needed
-- [ ] Verify the real peer IP/port remain visible to WireGuard so roaming semantics are preserved
+- [x] Add `tests/test_wireguard.py` using the same two-namespace veth topology, then create one kernel WireGuard gateway inside each namespace
+- [x] Verify kernel WireGuard peer-to-peer handshake and bidirectional payload delivery over the module
+- [x] Verify no endpoint rewrite to `127.0.0.1:*` is needed
+- [x] Verify the real peer IP/port remain visible to WireGuard so roaming semantics are preserved
 - [ ] After the kernel-WireGuard path is stable, reuse the same topology helpers for `wireguard-go` peer-to-peer coverage
 - [ ] After that, add mixed kernel WireGuard <-> `wireguard-go` coverage without creating a separate topology harness
 - [ ] Run the fast handshake/netns suites first on `--kernel host`, then use the existing pytest kernel-matrix options for broader regression coverage of the stable scenarios
