@@ -735,6 +735,13 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 					pht_flow_put(flow);
 					return NF_DROP;
 				}
+				if (phantun_response_enabled()) {
+					spin_lock_bh(&flow->lock);
+					flow->ack += phantun_cfg.handshake_response_len;
+					flow->peer_syn_next = flow->ack;
+					flow->last_ack = flow->ack;
+					spin_unlock_bh(&flow->lock);
+				}
 			}
 
 			pht_flow_update_state(flow, PHT_FLOW_STATE_ESTABLISHED);

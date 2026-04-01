@@ -14,7 +14,6 @@ NS_ADDR_B = "10.200.0.2"
 PORTS_A = (2222, 4444)
 PORTS_B = (3333, 5555)
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 GUEST_UDP_SCENARIOS = str(PROJECT_ROOT / 'tests/guest/udp_scenarios.py')
 
@@ -35,16 +34,19 @@ class GuestProcess:
     def terminate(self):
         self.proc.terminate()
 
-class NetnsOutputProbe:
-    def __init__(self, namespace, table_name):
+
+class NetnsNftProbe:
+    def __init__(self, namespace, family, table_name, chain_name):
         self.namespace = namespace
+        self.family = family
         self.table_name = table_name
+        self.chain_name = chain_name
 
     def packets(self, vm, comment):
         res = run_in_netns(
             vm,
             self.namespace,
-            ['nft', '-j', 'list', 'chain', 'inet', self.table_name, 'output'],
+            ['nft', '-j', 'list', 'chain', self.family, self.table_name, self.chain_name],
         )
         data = json.loads(res.stdout)
 
@@ -64,7 +66,7 @@ class NetnsOutputProbe:
         run_in_netns(
             vm,
             self.namespace,
-            ['nft', 'delete', 'table', 'inet', self.table_name],
+            ['nft', 'delete', 'table', self.family, self.table_name],
             check=False,
         )
 
@@ -79,7 +81,11 @@ def run_in_netns(vm, namespace, cmd, check=True, **kwargs):
     if isinstance(cmd, list):
         return vm.run(['ip', 'netns', 'exec', namespace, *cmd], check=check, **kwargs)
 
-    return vm.run(f"ip netns exec {shlex.quote(namespace)} bash -c {shlex.quote(cmd)}", check=check, **kwargs)
+    return vm.run(
+        f"ip netns exec {shlex.quote(namespace)} bash -c {shlex.quote(cmd)}",
+        check=check,
+        **kwargs,
+    )
 
 
 def guest_command(cmd):
@@ -184,7 +190,7 @@ def make_netns_output_probe(vm, namespace, channels):
         )
 
     run_in_netns(vm, namespace, "\n".join(lines))
-    return NetnsOutputProbe(namespace, table_name)
+    return NetnsNftProbe(namespace, 'inet', table_name, 'output')
 
 
 def payload_hex(payload):
@@ -218,7 +224,57 @@ def make_netns_tcp_payload_probe(vm, namespace, payload_rules):
         )
 
     run_in_netns(vm, namespace, "\n".join(lines))
-    return NetnsOutputProbe(namespace, table_name)
+    return NetnsNftProbe(namespace, 'inet', table_name, 'output')
+
+
+def make_netns_ingress_flag_drop_probe(vm, namespace, device, rules):
+    table_name = f"phantun_ingress_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table netdev {table_name} >/dev/null 2>&1 || true",
+        f"nft add table netdev {table_name}",
+        (
+            f"nft 'add chain netdev {table_name} ingress "
+            f"{{ type filter hook ingress device {device} priority 0; policy accept; }}'"
+        ),
+    ]
+
+    for rule in rules:
+        lines.append(
+            f"nft 'add rule netdev {table_name} ingress "
+            f"ip saddr {rule['src_addr']} ip daddr {rule['dst_addr']} "
+            f"tcp sport {rule['src_port']} tcp dport {rule['dst_port']} "
+            f"tcp flags & (fin|syn|rst|ack) == {rule['flags_expr']} "
+            f"counter {rule.get('action', 'drop')} comment \"{rule['comment']}\"'"
+        )
+
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsNftProbe(namespace, 'netdev', table_name, 'ingress')
+
+
+def make_netns_ingress_payload_drop_probe(vm, namespace, device, rules):
+    table_name = f"phantun_ingress_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table netdev {table_name} >/dev/null 2>&1 || true",
+        f"nft add table netdev {table_name}",
+        (
+            f"nft 'add chain netdev {table_name} ingress "
+            f"{{ type filter hook ingress device {device} priority 0; policy accept; }}'"
+        ),
+    ]
+
+    for rule in rules:
+        payload_bits = len(rule['payload'].encode() if isinstance(rule['payload'], str) else rule['payload']) * 8
+        payload_value = payload_hex(rule['payload'])
+        lines.append(
+            f"nft 'add rule netdev {table_name} ingress "
+            f"ip saddr {rule['src_addr']} ip daddr {rule['dst_addr']} "
+            f"tcp sport {rule['src_port']} tcp dport {rule['dst_port']} "
+            f"@th,160,{payload_bits} 0x{payload_value} "
+            f"counter {rule.get('action', 'drop')} comment \"{rule['comment']}\"'"
+        )
+
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsNftProbe(namespace, 'netdev', table_name, 'ingress')
 
 
 def probe_comment(prefix, src_addr, src_port, dst_addr, dst_port):

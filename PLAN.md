@@ -167,6 +167,7 @@
   - [x] veth pair creation, addressing, link-up, and route setup
   - [x] small UDP send/receive/echo helpers invoked via checked-in guest scripts under `tests/guest/`
   - [x] nftables OUTPUT-counter helpers for TCP-vs-UDP verification on managed tuples
+  - [x] netdev ingress nft drop helpers for packet-loss simulation before PRE_ROUTING
   - [x] namespace guest-scenario runner helpers for synchronous/asynchronous test roles
 - [x] Keep shared helpers in the current `tests/` support code path via `tests/helpers.py` and `tests/guest/udp_scenarios.py`
 - [x] Keep assertions explicit: observable packet/result checks first, `dmesg` verification second, `pytest.fail(...)` for clear failures
@@ -179,7 +180,15 @@
 - [x] `handshake_request` + `handshake_response` => responder injects the configured response, initiator drops the shaped responder payload from the UDP app view, and the flow stays established
 - [x] `handshake_response` without `handshake_request` => both sides behave like the no-hint path
 - [ ] Duplicate pure ACKs and unexpected first-payload contents do not trigger `RST` or teardown once the three-way handshake has completed
-- [ ] Loss-injection cases for request/response shaping once the exact tolerated-loss behavior is locked down against the implementation
+- [x] Loss-injection cases for request/response shaping using ingress nft drops on the veth path
+
+### Packet loss tolerance tests
+
+- [x] Add `tests/test_packet_loss.py` for focused ingress-loss coverage on the netns/veth topology
+- [x] Lost initiator `SYN` => handshake retries and later succeeds within the configured timeout/retry budget
+- [x] Lost responder `SYN|ACK` => handshake retries and later succeeds within the configured timeout/retry budget
+- [x] Lost `handshake_request` => responder drops one later inbound payload and then later payloads continue normally
+- [x] Lost `handshake_response` => initiator drops one later responder payload and then later responder payloads continue normally
 
 ### Namespace + veth UDP integration tests
 
@@ -194,8 +203,6 @@
 - [ ] Duplicate outbound UDP while half-open => only one flow exists; one packet may be queued, later packets are dropped per design
 - [ ] Duplicate initiator `SYN` after lost `SYN|ACK` => responder re-sends `SYN|ACK` without creating a second flow
 - [ ] Responder-owned queued UDP is flushed only after a later initiator ACK covers an injected `handshake_response`
-- [ ] If an injected `handshake_request` is lost, the next payload seen by the responder is dropped once, but the flow stays established
-- [ ] If an injected `handshake_response` is lost, the initiator does not tear the flow down; later responder payloads still progress the flow
 - [ ] Simultaneous initiation => deterministic winner and exactly one surviving flow
 - [ ] Simultaneous-initiation loser with a queued UDP skb => packet is flushed by the responder rule or dropped on timeout, never retained indefinitely
 - [ ] Unknown inbound non-`RST` fake-TCP => module sends `RST|ACK`

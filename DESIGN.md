@@ -162,7 +162,21 @@ So the preferred path becomes:
 
 Responder code should still accept either a combined final `ACK + payload` or a pure final `ACK` followed by later payload, because the shaping hints are optional.
 
-## 5.3 Symmetric role model
+## 5.3 Packet-loss tolerance expectations
+
+The translator is expected to tolerate loss of handshake-path packets within the configured retry budget. These are not optional nice-to-haves; they are part of the connection contract.
+
+Expected behaviors:
+
+- lost initiator `SYN`: initiator stays in `SYN_SENT`, retransmits `SYN` on each handshake timeout, and keeps at most one queued UDP skb until either a valid `SYN|ACK` arrives or the retry budget is exhausted
+- lost responder `SYN|ACK`: responder stays in `SYN_RCVD`; duplicate/retransmitted `SYN` and the responder retransmit timer both re-send `SYN|ACK` until a valid final `ACK` arrives or the retry budget is exhausted
+- lost `handshake_request`: flow establishment is not revoked; responder still applies the one-shot “ignore first inbound payload” rule, so the next inbound payload it sees is dropped once, and later payloads continue normally
+- lost `handshake_response`: flow establishment is not revoked; initiator still applies its one-shot “ignore first inbound responder payload” rule, so the next responder payload it sees is dropped once, and later responder payloads continue normally
+- duplicate or delayed optional shaping payloads never trigger `RST`; they only affect which payload is ignored once on the receiving side
+
+If retries are exhausted before the three-way handshake completes, the half-open flow is torn down and signaled with `RST`. Optional shaping-payload loss by itself must never be promoted into handshake failure.
+
+## 5.4 Symmetric role model
 
 Each flow is independent. The same node may be:
 
