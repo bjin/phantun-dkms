@@ -8,7 +8,10 @@
 #define PHANTUN_MAX_MANAGED_PORTS 16
 #define PHANTUN_DEFAULT_HANDSHAKE_TIMEOUT_MS 1000U
 #define PHANTUN_DEFAULT_HANDSHAKE_RETRIES 6U
-#define PHANTUN_DEFAULT_IDLE_TIMEOUT_SEC 180U
+#define PHANTUN_DEFAULT_KEEPALIVE_INTERVAL_SEC 30U
+#define PHANTUN_DEFAULT_KEEPALIVE_MISSES 3U
+#define PHANTUN_DEFAULT_HARD_IDLE_TIMEOUT_SEC 300U
+#define PHANTUN_DEFAULT_REOPEN_GUARD_BYTES 4194304U
 #define PHANTUN_CAPTURE_PRIORITY (-400)
 
 #define pht_pr_err(fmt, ...) pr_err(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
@@ -28,7 +31,10 @@ struct phantun_config {
 	unsigned int handshake_response_len;
 	unsigned int handshake_timeout_ms;
 	unsigned int handshake_retries;
-	unsigned int idle_timeout_sec;
+	unsigned int keepalive_interval_sec;
+	unsigned int keepalive_misses;
+	unsigned int hard_idle_timeout_sec;
+	unsigned int reopen_guard_bytes;
 	const char *remote_ipv4_cidr;
 	__be32 remote_ipv4_addr;
 	__be32 remote_ipv4_mask;

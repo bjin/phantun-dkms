@@ -15,7 +15,7 @@ PORTS_A = (2222, 4444)
 PORTS_B = (3333, 5555)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-GUEST_UDP_SCENARIOS = str(PROJECT_ROOT / 'tests/guest/udp_scenarios.py')
+GUEST_SCENARIOS = str(PROJECT_ROOT / 'tests/guest/scenarios.py')
 MODULE_STAT_NAMES = (
     'flows_created',
     'flows_established',
@@ -124,7 +124,7 @@ def run_netns_scenario(vm, namespace, scenario, config, check=True, **kwargs):
     return run_in_netns(
         vm,
         namespace,
-        ['python3', GUEST_UDP_SCENARIOS, scenario, json.dumps(config)],
+        ['python3', GUEST_SCENARIOS, scenario, json.dumps(config)],
         check=check,
         **kwargs,
     )
@@ -133,7 +133,7 @@ def run_netns_scenario(vm, namespace, scenario, config, check=True, **kwargs):
 def spawn_netns_scenario(vm, namespace, scenario, config, **kwargs):
     return spawn_guest_command(
         vm,
-        ['ip', 'netns', 'exec', namespace, 'python3', GUEST_UDP_SCENARIOS, scenario, json.dumps(config)],
+        ['ip', 'netns', 'exec', namespace, 'python3', GUEST_SCENARIOS, scenario, json.dumps(config)],
         **kwargs,
     )
 
@@ -218,6 +218,29 @@ def make_netns_output_probe(vm, namespace, channels):
             f'ip saddr {src_addr} ip daddr {dst_addr} '
             f'tcp sport {src_port} tcp dport {dst_port} '
             f'counter accept comment "tcp_{tag}"'
+        )
+
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsNftProbe(namespace, 'inet', table_name, 'output')
+
+def make_netns_output_flag_probe(vm, namespace, rules):
+    table_name = f"phantun_out_flags_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
+        f"nft add table inet {table_name}",
+        (
+            f"nft 'add chain inet {table_name} output "
+            "{ type filter hook output priority 0; policy accept; }'"
+        ),
+    ]
+
+    for rule in rules:
+        lines.append(
+            f"nft 'add rule inet {table_name} output "
+            f"ip saddr {rule['src_addr']} ip daddr {rule['dst_addr']} "
+            f"tcp sport {rule['src_port']} tcp dport {rule['dst_port']} "
+            f"tcp flags & (fin|syn|rst|ack) == {rule['flags_expr']} "
+            f"counter {rule.get('action', 'accept')} comment \"{rule['comment']}\"'"
         )
 
     run_in_netns(vm, namespace, "\n".join(lines))

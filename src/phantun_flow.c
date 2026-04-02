@@ -4,9 +4,12 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <net/ip.h>
+#include <net/route.h>
 
 #include "phantun_flow.h"
 #include "phantun_stats.h"
+#include "phantun_packet.h"
 static u32 pht_flow_hash_key(const struct pht_flow_key *key)
 {
 	return jhash(key, sizeof(*key), 0) & (PHT_FLOW_BUCKETS - 1);
@@ -80,7 +83,6 @@ static int pht_flow_retransmit_now(struct pht_flow *flow)
 }
 
 static void pht_flow_gc_worker(struct work_struct *work);
-static void __pht_flow_remove(struct pht_flow *flow, bool from_timer);
 
 static void pht_flow_retransmit_timer(struct timer_list *timer)
 {
@@ -103,7 +105,6 @@ static void pht_flow_retransmit_timer(struct timer_list *timer)
 		flow->retransmit_armed = false;
 		spin_unlock_bh(&flow->lock);
 		pht_flow_send_local_rst(flow);
-		__pht_flow_remove(flow, true);
 		pht_flow_put(flow);
 		return;
 	}
@@ -211,10 +212,21 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
 
 	table->handshake_timeout_jiffies =
 		msecs_to_jiffies(cfg->handshake_timeout_ms);
-	table->idle_timeout_jiffies =
-		msecs_to_jiffies(cfg->idle_timeout_sec * 1000U);
+	table->keepalive_interval_jiffies =
+		msecs_to_jiffies(cfg->keepalive_interval_sec * 1000U);
+	table->keepalive_misses = cfg->keepalive_misses;
+	table->hard_idle_timeout_jiffies =
+		msecs_to_jiffies(cfg->hard_idle_timeout_sec * 1000U);
+	table->reopen_guard_bytes = cfg->reopen_guard_bytes;
 	table->gc_interval_jiffies =
 		msecs_to_jiffies(PHT_FLOW_GC_INTERVAL_SEC * 1000U);
+	if (table->keepalive_interval_jiffies > 0) {
+		unsigned long min_gc = table->keepalive_interval_jiffies / 2;
+		if (min_gc < table->gc_interval_jiffies)
+			table->gc_interval_jiffies = min_gc;
+		if (table->gc_interval_jiffies == 0)
+			table->gc_interval_jiffies = 1;
+	}
 	table->handshake_retries = cfg->handshake_retries;
 	table->net = net;
 	table->cfg = cfg;
@@ -248,7 +260,8 @@ static void pht_flow_detach_all(struct pht_flow_table *table,
 }
 
 static bool pht_flow_gc_detach_expired(struct pht_flow_table *table,
-				       struct list_head *expired)
+				       struct list_head *expired,
+				       struct sk_buff_head *reinject_list)
 {
 	unsigned int i;
 	unsigned long now = jiffies;
@@ -262,18 +275,69 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table,
 		spin_lock_bh(&bucket->lock);
 		hlist_for_each_entry_safe(flow, tmp, &bucket->head, hnode)
 		{
-			bool expired_flow;
+			bool expired_flow = false;
+			bool send_keepalive = false;
+			bool is_liveness_failure = false;
 
 			spin_lock(&flow->lock);
-			expired_flow =
-				(flow->state == PHT_FLOW_STATE_DEAD) ||
-				time_after_eq(
+			if (flow->state == PHT_FLOW_STATE_DEAD) {
+				if (time_after_eq(now, flow->last_activity_jiffies + table->hard_idle_timeout_jiffies)) {
+					expired_flow = true;
+				}
+			} else {
+				bool hard_expired = time_after_eq(
 					now,
 					flow->last_activity_jiffies +
-						table->idle_timeout_jiffies);
+						table->hard_idle_timeout_jiffies);
+				bool liveness_failed = table->keepalive_interval_jiffies > 0 && time_after_eq(
+					now,
+					flow->last_inbound_jiffies +
+						(table->keepalive_interval_jiffies *
+						 table->keepalive_misses));
+				if (hard_expired) {
+					expired_flow = true;
+					flow->hard_expired = true;
+				} else if (liveness_failed) {
+					expired_flow = true;
+					flow->state = PHT_FLOW_STATE_DEAD;
+					flow->liveness_failed = true;
+					is_liveness_failure = true;
+				} else if (
+					table->keepalive_interval_jiffies > 0 &&
+					time_after_eq(
+						now,
+						flow->last_inbound_jiffies +
+							table->keepalive_interval_jiffies *
+							(flow->keepalives_sent + 1))) {
+					send_keepalive = true;
+					flow->keepalives_sent++;
+				}
+			}
+
 			if (expired_flow)
 				flow->state = PHT_FLOW_STATE_DEAD;
 			spin_unlock(&flow->lock);
+
+			if (is_liveness_failure) {
+				struct sk_buff *queued_skb;
+
+				queued_skb = pht_flow_take_queued_skb(flow);
+				if (queued_skb)
+					__skb_queue_tail(reinject_list, queued_skb);
+			}
+
+			if (send_keepalive && !expired_flow && !is_liveness_failure) {
+				/* Send a pure ACK as keepalive */
+				spin_lock(&flow->lock);
+				if (flow->table && flow->table->net) {
+					pht_emit_fake_tcp_v4(
+						flow->table->net,
+						&flow->oriented, flow->seq,
+						flow->ack, PHT_TCP_FLAG_ACK,
+						NULL, 0);
+				}
+				spin_unlock(&flow->lock);
+			}
 
 			if (!expired_flow)
 				continue;
@@ -293,16 +357,26 @@ static void pht_flow_gc_worker(struct work_struct *work)
 	struct pht_flow_table *table = container_of(
 		to_delayed_work(work), struct pht_flow_table, gc_work);
 	LIST_HEAD(expired);
+	struct sk_buff_head reinject_list;
+	struct sk_buff *skb;
 	struct pht_flow *flow;
 	struct pht_flow *tmp;
 
-	pht_flow_gc_detach_expired(table, &expired);
+	__skb_queue_head_init(&reinject_list);
+
+	pht_flow_gc_detach_expired(table, &expired, &reinject_list);
 	list_for_each_entry_safe(flow, tmp, &expired, gc_node)
 	{
 		list_del_init(&flow->gc_node);
-		pht_flow_send_local_rst(flow);
 		pht_flow_shutdown_retransmit_sync(flow);
 		pht_flow_put(flow);
+	}
+
+	while ((skb = __skb_dequeue(&reinject_list)) != NULL) {
+		if (table->net)
+			ip_local_out(table->net, NULL, skb);
+		else
+			kfree_skb(skb);
 	}
 
 	schedule_delayed_work(&table->gc_work, table->gc_interval_jiffies);
@@ -405,6 +479,8 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table,
 	flow->state = state;
 	flow->max_retries = table->handshake_retries;
 	flow->last_activity_jiffies = jiffies;
+	flow->last_inbound_jiffies = jiffies;
+	flow->keepalives_sent = 0;
 	flow->retransmit_at_jiffies = jiffies;
 	flow->retransmit_armed = false;
 	pht_flow_key_from_endpoints(&flow->key, ep, &flow->local_is_low);
@@ -440,7 +516,7 @@ int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow)
 	return 0;
 }
 
-static void __pht_flow_remove(struct pht_flow *flow, bool from_timer)
+void pht_flow_detach(struct pht_flow *flow)
 {
 	struct pht_flow_bucket *bucket;
 	u32 idx;
@@ -461,18 +537,32 @@ static void __pht_flow_remove(struct pht_flow *flow, bool from_timer)
 	if (!removed)
 		return;
 
-	spin_lock_bh(&flow->lock);
-	flow->state = PHT_FLOW_STATE_DEAD;
-	spin_unlock_bh(&flow->lock);
-
-	if (!from_timer)
-		pht_flow_cancel_retransmit(flow);
+	pht_flow_cancel_retransmit(flow);
 	pht_flow_put(flow);
 }
 
 void pht_flow_remove(struct pht_flow *flow)
 {
-	__pht_flow_remove(flow, false);
+	if (!flow)
+		return;
+
+	spin_lock_bh(&flow->lock);
+	flow->state = PHT_FLOW_STATE_DEAD;
+	spin_unlock_bh(&flow->lock);
+
+	pht_flow_cancel_retransmit(flow);
+}
+
+void pht_flow_touch_inbound(struct pht_flow *flow)
+{
+	if (!flow)
+		return;
+
+	spin_lock_bh(&flow->lock);
+	flow->last_inbound_jiffies = jiffies;
+	flow->last_activity_jiffies = jiffies;
+	flow->keepalives_sent = 0;
+	spin_unlock_bh(&flow->lock);
 }
 
 void pht_flow_touch(struct pht_flow *flow)

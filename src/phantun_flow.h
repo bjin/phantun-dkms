@@ -59,11 +59,15 @@ struct pht_flow {
 	unsigned int retries_done;
 	unsigned int max_retries;
 	unsigned long last_activity_jiffies;
+	unsigned long last_inbound_jiffies;
 	unsigned long retransmit_at_jiffies;
+	unsigned int keepalives_sent;
 	bool local_is_low;
 	bool drop_next_rx_payload;
 	bool response_pending_ack;
 	bool retransmit_armed;
+	bool hard_expired;
+	bool liveness_failed;
 };
 
 struct pht_flow_bucket {
@@ -74,10 +78,13 @@ struct pht_flow_bucket {
 struct pht_flow_table {
 	struct pht_flow_bucket buckets[PHT_FLOW_BUCKETS];
 	struct delayed_work gc_work;
-	unsigned long idle_timeout_jiffies;
+	unsigned long keepalive_interval_jiffies;
+	unsigned long hard_idle_timeout_jiffies;
 	unsigned long handshake_timeout_jiffies;
 	unsigned long gc_interval_jiffies;
+	unsigned int keepalive_misses;
 	unsigned int handshake_retries;
+	unsigned int reopen_guard_bytes;
 	struct net *net;
 	const struct phantun_config *cfg;
 };
@@ -104,10 +111,12 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table,
 				 enum pht_flow_state state);
 int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow);
 void pht_flow_remove(struct pht_flow *flow);
+void pht_flow_detach(struct pht_flow *flow);
 
 void pht_flow_get(struct pht_flow *flow);
 void pht_flow_put(struct pht_flow *flow);
 void pht_flow_touch(struct pht_flow *flow);
+void pht_flow_touch_inbound(struct pht_flow *flow);
 bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb);
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb);
 struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow);

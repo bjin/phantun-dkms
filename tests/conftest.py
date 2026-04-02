@@ -221,9 +221,17 @@ def project_info():
                 version = line.split("=")[1].strip('"').strip("'")
                 break
 
-    # Prepare tarball BEFORE VM starts because of COW filesystem
+    # Prepare tarball BEFORE VM starts because of COW filesystem.
     tar_path = proj_root / ".dkms_copy.tar"
-    subprocess.run(f"git ls-files -z | tar --null -c -T - -f {tar_path}", cwd=proj_root, shell=True, check=True, executable="/bin/bash")
+    tar_path.unlink(missing_ok=True)
+    subprocess.run(
+        f"git ls-files -z --cached --others --exclude-standard | "
+        f"tar --null -c -T - -f {tar_path}",
+        cwd=proj_root,
+        shell=True,
+        check=True,
+        executable="/bin/bash",
+    )
 
     return {"root": proj_root, "version": version, "tar_path": tar_path}
 

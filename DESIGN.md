@@ -219,7 +219,8 @@ Rules:
 - if a handshaking flow exists: do not create a second flow
   - queue at most one triggering UDP skb if the flow has no queued skb yet
   - otherwise drop and rely on WireGuard retransmission
-- if a stale flow exists: send `RST`, remove it, then create a new flow
+- if a stale/dead flow exists: remove the local state without sending `RST`, then create a fresh initiator flow
+  - preserve at most one queued outbound UDP skb across that local reopen
 - only if no valid flow exists may a new outbound `SYN` be sent
 
 This directly addresses the requirement that initiators must not create a second session for an already-valid tuple.
@@ -234,16 +235,16 @@ Reason:
 - deterministic collapse keeps initiator/responder orientation stable without adding a second conflict-resolution handshake
 - optional first-payload shaping remains unambiguous once only one flow survives
 
-### Chosen policy: deterministic collapse
+### Chosen policy: SYN-ISN tie-break
 
 If a node is in `SYN_SENT` and receives a bare `SYN` for the same canonical tuple:
 
-- compare the two oriented endpoints numerically
-- the endpoint with the lower `(ip, port)` wins the initiator role
-- winner keeps its outbound `SYN_SENT` flow
-- loser destroys its outbound half-open flow and reprocesses the incoming `SYN` as responder
+- compare the two initial sequence numbers (ISNs)
+- the flow with the lower ISN wins the initiator role
+- the flow with the higher ISN loses its initiator role and reprocesses the incoming `SYN` as responder
+- if the ISNs are exactly equal, the packet is dropped and both sides rely on retransmission
 
-This guarantees that only one connection survives for a tuple.
+This guarantees deterministic collapse without relying on potentially NAT-rewritten endpoints.
 
 ## 7. Per-flow state machine
 
@@ -271,6 +272,7 @@ Entered when outbound UDP for a managed tuple appears and no valid flow exists.
 Actions:
 
 - generate initial seq as a randomly chosen `u32` value rounded/aligned so it is also a multiple of `4095`
+  - reject candidate ISNs that are within `reopen_guard_bytes` of the previous generation's sequence space
 - send `SYN`
 - queue at most one UDP skb
 - start retransmit timer
@@ -278,7 +280,7 @@ Actions:
 Accepts:
 
 - valid `SYN|ACK` with exact `ack = syn_seq + 1`
-- collision `SYN` for deterministic tie-break handling
+- bare aligned collision `SYN` for deterministic tie-break handling
 - `RST` => destroy flow
 
 On valid `SYN|ACK`:
@@ -298,6 +300,16 @@ Actions:
 - if `handshake_request` was configured, flush the initiator-owned queued UDP skb after the injected request packet
 - if the one-shot inbound ignore flag is armed, drop the first responder payload received and then clear the flag
 - from then on translate UDP <-> fake-TCP normally
+- inbound traffic handling prioritizes flag classification:
+  - `RST`: destroy local state silently
+  - bare `SYN` (syn=1, ack=0, payload=0, aligned): accept as generation replacement. Destroy old flow state, drop old skb, create new `SYN_RCVD` responder flow, and send `SYN|ACK`.
+  - any other packet with `SYN` set: send `RST|ACK` and destroy local state
+  - no `SYN`: normal established data processing
+- any valid inbound fake-TCP packet that is accepted for this flow, including pure `ACK`s and handshake-response acknowledgement traffic, refreshes liveness suspicion
+- if no valid inbound packet has been seen for `keepalive_interval_sec`, send a pure `ACK` keepalive
+- if no valid inbound packet has been seen for `keepalive_misses * keepalive_interval_sec`, destroy local state silently
+  - if a queued outbound UDP skb already exists, immediately create a fresh `SYN_SENT` flow, carry one queued skb into it, and send `SYN`
+  - otherwise wait for future outbound UDP to create the next generation
 
 ## 7.2 Responder states
 
@@ -307,7 +319,7 @@ Entered when inbound `SYN` is seen on a managed port and no existing flow handle
 
 Validation:
 
-- packet must be `SYN`
+- packet must be a bare `SYN` (no `ACK`, no payload)
 - `seq % 4095 == 0`
 - tuple must pass local policy checks
 
@@ -339,8 +351,17 @@ After establishment:
 - incoming fake-TCP payload becomes local UDP unless the one-shot ignore flag is still armed; if it is armed, drop that first payload and clear the flag
 - `seq` grows by payload length on send
 - `ack` tracks peer `seq + payload_len` on receive
-- if an injected responder `handshake_response` is still waiting for acknowledgement, local responder UDP is queued/dropped by the one-skb rule until a later initiator `ACK` covers it; inbound initiator traffic is still processed normally
-- idle timeout destroys the flow and sends `RST`
+- inbound traffic handling prioritizes flag classification:
+  - `RST`: destroy local state silently
+  - bare `SYN` (syn=1, ack=0, payload=0, aligned): accept as generation replacement. Destroy old flow state, drop old skb, create new `SYN_RCVD` responder flow, and send `SYN|ACK`.
+  - any other packet with `SYN` set: send `RST|ACK` and destroy local state
+  - no `SYN`: normal established data processing
+- any valid inbound fake-TCP packet that is accepted for this flow, including pure `ACK`s and handshake-response acknowledgement traffic, refreshes liveness suspicion
+- if an injected responder `handshake_response` is still waiting for acknowledgement, local responder UDP is queued/dropped by the one-skb rule until a later initiator `ACK` covers the end of that injected response; inbound initiator traffic is still processed normally
+- if no valid inbound packet has been seen for `keepalive_interval_sec`, send a pure `ACK` keepalive
+- if no valid inbound packet has been seen for `keepalive_misses * keepalive_interval_sec`, destroy local state silently
+  - if a queued outbound UDP skb already exists, immediately create a fresh `SYN_SENT` flow, carry one queued skb into it, and send `SYN`
+  - otherwise wait for future outbound UDP to create the next generation
 - explicit peer `RST` destroys the flow silently
 
 ## 8. Strict failure policy
@@ -457,7 +478,10 @@ Recommended optional config:
 - `handshake_response` (effective only when `handshake_request` is also configured)
 - allowed remote IPv4 CIDRs
 - allowed remote ports
-- idle timeout
+- `keepalive_interval_sec`
+- `keepalive_misses`
+- `hard_idle_timeout_sec`
+- `reopen_guard_bytes`
 - handshake timeout
 - retry count
 
@@ -531,3 +555,23 @@ Chosen because it works with existing UDP applications directly and avoids lying
 ### Netfilter core, not xtables target core
 
 Chosen because translation/state ownership belongs in a real module, not in a target callback abstraction designed mainly for policy integration.
+
+
+## 14. Remaining refinements not implemented in v1
+
+This design intentionally implements the minimum coherent best-effort recovery package from `REFINES.md`, not every possible refinement.
+
+Still unimplemented or intentionally deferred:
+
+- short quarantine for delayed old-generation packets after replacement (`REFINES.md` recommendation H)
+  - useful, but optional for the first recovery-focused implementation
+  - delayed old-generation traffic is still handled by the normal flag/seq rules immediately after replacement
+
+- seamless roaming or live tuple migration
+  - tuple changes are still handled as break detection plus re-establishment, not as transport-preserving migration
+
+- transport-independent session identity beyond the current tuple plus generation behavior
+  - SYN ISNs provide deterministic collision handling and generation separation, but they do not create a WireGuard-like authenticated session identity
+
+- WireGuard-like endpoint update semantics for the fake-TCP wrapper
+  - the wrapper can reconnect after breakage, but it still cannot safely claim true mobility support across arbitrary middleboxes

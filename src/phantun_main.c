@@ -17,13 +17,20 @@
 #include "phantun_packet.h"
 #include "phantun_stats.h"
 
+#define PHANTUN_REOPEN_ISN_ATTEMPTS 1024U
+
 static unsigned short managed_ports[PHANTUN_MAX_MANAGED_PORTS];
 static int managed_ports_count;
 static char *handshake_request;
 static char *handshake_response;
 static unsigned int handshake_timeout_ms = PHANTUN_DEFAULT_HANDSHAKE_TIMEOUT_MS;
 static unsigned int handshake_retries = PHANTUN_DEFAULT_HANDSHAKE_RETRIES;
-static unsigned int idle_timeout_sec = PHANTUN_DEFAULT_IDLE_TIMEOUT_SEC;
+static unsigned int keepalive_interval_sec =
+	PHANTUN_DEFAULT_KEEPALIVE_INTERVAL_SEC;
+static unsigned int keepalive_misses = PHANTUN_DEFAULT_KEEPALIVE_MISSES;
+static unsigned int hard_idle_timeout_sec =
+	PHANTUN_DEFAULT_HARD_IDLE_TIMEOUT_SEC;
+static unsigned int reopen_guard_bytes = PHANTUN_DEFAULT_REOPEN_GUARD_BYTES;
 static char *remote_ipv4_cidr;
 static unsigned short remote_port;
 static __be32 remote_ipv4_addr;
@@ -48,9 +55,18 @@ module_param(handshake_retries, uint, 0444);
 MODULE_PARM_DESC(
 	handshake_retries,
 	"Maximum handshake retry count before tearing a flow down with RST");
-module_param(idle_timeout_sec, uint, 0444);
-MODULE_PARM_DESC(idle_timeout_sec,
-		 "Idle flow timeout in seconds before teardown");
+module_param(keepalive_interval_sec, uint, 0444);
+MODULE_PARM_DESC(keepalive_interval_sec,
+		 "Idle time in seconds before sending a keepalive ACK");
+module_param(keepalive_misses, uint, 0444);
+MODULE_PARM_DESC(keepalive_misses,
+		 "Number of unanswered keepalives before flow teardown");
+module_param(hard_idle_timeout_sec, uint, 0444);
+MODULE_PARM_DESC(hard_idle_timeout_sec,
+		 "Maximum idle flow timeout in seconds (hard GC limit)");
+module_param(reopen_guard_bytes, uint, 0444);
+MODULE_PARM_DESC(reopen_guard_bytes,
+		 "Minimum sequence space separation for new connections");
 module_param(remote_ipv4_cidr, charp, 0444);
 MODULE_PARM_DESC(remote_ipv4_cidr, "Optional remote IPv4 CIDR filter (string "
 				   "form, parsed in later phases)");
@@ -178,6 +194,42 @@ static u32 phantun_tcp_seq_advance(const struct tcphdr *th,
 		advance++;
 
 	return advance;
+}
+
+static bool phantun_tcp_is_bare_syn(const struct pht_l4_view *view)
+{
+	return view && view->tcp->syn && !view->tcp->ack &&
+	       view->payload_len == 0;
+}
+
+static bool phantun_tcp_syn_is_aligned(const struct pht_l4_view *view)
+{
+	return view && ntohl(view->tcp->seq) % 4095U == 0;
+}
+
+static bool phantun_pick_reopen_isn(u32 prev_seq, bool has_prev_seq, u32 *init_seq)
+{
+	unsigned int attempt;
+
+	if (!init_seq)
+		return false;
+
+	for (attempt = 0; attempt < PHANTUN_REOPEN_ISN_ATTEMPTS; attempt++) {
+		u32 candidate = phantun_random_aligned_seq();
+
+		if (has_prev_seq) {
+			u32 diff = candidate - prev_seq;
+			u32 abs_diff = diff < 0x80000000U ? diff : -diff;
+
+			if (abs_diff < phantun_cfg.reopen_guard_bytes)
+				continue;
+		}
+
+		*init_seq = candidate;
+		return true;
+	}
+
+	return false;
 }
 
 static bool phantun_request_enabled(void)
@@ -441,6 +493,8 @@ static void phantun_note_inbound_payload(struct pht_flow *flow,
 	flow->ack = ntohl(view->tcp->seq) + view->payload_len;
 	flow->last_ack = flow->ack;
 	flow->last_activity_jiffies = jiffies;
+	flow->last_inbound_jiffies = jiffies;
+	flow->keepalives_sent = 0;
 	if (clear_drop_next)
 		flow->drop_next_rx_payload = false;
 	spin_unlock_bh(&flow->lock);
@@ -459,6 +513,8 @@ static int phantun_finalize_established_rx(
 	flow->ack = ntohl(view->tcp->seq) + view->payload_len;
 	flow->last_ack = flow->ack;
 	flow->last_activity_jiffies = jiffies;
+	flow->last_inbound_jiffies = jiffies;
+	flow->keepalives_sent = 0;
 	if (clear_drop_next)
 		flow->drop_next_rx_payload = false;
 	allow_flush = !flow->response_pending_ack;
@@ -491,6 +547,8 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
 	struct pht_flow *new_flow;
 	enum pht_flow_state state_now;
 	u32 init_seq;
+	u32 prev_seq = 0;
+	bool has_prev_seq = false;
 	int ret;
 	bool queued;
 
@@ -562,7 +620,9 @@ retry_lookup:
 		}
 
 		if (state_now == PHT_FLOW_STATE_DEAD) {
-			pht_flow_remove(flow);
+			prev_seq = flow->seq;
+			has_prev_seq = true;
+			pht_flow_detach(flow);
 			pht_flow_put(flow);
 			goto retry_lookup;
 		}
@@ -581,7 +641,14 @@ retry_lookup:
 		return NF_STOLEN;
 	}
 
-	init_seq = phantun_random_aligned_seq();
+	if (!phantun_pick_reopen_isn(prev_seq, has_prev_seq, &init_seq)) {
+		pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+		pht_pr_warn("failed to choose reopen ISN for new flow\n");
+		pht_flow_put(new_flow);
+		kfree_skb(skb);
+		return NF_STOLEN;
+	}
+
 	spin_lock_bh(&new_flow->lock);
 	new_flow->seq = init_seq;
 	new_flow->ack = 0;
@@ -630,7 +697,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 	struct net_device *in_dev;
 	u32 expected_ack;
 	u32 responder_seq;
-	bool local_is_low;
+	u32 local_isn;
+	u32 peer_syn_next;
 	bool had_queued;
 	int ret;
 
@@ -656,13 +724,25 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 	in_dev = state->in ? state->in : skb->dev;
 
 	flow = pht_flow_lookup_oriented(flows, &ep);
+	if (flow) {
+		spin_lock_bh(&flow->lock);
+		state_now = flow->state;
+		spin_unlock_bh(&flow->lock);
+
+		if (state_now == PHT_FLOW_STATE_DEAD) {
+			pht_flow_detach(flow);
+			pht_flow_put(flow);
+			flow = NULL;
+		}
+	}
+
 	if (!flow) {
 		if (view.tcp->rst)
 			return NF_DROP;
 
-		if (!view.tcp->syn) {
+		if (!phantun_tcp_is_bare_syn(&view)) {
 			ret = phantun_send_rstack(state->net, &ep, &view,
-						  false);
+						  view.tcp->syn);
 			if (ret)
 				pht_pr_warn("failed to emit RST|ACK for "
 					    "unknown packet: %d\n",
@@ -670,7 +750,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 			return NF_DROP;
 		}
 
-		if (ntohl(view.tcp->seq) % 4095U != 0) {
+		if (!phantun_tcp_syn_is_aligned(&view)) {
 			ret = phantun_send_rstack(state->net, &ep, &view, true);
 			if (ret)
 				pht_pr_warn("failed to emit RST|ACK for "
@@ -678,7 +758,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 					    ret);
 			return NF_DROP;
 		}
-
+process_as_new_syn:
 		new_flow = pht_flow_create(flows, &ep, PHT_FLOW_ROLE_RESPONDER,
 					   PHT_FLOW_STATE_SYN_RCVD);
 		if (IS_ERR(new_flow)) {
@@ -713,7 +793,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 	spin_lock_bh(&flow->lock);
 	state_now = flow->state;
 	expected_ack = flow->local_isn + 1;
-	local_is_low = flow->local_is_low;
+	local_isn = flow->local_isn;
+	peer_syn_next = flow->peer_syn_next;
 	had_queued = flow->queued_skb != NULL;
 	spin_unlock_bh(&flow->lock);
 
@@ -724,11 +805,32 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 	}
 
 	if (state_now == PHT_FLOW_STATE_SYN_SENT) {
-		if (view.tcp->syn && !view.tcp->ack && view.payload_len == 0) {
-			if (local_is_low) {
+		if (phantun_tcp_is_bare_syn(&view)) {
+			u32 peer_isn;
+
+			if (!phantun_tcp_syn_is_aligned(&view)) {
+				ret = phantun_send_rstack(state->net, &ep, &view, true);
+				if (ret)
+					pht_pr_warn("failed to emit RST|ACK for "
+						    "misaligned colliding SYN: %d\n",
+						    ret);
+				pht_flow_put(flow);
+				return NF_DROP;
+			}
+
+			peer_isn = ntohl(view.tcp->seq);
+
+			if (local_isn == peer_isn) {
+				/* Exact match is extremely rare. Drop to
+				 * resolve via timeout */
+				pht_flow_put(flow);
+				return NF_DROP;
+			}
+
+			if (local_isn < peer_isn) {
 				pht_pr_info("collision on tuple; keeping "
 					    "initiator role\n");
-				pht_flow_touch(flow);
+				pht_flow_touch_inbound(flow);
 				pht_stats_inc(PHT_STAT_COLLISIONS_WON);
 				pht_flow_put(flow);
 				return NF_DROP;
@@ -738,20 +840,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 				    "responder role\n");
 			pht_stats_inc(PHT_STAT_COLLISIONS_LOST);
 			queued_skb = pht_flow_take_queued_skb(flow);
-			pht_flow_remove(flow);
+			pht_flow_detach(flow);
 			pht_flow_put(flow);
-
-			if (ntohl(view.tcp->seq) % 4095U != 0) {
-				ret = phantun_send_rstack(state->net, &ep,
-							  &view, true);
-				if (ret)
-					pht_pr_warn("failed to emit RST|ACK "
-						    "for misaligned colliding "
-						    "SYN: %d\n",
-						    ret);
-				kfree_skb(queued_skb);
-				return NF_DROP;
-			}
 
 			new_flow = pht_flow_create(flows, &ep,
 						   PHT_FLOW_ROLE_RESPONDER,
@@ -822,6 +912,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 				}
 			}
 
+			pht_flow_touch_inbound(flow);
 			pht_flow_update_state(flow, PHT_FLOW_STATE_ESTABLISHED);
 			ret = phantun_flush_queued_udp(flow, state->net);
 			if (!ret && !had_queued && !phantun_request_enabled())
@@ -846,8 +937,10 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 		return NF_DROP;
 	}
 
-	if (state_now == PHT_FLOW_STATE_SYN_RCVD && view.tcp->syn &&
-	    !view.tcp->ack && view.payload_len == 0) {
+	if (state_now == PHT_FLOW_STATE_SYN_RCVD &&
+	    phantun_tcp_is_bare_syn(&view) &&
+	    phantun_tcp_syn_is_aligned(&view) &&
+	    ntohl(view.tcp->seq) + 1 == peer_syn_next) {
 		ret = phantun_send_synack(flow, state->net);
 		if (ret)
 			pht_pr_warn("failed to re-emit SYN|ACK: %d\n", ret);
@@ -899,20 +992,28 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 			flow->response_pending_ack = true;
 			spin_unlock_bh(&flow->lock);
 
+			if (view.payload_len == 0)
+				pht_flow_touch_inbound(flow);
 			pht_flow_update_state(flow, PHT_FLOW_STATE_ESTABLISHED);
 			pht_flow_put(flow);
 			return NF_DROP;
 		}
 
+		pht_flow_touch_inbound(flow);
 		pht_flow_update_state(flow, PHT_FLOW_STATE_ESTABLISHED);
+
+		/* The responder transitions to ESTABLISHED. We must flush any
+		 * queued UDP data. */
+		ret = phantun_flush_queued_udp(flow, state->net);
+		if (ret) {
+			pht_pr_warn("failed to flush responder queue: %d\n",
+				    ret);
+			pht_flow_remove(flow);
+			pht_flow_put(flow);
+			return NF_DROP;
+		}
+
 		if (view.payload_len == 0) {
-			ret = phantun_flush_queued_udp(flow, state->net);
-			if (ret) {
-				pht_pr_warn(
-					"failed to flush responder queue: %d\n",
-					ret);
-				pht_flow_remove(flow);
-			}
 			pht_flow_put(flow);
 			return NF_DROP;
 		}
@@ -937,6 +1038,26 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 		bool response_acked = false;
 		bool drop_payload = false;
 
+		if (view.tcp->syn) {
+			if (phantun_tcp_is_bare_syn(&view) &&
+			    phantun_tcp_syn_is_aligned(&view)) {
+				pht_pr_info("received bare SYN on ESTABLISHED "
+					    "tuple, replacing generation\n");
+				queued_skb = pht_flow_take_queued_skb(flow);
+				if (queued_skb)
+					kfree_skb(queued_skb);
+				pht_flow_detach(flow);
+				pht_flow_put(flow);
+				goto process_as_new_syn;
+			}
+			pht_pr_warn("received invalid SYN on ESTABLISHED "
+				    "tuple, destroying\n");
+			phantun_send_rstack(state->net, &ep, &view, true);
+			pht_flow_remove(flow);
+			pht_flow_put(flow);
+			return NF_DROP;
+		}
+
 		spin_lock_bh(&flow->lock);
 		if (flow->response_pending_ack && view.tcp->ack &&
 		    ntohl(view.tcp->ack_seq) >=
@@ -952,18 +1073,16 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 		spin_unlock_bh(&flow->lock);
 
 		if (view.payload_len == 0) {
+			pht_flow_touch_inbound(flow);
 			if (response_acked) {
 				ret = phantun_flush_queued_udp(flow,
-							       state->net);
+						       state->net);
 				if (ret) {
 					pht_pr_warn("failed to flush responder "
-						    "queue: "
-						    "%d\n",
+						    "queue: %d\n",
 						    ret);
 					pht_flow_remove(flow);
 				}
-			} else {
-				pht_flow_touch(flow);
 			}
 			pht_flow_put(flow);
 			return NF_DROP;
@@ -982,8 +1101,6 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 		return NF_DROP;
 	}
 
-	if (state_now == PHT_FLOW_STATE_DEAD)
-		pht_flow_remove(flow);
 	pht_flow_put(flow);
 	return NF_DROP;
 }
@@ -1084,8 +1201,24 @@ static int phantun_validate_config(void)
 		return -EINVAL;
 	}
 
-	if (!idle_timeout_sec) {
-		pht_pr_err("idle_timeout_sec must be greater than zero\n");
+	if (!keepalive_interval_sec) {
+		pht_pr_err(
+			"keepalive_interval_sec must be greater than zero\n");
+		return -EINVAL;
+	}
+
+	if (!keepalive_misses) {
+		pht_pr_err("keepalive_misses must be greater than zero\n");
+		return -EINVAL;
+	}
+
+	if (!hard_idle_timeout_sec) {
+		pht_pr_err("hard_idle_timeout_sec must be greater than zero\n");
+		return -EINVAL;
+	}
+
+	if (reopen_guard_bytes >= 0x80000000U) {
+		pht_pr_err("reopen_guard_bytes must be smaller than 2147483648\n");
 		return -EINVAL;
 	}
 
@@ -1118,7 +1251,10 @@ static void phantun_snapshot_config(void)
 			: 0;
 	phantun_cfg.handshake_timeout_ms = handshake_timeout_ms;
 	phantun_cfg.handshake_retries = handshake_retries;
-	phantun_cfg.idle_timeout_sec = idle_timeout_sec;
+	phantun_cfg.keepalive_interval_sec = keepalive_interval_sec;
+	phantun_cfg.keepalive_misses = keepalive_misses;
+	phantun_cfg.hard_idle_timeout_sec = hard_idle_timeout_sec;
+	phantun_cfg.reopen_guard_bytes = reopen_guard_bytes;
 	phantun_cfg.remote_ipv4_cidr =
 		remote_ipv4_enabled ? remote_ipv4_cidr : NULL;
 	phantun_cfg.remote_ipv4_addr = remote_ipv4_addr;
@@ -1132,11 +1268,16 @@ static void phantun_log_config(void)
 	unsigned int i;
 
 	pht_pr_info("loading with %u managed port(s), handshake_timeout_ms=%u, "
-		    "handshake_retries=%u, idle_timeout_sec=%u\n",
+		    "handshake_retries=%u, keepalive_interval_sec=%u, "
+		    "keepalive_misses=%u, hard_idle_timeout_sec=%u, "
+		    "reopen_guard_bytes=%u\n",
 		    phantun_cfg.managed_ports_count,
 		    phantun_cfg.handshake_timeout_ms,
 		    phantun_cfg.handshake_retries,
-		    phantun_cfg.idle_timeout_sec);
+		    phantun_cfg.keepalive_interval_sec,
+		    phantun_cfg.keepalive_misses,
+		    phantun_cfg.hard_idle_timeout_sec,
+		    phantun_cfg.reopen_guard_bytes);
 
 	for (i = 0; i < phantun_cfg.managed_ports_count; i++)
 		pht_pr_info("managed_ports[%u]=%u\n", i,

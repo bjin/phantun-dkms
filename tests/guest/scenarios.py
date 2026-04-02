@@ -1,6 +1,7 @@
 import json
 import select
 import socket
+import struct
 import sys
 
 
@@ -202,6 +203,132 @@ def multi_client(config):
     _emit({'channels': channels, 'replies': replies})
 
 
+def simultaneous_exchange(config):
+    with _socket(config['bind_addr'], config['bind_port']) as sock:
+        sock.sendto(
+            config['payload'].encode(),
+            (config['target_addr'], config['target_port']),
+        )
+        data, addr = sock.recvfrom(2048)
+        _emit({
+            'sent': config['payload'],
+            'received': data.decode(),
+            'peer': [addr[0], addr[1]],
+        })
+
+def _checksum(data):
+    if len(data) % 2:
+        data += b'\x00'
+    words = struct.unpack(f'!{len(data) // 2}H', data)
+    total = sum(words)
+    total = (total & 0xffff) + (total >> 16)
+    total = (total & 0xffff) + (total >> 16)
+    return (~total) & 0xffff
+
+
+def _tcp_flags_expr(expr):
+    value = 0
+    for name in expr.split('|'):
+        flag = name.strip().lower()
+        if not flag:
+            continue
+        value |= {
+            'fin': 0x01,
+            'syn': 0x02,
+            'rst': 0x04,
+            'psh': 0x08,
+            'ack': 0x10,
+            'urg': 0x20,
+        }[flag]
+    return value
+
+
+def send_tcp_packet(config):
+    import struct
+
+    src_addr = config['bind_addr']
+    dst_addr = config['target_addr']
+    src_port = config['bind_port']
+    dst_port = config['target_port']
+    seq = config.get('seq', 12345)
+    ack = config.get('ack', 0)
+    payload = config.get('payload', b'')
+    if isinstance(payload, str):
+        payload = payload.encode()
+
+    flags = _tcp_flags_expr(config['flags'])
+    window = socket.htons(config.get('window', 5840))
+    doff = 5
+
+    tcp_header = struct.pack(
+        '!HHLLBBHHH',
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        doff << 4,
+        flags,
+        window,
+        0,
+        0,
+    )
+    pseudo_header = struct.pack(
+        '!4s4sBBH',
+        socket.inet_aton(src_addr),
+        socket.inet_aton(dst_addr),
+        0,
+        socket.IPPROTO_TCP,
+        len(tcp_header) + len(payload),
+    )
+    tcp_check = _checksum(pseudo_header + tcp_header + payload)
+    tcp_header = struct.pack(
+        '!HHLLBBHHH',
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        doff << 4,
+        flags,
+        window,
+        tcp_check,
+        0,
+    )
+
+    total_len = 20 + len(tcp_header) + len(payload)
+    ip_header = struct.pack(
+        '!BBHHHBBH4s4s',
+        (4 << 4) | 5,
+        0,
+        total_len,
+        config.get('ip_id', 0),
+        0,
+        64,
+        socket.IPPROTO_TCP,
+        0,
+        socket.inet_aton(src_addr),
+        socket.inet_aton(dst_addr),
+    )
+    ip_check = _checksum(ip_header)
+    ip_header = struct.pack(
+        '!BBHHHBBH4s4s',
+        (4 << 4) | 5,
+        0,
+        total_len,
+        config.get('ip_id', 0),
+        0,
+        64,
+        socket.IPPROTO_TCP,
+        ip_check,
+        socket.inet_aton(src_addr),
+        socket.inet_aton(dst_addr),
+    )
+
+    with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW) as raw_sock:
+        raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        raw_sock.sendto(ip_header + tcp_header + payload, (dst_addr, 0))
+
+    _emit({'done': True})
+
 SCENARIOS = {
     'ping_server': ping_server,
     'ping_client': ping_client,
@@ -209,6 +336,8 @@ SCENARIOS = {
     'echo_client': echo_client,
     'recv_many': recv_many,
     'send_many': send_many,
+    'simultaneous_exchange': simultaneous_exchange,
+    'send_tcp_packet': send_tcp_packet,
     'recv_many_reply': recv_many_reply,
     'send_many_recv': send_many_recv,
     'multi_server': multi_server,
@@ -218,7 +347,7 @@ SCENARIOS = {
 
 def main(argv):
     if len(argv) != 3:
-        raise SystemExit('usage: udp_scenarios.py <scenario> <json-config>')
+        raise SystemExit('usage: scenarios.py <scenario> <json-config>')
 
     scenario = argv[1]
     config = json.loads(argv[2])
