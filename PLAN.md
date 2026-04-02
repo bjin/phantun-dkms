@@ -55,19 +55,19 @@ It tracks only unfinished work that still matters after the recovery redesign.
 
 ## Phase 3 - operational hardening
 
-- [ ] Add ratelimited warnings for malformed or impossible fake-TCP traffic
-- [ ] Re-audit teardown and recovery paths for idempotency
-- [ ] Re-audit skb ownership across recovery and replacement paths
-- [ ] Re-audit hook/atomic paths to ensure no accidental sleep/regression was introduced by later changes
+- [x] Add ratelimited warnings for malformed or impossible fake-TCP traffic
+- [x] Re-audit teardown and recovery paths for idempotency
+- [x] Re-audit skb ownership across recovery and replacement paths
+- [x] Re-audit hook/atomic paths to ensure no accidental sleep/regression was introduced by later changes
 
 ## Phase 4 - documentation cleanup
 
-- [ ] Document required firewall policy changes
-  - [ ] allow fake-TCP for selector-matched tuples instead of thinking only in terms of one managed port
-  - [ ] explain that raw inbound UDP matching the selectors is dropped by default while module-reinjected UDP is exempt
-  - [ ] clarify that old TUN NAT rules do not apply here
-- [ ] Document WireGuard MTU reduction guidance
-- [ ] Document the exact shaping semantics for `handshake_request` / `handshake_response`
-- [ ] Document this protocol as a kernel-to-kernel variant, not a compatibility mode for legacy userspace Phantun
-- [ ] Add concise operational examples for kernel WireGuard and `wireguard-go`
+- [x] Document required firewall policy changes
+  - [x] allow fake-TCP for selector-matched tuples instead of thinking only in terms of one managed port
+  - [x] explain that raw inbound UDP matching the selectors is dropped by default while module-reinjected UDP is exempt
+  - [x] clarify that old TUN NAT rules do not apply here
+- [x] Document WireGuard MTU reduction guidance
+- [x] Document the exact shaping semantics for `handshake_request` / `handshake_response`
+- [x] Document this protocol as a kernel-to-kernel variant, not a compatibility mode for legacy userspace Phantun
+- [x] Add concise operational examples for kernel WireGuard and `wireguard-go`
 

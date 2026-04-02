@@ -10,14 +10,11 @@
 static atomic64_t pht_stats[PHT_STAT_COUNT];
 static struct kobject *pht_stats_kobj;
 
-#define PHT_STAT_ATTR(_name, _id)                                            \
-	static ssize_t _name##_show(struct kobject *kobj,                    \
-				    struct kobj_attribute *attr, char *buf)  \
-	{                                                                    \
-		return sysfs_emit(                                           \
-			buf, "%llu\n",                                       \
-			(unsigned long long)atomic64_read(&pht_stats[_id])); \
-	}                                                                    \
+#define PHT_STAT_ATTR(_name, _id)                                                                     \
+	static ssize_t _name##_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)     \
+	{                                                                                             \
+		return sysfs_emit(buf, "%llu\n", (unsigned long long)atomic64_read(&pht_stats[_id])); \
+	}                                                                                             \
 	static struct kobj_attribute _name##_attr = __ATTR_RO(_name)
 
 PHT_STAT_ATTR(flows_created, PHT_STAT_FLOWS_CREATED);

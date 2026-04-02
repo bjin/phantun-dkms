@@ -17,12 +17,10 @@
 #define PHANTUN_CAPTURE_PRIORITY (-400)
 
 #define pht_pr_err(fmt, ...) pr_err(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
-#define pht_pr_warn(fmt, ...) \
-	pr_warn(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
-#define pht_pr_info(fmt, ...) \
-	pr_info(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
-#define pht_pr_debug(fmt, ...) \
-	pr_debug(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
+#define pht_pr_warn(fmt, ...) pr_warn(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
+#define pht_pr_warn_rl(fmt, ...) pr_warn_ratelimited(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
+#define pht_pr_info(fmt, ...) pr_info(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
+#define pht_pr_debug(fmt, ...) pr_debug(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
 
 struct pht_managed_peer {
 	__be32 addr;

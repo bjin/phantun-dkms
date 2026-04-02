@@ -15,8 +15,7 @@ static u32 pht_flow_hash_key(const struct pht_flow_key *key)
 	return jhash(key, sizeof(*key), 0) & (PHT_FLOW_BUCKETS - 1);
 }
 
-static int pht_endpoint_cmp(__be32 addr_a, __be16 port_a, __be32 addr_b,
-			    __be16 port_b)
+static int pht_endpoint_cmp(__be32 addr_a, __be16 port_a, __be32 addr_b, __be16 port_b)
 {
 	if (ntohl(addr_a) < ntohl(addr_b))
 		return -1;
@@ -42,8 +41,7 @@ static int pht_flow_send_local_rst(struct pht_flow *flow)
 	if (!flow || !flow->table || !flow->table->net)
 		return -EINVAL;
 
-	ret = pht_emit_fake_tcp_v4(flow->table->net, &flow->oriented, flow->seq,
-				   0, PHT_TCP_FLAG_RST, NULL, 0);
+	ret = pht_emit_fake_tcp_v4(flow->table->net, &flow->oriented, flow->seq, 0, PHT_TCP_FLAG_RST, NULL, 0);
 	if (!ret)
 		pht_stats_inc(PHT_STAT_RST_SENT);
 	return ret;
@@ -78,21 +76,18 @@ static int pht_flow_retransmit_now(struct pht_flow *flow)
 	if (!flags)
 		return 0;
 
-	return pht_emit_fake_tcp_v4(flow->table->net, &ep, seq, ack, flags,
-				    NULL, 0);
+	return pht_emit_fake_tcp_v4(flow->table->net, &ep, seq, ack, flags, NULL, 0);
 }
 
 static void pht_flow_gc_worker(struct work_struct *work);
 
 static void pht_flow_retransmit_timer(struct timer_list *timer)
 {
-	struct pht_flow *flow =
-		timer_container_of(flow, timer, retransmit_timer);
+	struct pht_flow *flow = timer_container_of(flow, timer, retransmit_timer);
 	unsigned long next;
 
 	spin_lock_bh(&flow->lock);
-	if (!flow->retransmit_armed ||
-	    !pht_flow_state_is_half_open(flow->state) ||
+	if (!flow->retransmit_armed || !pht_flow_state_is_half_open(flow->state) ||
 	    flow->state == PHT_FLOW_STATE_DEAD) {
 		flow->retransmit_armed = false;
 		spin_unlock_bh(&flow->lock);
@@ -118,8 +113,7 @@ static void pht_flow_retransmit_timer(struct timer_list *timer)
 		pht_pr_warn("failed to retransmit half-open flow packet\n");
 
 	spin_lock_bh(&flow->lock);
-	if (!flow->retransmit_armed ||
-	    !pht_flow_state_is_half_open(flow->state) ||
+	if (!flow->retransmit_armed || !pht_flow_state_is_half_open(flow->state) ||
 	    flow->state == PHT_FLOW_STATE_DEAD) {
 		flow->retransmit_armed = false;
 		spin_unlock_bh(&flow->lock);
@@ -128,8 +122,7 @@ static void pht_flow_retransmit_timer(struct timer_list *timer)
 	}
 	spin_unlock_bh(&flow->lock);
 
-	pht_pr_debug("half-open flow retry %u/%u scheduled\n",
-		     flow->retries_done, flow->max_retries);
+	pht_pr_debug("half-open flow retry %u/%u scheduled\n", flow->retries_done, flow->max_retries);
 	mod_timer(&flow->retransmit_timer, next);
 }
 
@@ -152,21 +145,17 @@ static void pht_flow_shutdown_retransmit_sync(struct pht_flow *flow)
 		pht_flow_put(flow);
 }
 
-bool pht_flow_key_equal(const struct pht_flow_key *a,
-			const struct pht_flow_key *b)
+bool pht_flow_key_equal(const struct pht_flow_key *a, const struct pht_flow_key *b)
 {
 	return !memcmp(a, b, sizeof(*a));
 }
 
-void pht_flow_key_from_endpoints(struct pht_flow_key *key,
-				 const struct pht_ipv4_endpoint_pair *ep,
-				 bool *local_is_low)
+void pht_flow_key_from_endpoints(struct pht_flow_key *key, const struct pht_ipv4_endpoint_pair *ep, bool *local_is_low)
 {
 	bool is_low;
 	int cmp;
 
-	cmp = pht_endpoint_cmp(ep->local_addr, ep->local_port, ep->remote_addr,
-			       ep->remote_port);
+	cmp = pht_endpoint_cmp(ep->local_addr, ep->local_port, ep->remote_addr, ep->remote_port);
 	is_low = cmp <= 0;
 
 	if (is_low) {
@@ -196,8 +185,7 @@ bool pht_flow_state_is_half_open(enum pht_flow_state state)
 	}
 }
 
-int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
-			const struct phantun_config *cfg)
+int pht_flow_table_init(struct pht_flow_table *table, struct net *net, const struct phantun_config *cfg)
 {
 	unsigned int i;
 
@@ -210,16 +198,12 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
 		INIT_HLIST_HEAD(&table->buckets[i].head);
 	}
 
-	table->handshake_timeout_jiffies =
-		msecs_to_jiffies(cfg->handshake_timeout_ms);
-	table->keepalive_interval_jiffies =
-		msecs_to_jiffies(cfg->keepalive_interval_sec * 1000U);
+	table->handshake_timeout_jiffies = msecs_to_jiffies(cfg->handshake_timeout_ms);
+	table->keepalive_interval_jiffies = msecs_to_jiffies(cfg->keepalive_interval_sec * 1000U);
 	table->keepalive_misses = cfg->keepalive_misses;
-	table->hard_idle_timeout_jiffies =
-		msecs_to_jiffies(cfg->hard_idle_timeout_sec * 1000U);
+	table->hard_idle_timeout_jiffies = msecs_to_jiffies(cfg->hard_idle_timeout_sec * 1000U);
 	table->reopen_guard_bytes = cfg->reopen_guard_bytes;
-	table->gc_interval_jiffies =
-		msecs_to_jiffies(PHT_FLOW_GC_INTERVAL_SEC * 1000U);
+	table->gc_interval_jiffies = msecs_to_jiffies(PHT_FLOW_GC_INTERVAL_SEC * 1000U);
 	if (table->keepalive_interval_jiffies > 0) {
 		unsigned long min_gc = table->keepalive_interval_jiffies / 2;
 		if (min_gc < table->gc_interval_jiffies)
@@ -235,8 +219,7 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
 	return 0;
 }
 
-static void pht_flow_detach_all(struct pht_flow_table *table,
-				struct list_head *expired)
+static void pht_flow_detach_all(struct pht_flow_table *table, struct list_head *expired)
 
 {
 	unsigned int i;
@@ -259,8 +242,7 @@ static void pht_flow_detach_all(struct pht_flow_table *table,
 	}
 }
 
-static bool pht_flow_gc_detach_expired(struct pht_flow_table *table,
-				       struct list_head *expired,
+static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list_head *expired,
 				       struct sk_buff_head *reinject_list)
 {
 	unsigned int i;
@@ -281,24 +263,17 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table,
 
 			spin_lock(&flow->lock);
 			if (flow->state == PHT_FLOW_STATE_DEAD) {
-				if (time_after_eq(
-					    now,
-					    flow->last_activity_jiffies +
-						    table->hard_idle_timeout_jiffies)) {
+				if (time_after_eq(now,
+						  flow->last_activity_jiffies + table->hard_idle_timeout_jiffies)) {
 					expired_flow = true;
 				}
 			} else {
-				bool hard_expired = time_after_eq(
-					now,
-					flow->last_activity_jiffies +
-						table->hard_idle_timeout_jiffies);
-				bool liveness_failed =
-					table->keepalive_interval_jiffies > 0 &&
-					time_after_eq(
-						now,
-						flow->last_inbound_jiffies +
-							(table->keepalive_interval_jiffies *
-							 table->keepalive_misses));
+				bool hard_expired = time_after_eq(now, flow->last_activity_jiffies +
+									       table->hard_idle_timeout_jiffies);
+				bool liveness_failed = table->keepalive_interval_jiffies > 0 &&
+						       time_after_eq(now, flow->last_inbound_jiffies +
+										  (table->keepalive_interval_jiffies *
+										   table->keepalive_misses));
 				if (hard_expired) {
 					expired_flow = true;
 					flow->hard_expired = true;
@@ -307,14 +282,10 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table,
 					flow->state = PHT_FLOW_STATE_DEAD;
 					flow->liveness_failed = true;
 					is_liveness_failure = true;
-				} else if (
-					table->keepalive_interval_jiffies > 0 &&
-					time_after_eq(
-						now,
-						flow->last_inbound_jiffies +
-							table->keepalive_interval_jiffies *
-								(flow->keepalives_sent +
-								 1))) {
+				} else if (table->keepalive_interval_jiffies > 0 &&
+					   time_after_eq(now, flow->last_inbound_jiffies +
+								      table->keepalive_interval_jiffies *
+									      (flow->keepalives_sent + 1))) {
 					send_keepalive = true;
 					flow->keepalives_sent++;
 				}
@@ -329,20 +300,15 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table,
 
 				queued_skb = pht_flow_take_queued_skb(flow);
 				if (queued_skb)
-					__skb_queue_tail(reinject_list,
-							 queued_skb);
+					__skb_queue_tail(reinject_list, queued_skb);
 			}
 
-			if (send_keepalive && !expired_flow &&
-			    !is_liveness_failure) {
+			if (send_keepalive && !expired_flow && !is_liveness_failure) {
 				/* Send a pure ACK as keepalive */
 				spin_lock(&flow->lock);
 				if (flow->table && flow->table->net) {
-					pht_emit_fake_tcp_v4(
-						flow->table->net,
-						&flow->oriented, flow->seq,
-						flow->ack, PHT_TCP_FLAG_ACK,
-						NULL, 0);
+					pht_emit_fake_tcp_v4(flow->table->net, &flow->oriented, flow->seq, flow->ack,
+							     PHT_TCP_FLAG_ACK, NULL, 0);
 				}
 				spin_unlock(&flow->lock);
 			}
@@ -362,8 +328,7 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table,
 
 static void pht_flow_gc_worker(struct work_struct *work)
 {
-	struct pht_flow_table *table = container_of(
-		to_delayed_work(work), struct pht_flow_table, gc_work);
+	struct pht_flow_table *table = container_of(to_delayed_work(work), struct pht_flow_table, gc_work);
 	LIST_HEAD(expired);
 	struct sk_buff_head reinject_list;
 	struct sk_buff *skb;
@@ -422,8 +387,7 @@ void pht_flow_put(struct pht_flow *flow)
 		pht_flow_free(flow);
 }
 
-struct pht_flow *pht_flow_lookup(struct pht_flow_table *table,
-				 const struct pht_flow_key *key)
+struct pht_flow *pht_flow_lookup(struct pht_flow_table *table, const struct pht_flow_key *key)
 {
 	struct pht_flow_bucket *bucket;
 	struct pht_flow *flow;
@@ -448,9 +412,7 @@ struct pht_flow *pht_flow_lookup(struct pht_flow_table *table,
 	return NULL;
 }
 
-struct pht_flow *
-pht_flow_lookup_oriented(struct pht_flow_table *table,
-			 const struct pht_ipv4_endpoint_pair *ep)
+struct pht_flow *pht_flow_lookup_oriented(struct pht_flow_table *table, const struct pht_ipv4_endpoint_pair *ep)
 {
 	struct pht_flow_key key;
 
@@ -461,10 +423,8 @@ pht_flow_lookup_oriented(struct pht_flow_table *table,
 	return pht_flow_lookup(table, &key);
 }
 
-struct pht_flow *pht_flow_create(struct pht_flow_table *table,
-				 const struct pht_ipv4_endpoint_pair *ep,
-				 enum pht_flow_role role,
-				 enum pht_flow_state state)
+struct pht_flow *pht_flow_create(struct pht_flow_table *table, const struct pht_ipv4_endpoint_pair *ep,
+				 enum pht_flow_role role, enum pht_flow_state state)
 {
 	struct pht_flow *flow;
 
@@ -524,6 +484,10 @@ int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow)
 	return 0;
 }
 
+/* Idempotent detach: if the flow is still hashed, remove that table-owned
+ * reference exactly once. The caller keeps its own reference and decides when
+ * to drop it.
+ */
 void pht_flow_detach(struct pht_flow *flow)
 {
 	struct pht_flow_bucket *bucket;
@@ -549,6 +513,9 @@ void pht_flow_detach(struct pht_flow *flow)
 	pht_flow_put(flow);
 }
 
+/* Local teardown is intentionally idempotent: mark the flow dead and stop
+ * retransmits, but leave final unhash/free to detach/GC paths.
+ */
 void pht_flow_remove(struct pht_flow *flow)
 {
 	if (!flow)
@@ -583,6 +550,9 @@ void pht_flow_touch(struct pht_flow *flow)
 	spin_unlock_bh(&flow->lock);
 }
 
+/* On success the flow takes ownership of @skb. On failure the caller still
+ * owns @skb and must decide whether to free or reuse it.
+ */
 bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb)
 {
 	bool queued = false;
@@ -603,6 +573,9 @@ bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb)
 	return queued;
 }
 
+/* The flow takes ownership of @skb. Any previously queued skb is released
+ * here so callers do not need a second free path.
+ */
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb)
 {
 	struct sk_buff *old;
@@ -650,8 +623,7 @@ void pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state)
 	half_open = pht_flow_state_is_half_open(state);
 	spin_unlock_bh(&flow->lock);
 
-	if (state == PHT_FLOW_STATE_ESTABLISHED &&
-	    old_state != PHT_FLOW_STATE_ESTABLISHED)
+	if (state == PHT_FLOW_STATE_ESTABLISHED && old_state != PHT_FLOW_STATE_ESTABLISHED)
 		pht_stats_inc(PHT_STAT_FLOWS_ESTABLISHED);
 	if (half_open)
 		pht_flow_arm_retransmit(flow);
@@ -668,8 +640,7 @@ void pht_flow_arm_retransmit(struct pht_flow *flow)
 		return;
 
 	spin_lock_bh(&flow->lock);
-	if (!pht_flow_state_is_half_open(flow->state) ||
-	    flow->state == PHT_FLOW_STATE_DEAD) {
+	if (!pht_flow_state_is_half_open(flow->state) || flow->state == PHT_FLOW_STATE_DEAD) {
 		spin_unlock_bh(&flow->lock);
 		return;
 	}
