@@ -207,7 +207,8 @@ static bool phantun_tcp_syn_is_aligned(const struct pht_l4_view *view)
 	return view && ntohl(view->tcp->seq) % 4095U == 0;
 }
 
-static bool phantun_pick_reopen_isn(u32 prev_seq, bool has_prev_seq, u32 *init_seq)
+static bool phantun_pick_reopen_isn(u32 prev_seq, bool has_prev_seq,
+				    u32 *init_seq)
 {
 	unsigned int attempt;
 
@@ -809,11 +810,14 @@ process_as_new_syn:
 			u32 peer_isn;
 
 			if (!phantun_tcp_syn_is_aligned(&view)) {
-				ret = phantun_send_rstack(state->net, &ep, &view, true);
+				ret = phantun_send_rstack(state->net, &ep,
+							  &view, true);
 				if (ret)
-					pht_pr_warn("failed to emit RST|ACK for "
-						    "misaligned colliding SYN: %d\n",
-						    ret);
+					pht_pr_warn(
+						"failed to emit RST|ACK for "
+						"misaligned colliding SYN: "
+						"%d\n",
+						ret);
 				pht_flow_put(flow);
 				return NF_DROP;
 			}
@@ -1076,7 +1080,7 @@ process_as_new_syn:
 			pht_flow_touch_inbound(flow);
 			if (response_acked) {
 				ret = phantun_flush_queued_udp(flow,
-						       state->net);
+							       state->net);
 				if (ret) {
 					pht_pr_warn("failed to flush responder "
 						    "queue: %d\n",
@@ -1218,7 +1222,8 @@ static int phantun_validate_config(void)
 	}
 
 	if (reopen_guard_bytes >= 0x80000000U) {
-		pht_pr_err("reopen_guard_bytes must be smaller than 2147483648\n");
+		pht_pr_err(
+			"reopen_guard_bytes must be smaller than 2147483648\n");
 		return -EINVAL;
 	}
 
@@ -1267,17 +1272,16 @@ static void phantun_log_config(void)
 {
 	unsigned int i;
 
-	pht_pr_info("loading with %u managed port(s), handshake_timeout_ms=%u, "
-		    "handshake_retries=%u, keepalive_interval_sec=%u, "
-		    "keepalive_misses=%u, hard_idle_timeout_sec=%u, "
-		    "reopen_guard_bytes=%u\n",
-		    phantun_cfg.managed_ports_count,
-		    phantun_cfg.handshake_timeout_ms,
-		    phantun_cfg.handshake_retries,
-		    phantun_cfg.keepalive_interval_sec,
-		    phantun_cfg.keepalive_misses,
-		    phantun_cfg.hard_idle_timeout_sec,
-		    phantun_cfg.reopen_guard_bytes);
+	pht_pr_info(
+		"loading with %u managed port(s), handshake_timeout_ms=%u, "
+		"handshake_retries=%u, keepalive_interval_sec=%u, "
+		"keepalive_misses=%u, hard_idle_timeout_sec=%u, "
+		"reopen_guard_bytes=%u\n",
+		phantun_cfg.managed_ports_count,
+		phantun_cfg.handshake_timeout_ms, phantun_cfg.handshake_retries,
+		phantun_cfg.keepalive_interval_sec,
+		phantun_cfg.keepalive_misses, phantun_cfg.hard_idle_timeout_sec,
+		phantun_cfg.reopen_guard_bytes);
 
 	for (i = 0; i < phantun_cfg.managed_ports_count; i++)
 		pht_pr_info("managed_ports[%u]=%u\n", i,

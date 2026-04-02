@@ -281,7 +281,10 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table,
 
 			spin_lock(&flow->lock);
 			if (flow->state == PHT_FLOW_STATE_DEAD) {
-				if (time_after_eq(now, flow->last_activity_jiffies + table->hard_idle_timeout_jiffies)) {
+				if (time_after_eq(
+					    now,
+					    flow->last_activity_jiffies +
+						    table->hard_idle_timeout_jiffies)) {
 					expired_flow = true;
 				}
 			} else {
@@ -289,11 +292,13 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table,
 					now,
 					flow->last_activity_jiffies +
 						table->hard_idle_timeout_jiffies);
-				bool liveness_failed = table->keepalive_interval_jiffies > 0 && time_after_eq(
-					now,
-					flow->last_inbound_jiffies +
-						(table->keepalive_interval_jiffies *
-						 table->keepalive_misses));
+				bool liveness_failed =
+					table->keepalive_interval_jiffies > 0 &&
+					time_after_eq(
+						now,
+						flow->last_inbound_jiffies +
+							(table->keepalive_interval_jiffies *
+							 table->keepalive_misses));
 				if (hard_expired) {
 					expired_flow = true;
 					flow->hard_expired = true;
@@ -308,7 +313,8 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table,
 						now,
 						flow->last_inbound_jiffies +
 							table->keepalive_interval_jiffies *
-							(flow->keepalives_sent + 1))) {
+								(flow->keepalives_sent +
+								 1))) {
 					send_keepalive = true;
 					flow->keepalives_sent++;
 				}
@@ -323,10 +329,12 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table,
 
 				queued_skb = pht_flow_take_queued_skb(flow);
 				if (queued_skb)
-					__skb_queue_tail(reinject_list, queued_skb);
+					__skb_queue_tail(reinject_list,
+							 queued_skb);
 			}
 
-			if (send_keepalive && !expired_flow && !is_liveness_failure) {
+			if (send_keepalive && !expired_flow &&
+			    !is_liveness_failure) {
 				/* Send a pure ACK as keepalive */
 				spin_lock(&flow->lock);
 				if (flow->table && flow->table->net) {
