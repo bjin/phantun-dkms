@@ -16,6 +16,19 @@ PORTS_B = (3333, 5555)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 GUEST_UDP_SCENARIOS = str(PROJECT_ROOT / 'tests/guest/udp_scenarios.py')
+MODULE_STAT_NAMES = (
+    'flows_created',
+    'flows_established',
+    'request_payloads_injected',
+    'response_payloads_injected',
+    'collisions_won',
+    'collisions_lost',
+    'rst_sent',
+    'udp_packets_queued',
+    'udp_packets_dropped',
+    'shaping_payloads_dropped',
+)
+
 
 
 class GuestProcess:
@@ -136,6 +149,24 @@ def parse_guest_json(stdout, context):
 def require_guest_command(vm, command):
     res = vm.run(f"command -v {shlex.quote(command)}", check=False)
     return res.returncode == 0
+
+
+def read_module_stat(vm, name):
+    res = run_guest_python(
+        vm,
+        f'''
+from pathlib import Path
+print(Path('/sys/module/phantun/stats/{name}').read_text().strip())
+''',
+    )
+    return int(res.stdout.strip())
+
+
+def read_module_stats(vm):
+    stats = {}
+    for name in MODULE_STAT_NAMES:
+        stats[name] = read_module_stat(vm, name)
+    return stats
 
 
 def cleanup_netns_topology(vm, namespaces=(NS_A, NS_B)):

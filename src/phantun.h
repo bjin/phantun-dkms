@@ -30,7 +30,10 @@ struct phantun_config {
 	unsigned int handshake_retries;
 	unsigned int idle_timeout_sec;
 	const char *remote_ipv4_cidr;
+	__be32 remote_ipv4_addr;
+	__be32 remote_ipv4_mask;
 	u16 remote_port;
+	bool remote_ipv4_enabled;
 };
 
 #endif

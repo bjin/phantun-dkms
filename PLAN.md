@@ -125,25 +125,24 @@
 
 ## Phase 9 - policy and configuration surface
 
-- [ ] Start with the smallest practical config mechanism:
-  - [ ] module params for a single managed port + handshake strings, or
-  - [ ] generic netlink from the start if multi-port support is required immediately
-- [ ] Support optional remote IPv4 CIDR restrictions
-- [ ] Support optional remote port restrictions
-- [ ] Document the exact matching rule for outbound interception
+- [x] Start with the smallest practical config mechanism: module params for managed ports, optional handshake strings, timeouts, and peer filters
+- [x] Support optional remote IPv4 CIDR restrictions
+- [x] Support optional remote port restrictions
+- [x] Document the exact matching rule for outbound interception
 - [ ] Defer xtables/nftables integration until the core translator is proven
 
 ## Phase 10 - observability and safety
 
-- [ ] Add counters for:
-  - [ ] flows created
-  - [ ] flows established
-  - [ ] optional request payloads injected
-  - [ ] optional response payloads injected
-  - [ ] collisions won/lost
-  - [ ] RST sent
-  - [ ] UDP packets queued/dropped while half-open or while a responder control response is waiting for ACK
-  - [ ] first inbound payloads dropped by shaping logic
+- [x] Add counters for:
+  - [x] flows created
+  - [x] flows established
+  - [x] optional request payloads injected
+  - [x] optional response payloads injected
+  - [x] collisions won/lost
+  - [x] RST sent
+  - [x] UDP packets queued/dropped while half-open or while a responder control response is waiting for ACK
+  - [x] first inbound payloads dropped by shaping logic
+- [x] Expose counters via sysfs under `/sys/module/phantun/stats/*`
 - [ ] Add ratelimited warnings for malformed traffic
 - [ ] Add a debug dump path for active flows
 - [ ] Make teardown paths idempotent

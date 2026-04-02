@@ -1,4 +1,5 @@
 #include <linux/init.h>
+#include <linux/inet.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -14,6 +15,7 @@
 #include "phantun.h"
 #include "phantun_flow.h"
 #include "phantun_packet.h"
+#include "phantun_stats.h"
 
 static unsigned short managed_ports[PHANTUN_MAX_MANAGED_PORTS];
 static int managed_ports_count;
@@ -24,6 +26,9 @@ static unsigned int handshake_retries = PHANTUN_DEFAULT_HANDSHAKE_RETRIES;
 static unsigned int idle_timeout_sec = PHANTUN_DEFAULT_IDLE_TIMEOUT_SEC;
 static char *remote_ipv4_cidr;
 static unsigned short remote_port;
+static __be32 remote_ipv4_addr;
+static __be32 remote_ipv4_mask;
+static bool remote_ipv4_enabled;
 
 module_param_array_named(managed_ports, managed_ports, ushort,
 			 &managed_ports_count, 0444);
@@ -69,6 +74,56 @@ static struct pht_flow_table *phantun_net_flows(const struct net *net)
 
 	pnet = net_generic(net, phantun_net_id);
 	return pnet ? &pnet->flows : NULL;
+}
+
+static int phantun_parse_remote_ipv4_cidr(const char *cidr, __be32 *addr,
+					  __be32 *mask)
+{
+	char buf[32];
+	char *slash;
+	u8 parsed[4];
+	unsigned int prefix_len;
+	u32 mask_host;
+
+	if (!cidr || !*cidr || !addr || !mask)
+		return -EINVAL;
+	if (strscpy(buf, cidr, sizeof(buf)) < 0)
+		return -EINVAL;
+
+	slash = strchr(buf, '/');
+	if (!slash)
+		return -EINVAL;
+	*slash = '\0';
+	slash++;
+	if (!*buf || !*slash)
+		return -EINVAL;
+	if (!in4_pton(buf, -1, parsed, -1, NULL))
+		return -EINVAL;
+	if (kstrtouint(slash, 10, &prefix_len) || prefix_len > 32U)
+		return -EINVAL;
+
+	memcpy(addr, parsed, sizeof(parsed));
+	mask_host = prefix_len ? (~0U << (32U - prefix_len)) : 0;
+	*mask = cpu_to_be32(mask_host);
+	*addr &= *mask;
+	return 0;
+}
+
+static bool phantun_remote_addr_allowed(__be32 addr)
+{
+	if (!phantun_cfg.remote_ipv4_enabled)
+		return true;
+
+	return (addr & phantun_cfg.remote_ipv4_mask) ==
+	       phantun_cfg.remote_ipv4_addr;
+}
+
+static void phantun_account_udp_queue_result(bool queued)
+{
+	if (queued)
+		pht_stats_inc(PHT_STAT_UDP_PACKETS_QUEUED);
+	else
+		pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
 }
 
 static bool phantun_managed_port(__be16 port)
@@ -141,6 +196,7 @@ static int phantun_send_flow_rst(struct pht_flow *flow, struct net *net)
 	struct pht_ipv4_endpoint_pair ep;
 	u32 seq;
 	u32 ack;
+	int ret;
 
 	spin_lock_bh(&flow->lock);
 	ep = flow->oriented;
@@ -148,8 +204,11 @@ static int phantun_send_flow_rst(struct pht_flow *flow, struct net *net)
 	ack = flow->ack;
 	spin_unlock_bh(&flow->lock);
 
-	return pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_RST, NULL,
-				    0);
+	ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_RST, NULL,
+				   0);
+	if (!ret)
+		pht_stats_inc(PHT_STAT_RST_SENT);
+	return ret;
 }
 
 static int phantun_send_established_udp(struct pht_flow *flow,
@@ -236,10 +295,14 @@ static int phantun_send_rstack(struct net *net,
 	u32 seq = force_zero_seq ? 0 : ntohl(view->tcp->ack_seq);
 	u32 ack = ntohl(view->tcp->seq) +
 		  phantun_tcp_seq_advance(view->tcp, view->payload_len);
+	int ret;
 
-	return pht_emit_fake_tcp_v4(net, ep, seq, ack,
-				    PHT_TCP_FLAG_RST | PHT_TCP_FLAG_ACK, NULL,
-				    0);
+	ret = pht_emit_fake_tcp_v4(net, ep, seq, ack,
+				   PHT_TCP_FLAG_RST | PHT_TCP_FLAG_ACK, NULL,
+				   0);
+	if (!ret)
+		pht_stats_inc(PHT_STAT_RST_SENT);
+	return ret;
 }
 
 static int phantun_send_handshake_request(struct pht_flow *flow,
@@ -265,6 +328,7 @@ static int phantun_send_handshake_request(struct pht_flow *flow,
 		flow->last_ack = ack;
 		flow->last_activity_jiffies = jiffies;
 		spin_unlock_bh(&flow->lock);
+		pht_stats_inc(PHT_STAT_REQUEST_PAYLOADS_INJECTED);
 	}
 	return ret;
 }
@@ -292,6 +356,7 @@ static int phantun_send_handshake_response(struct pht_flow *flow,
 		flow->last_ack = ack;
 		flow->last_activity_jiffies = jiffies;
 		spin_unlock_bh(&flow->lock);
+		pht_stats_inc(PHT_STAT_RESPONSE_PAYLOADS_INJECTED);
 	}
 	return ret;
 }
@@ -440,6 +505,8 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
 	if (ret)
 		return NF_ACCEPT;
 
+	if (!phantun_remote_addr_allowed(view.iph->daddr))
+		return NF_ACCEPT;
 	if (!phantun_managed_port(view.udp->source))
 		return NF_ACCEPT;
 	if (!phantun_remote_port_allowed(view.udp->dest))
@@ -466,6 +533,7 @@ retry_lookup:
 				queued = pht_flow_queue_skb_if_empty(flow, skb);
 				if (!queued)
 					kfree_skb(skb);
+				phantun_account_udp_queue_result(queued);
 				pht_flow_put(flow);
 				return NF_STOLEN;
 			}
@@ -488,6 +556,7 @@ retry_lookup:
 			queued = pht_flow_queue_skb_if_empty(flow, skb);
 			if (!queued)
 				kfree_skb(skb);
+			phantun_account_udp_queue_result(queued);
 			pht_flow_put(flow);
 			return NF_STOLEN;
 		}
@@ -529,14 +598,17 @@ retry_lookup:
 		goto retry_lookup;
 	}
 	if (ret) {
+		pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
 		pht_pr_warn("failed to insert initiator flow: %d\n", ret);
 		pht_flow_put(new_flow);
 		return NF_STOLEN;
 	}
+	pht_stats_inc(PHT_STAT_UDP_PACKETS_QUEUED);
 
 	ret = pht_emit_fake_tcp_v4(state->net, &ep, init_seq, 0,
 				   PHT_TCP_FLAG_SYN, NULL, 0);
 	if (ret) {
+		pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
 		pht_pr_warn("failed to emit fake-TCP SYN: %d\n", ret);
 		pht_flow_remove(new_flow);
 		return NF_STOLEN;
@@ -573,6 +645,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 	if (ret)
 		return NF_ACCEPT;
 
+	if (!phantun_remote_addr_allowed(view.iph->saddr))
+		return NF_ACCEPT;
 	if (!phantun_managed_port(view.tcp->dest))
 		return NF_ACCEPT;
 	if (!phantun_remote_port_allowed(view.tcp->source))
@@ -655,12 +729,14 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 				pht_pr_info("collision on tuple; keeping "
 					    "initiator role\n");
 				pht_flow_touch(flow);
+				pht_stats_inc(PHT_STAT_COLLISIONS_WON);
 				pht_flow_put(flow);
 				return NF_DROP;
 			}
 
 			pht_pr_info("collision on tuple; switching to "
 				    "responder role\n");
+			pht_stats_inc(PHT_STAT_COLLISIONS_LOST);
 			queued_skb = pht_flow_take_queued_skb(flow);
 			pht_flow_remove(flow);
 			pht_flow_put(flow);
@@ -737,7 +813,9 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 				}
 				if (phantun_response_enabled()) {
 					spin_lock_bh(&flow->lock);
-					flow->ack += phantun_cfg.handshake_response_len;
+					flow->ack +=
+						phantun_cfg
+							.handshake_response_len;
 					flow->peer_syn_next = flow->ack;
 					flow->last_ack = flow->ack;
 					spin_unlock_bh(&flow->lock);
@@ -801,8 +879,11 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 		spin_unlock_bh(&flow->lock);
 
 		if (phantun_response_enabled()) {
-			if (view.payload_len)
+			if (view.payload_len) {
 				phantun_note_inbound_payload(flow, &view, true);
+				pht_stats_inc(
+					PHT_STAT_SHAPING_PAYLOADS_DROPPED);
+			}
 
 			ret = phantun_send_handshake_response(flow, state->net);
 			if (ret) {
@@ -836,6 +917,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 			return NF_DROP;
 		}
 
+		if (phantun_request_enabled())
+			pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
 		ret = phantun_finalize_established_rx(
 			flow, &ep, skb, &view, state->net, in_dev,
 			!phantun_request_enabled(), phantun_request_enabled(),
@@ -862,8 +945,10 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 			flow->response_pending_ack = false;
 			response_acked = true;
 		}
-		if (view.payload_len && flow->drop_next_rx_payload)
+		if (view.payload_len && flow->drop_next_rx_payload) {
 			drop_payload = true;
+			pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
+		}
 		spin_unlock_bh(&flow->lock);
 
 		if (view.payload_len == 0) {
@@ -968,9 +1053,25 @@ static struct pernet_operations phantun_pernet_ops = {
 
 static int phantun_validate_config(void)
 {
+	int ret;
+
 	if (!managed_ports_count) {
 		pht_pr_err("at least one managed_ports entry is required\n");
 		return -EINVAL;
+	}
+
+	remote_ipv4_enabled = false;
+	remote_ipv4_addr = 0;
+	remote_ipv4_mask = 0;
+	if (remote_ipv4_cidr && strlen(remote_ipv4_cidr)) {
+		ret = phantun_parse_remote_ipv4_cidr(
+			remote_ipv4_cidr, &remote_ipv4_addr, &remote_ipv4_mask);
+		if (ret) {
+			pht_pr_err(
+				"remote_ipv4_cidr must be valid IPv4 CIDR\n");
+			return ret;
+		}
+		remote_ipv4_enabled = true;
 	}
 
 	if (!handshake_timeout_ms) {
@@ -1018,8 +1119,12 @@ static void phantun_snapshot_config(void)
 	phantun_cfg.handshake_timeout_ms = handshake_timeout_ms;
 	phantun_cfg.handshake_retries = handshake_retries;
 	phantun_cfg.idle_timeout_sec = idle_timeout_sec;
-	phantun_cfg.remote_ipv4_cidr = remote_ipv4_cidr;
+	phantun_cfg.remote_ipv4_cidr =
+		remote_ipv4_enabled ? remote_ipv4_cidr : NULL;
+	phantun_cfg.remote_ipv4_addr = remote_ipv4_addr;
+	phantun_cfg.remote_ipv4_mask = remote_ipv4_mask;
 	phantun_cfg.remote_port = remote_port;
+	phantun_cfg.remote_ipv4_enabled = remote_ipv4_enabled;
 }
 
 static void phantun_log_config(void)
@@ -1054,13 +1159,21 @@ static int __init phantun_init(void)
 
 	phantun_snapshot_config();
 	phantun_log_config();
+	pht_stats_reset();
+	ret = pht_stats_init_sysfs();
+	if (ret)
+		return ret;
 
-	return register_pernet_subsys(&phantun_pernet_ops);
+	ret = register_pernet_subsys(&phantun_pernet_ops);
+	if (ret)
+		pht_stats_exit_sysfs();
+	return ret;
 }
 
 static void __exit phantun_exit(void)
 {
 	unregister_pernet_subsys(&phantun_pernet_ops);
+	pht_stats_exit_sysfs();
 }
 
 module_init(phantun_init);

@@ -377,7 +377,8 @@ Match policy for v1:
 
 - IPv4 UDP
 - local source port is a managed port
-- optional remote IPv4/port policy matches
+- if `remote_ipv4_cidr` is configured, outbound destination IPv4 must fall within that CIDR
+- if `remote_port` is configured, outbound destination UDP port must equal that port
 
 Behavior:
 
@@ -406,6 +407,8 @@ Match policy for v1:
 
 - IPv4 TCP
 - destination port is a managed port, or tuple already exists in the flow table
+- if `remote_ipv4_cidr` is configured, inbound source IPv4 must fall within that CIDR
+- if `remote_port` is configured, inbound source TCP port must equal that port
 
 Behavior:
 

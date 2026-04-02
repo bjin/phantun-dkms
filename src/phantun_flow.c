@@ -6,7 +6,7 @@
 #include <linux/string.h>
 
 #include "phantun_flow.h"
-
+#include "phantun_stats.h"
 static u32 pht_flow_hash_key(const struct pht_flow_key *key)
 {
 	return jhash(key, sizeof(*key), 0) & (PHT_FLOW_BUCKETS - 1);
@@ -34,11 +34,16 @@ static void pht_flow_free(struct pht_flow *flow)
 
 static int pht_flow_send_local_rst(struct pht_flow *flow)
 {
+	int ret;
+
 	if (!flow || !flow->table || !flow->table->net)
 		return -EINVAL;
 
-	return pht_emit_fake_tcp_v4(flow->table->net, &flow->oriented,
-				    flow->seq, 0, PHT_TCP_FLAG_RST, NULL, 0);
+	ret = pht_emit_fake_tcp_v4(flow->table->net, &flow->oriented, flow->seq,
+				   0, PHT_TCP_FLAG_RST, NULL, 0);
+	if (!ret)
+		pht_stats_inc(PHT_STAT_RST_SENT);
+	return ret;
 }
 
 static int pht_flow_retransmit_now(struct pht_flow *flow)
@@ -428,6 +433,7 @@ int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow)
 	hlist_add_head(&flow->hnode, &bucket->head);
 	spin_unlock_bh(&bucket->lock);
 
+	pht_stats_inc(PHT_STAT_FLOWS_CREATED);
 	if (pht_flow_state_is_half_open(flow->state))
 		pht_flow_arm_retransmit(flow);
 
@@ -533,17 +539,22 @@ struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow)
 void pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state)
 {
 	bool half_open;
+	enum pht_flow_state old_state;
 
 	if (!flow)
 		return;
 
 	spin_lock_bh(&flow->lock);
+	old_state = flow->state;
 	flow->state = state;
 	flow->last_activity_jiffies = jiffies;
 	flow->retries_done = 0;
 	half_open = pht_flow_state_is_half_open(state);
 	spin_unlock_bh(&flow->lock);
 
+	if (state == PHT_FLOW_STATE_ESTABLISHED &&
+	    old_state != PHT_FLOW_STATE_ESTABLISHED)
+		pht_stats_inc(PHT_STAT_FLOWS_ESTABLISHED);
 	if (half_open)
 		pht_flow_arm_retransmit(flow);
 	else
