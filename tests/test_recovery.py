@@ -759,3 +759,79 @@ def test_unknown_synack_is_rejected_without_creating_flow(phantun_module, vm):
         pytest.fail(
             f"unexpected server messages after unknown synack: {received_messages(server_data)!r}"
         )
+
+
+def test_unknown_ack_payload_is_rejected_with_rstack(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    invalid_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "unknown_ack_rst",
+            }
+        ],
+    )
+
+    try:
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack",
+                "seq": 12345,
+                "ack": 67890,
+                "payload": "junk",
+            },
+        )
+        time.sleep(0.2)
+        if invalid_probe.packets(vm, "unknown_ack_rst") == 0:
+            pytest.fail("expected RST|ACK for unknown non-RST fake-TCP packet")
+    finally:
+        invalid_probe.cleanup(vm)
+
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "echo_server",
+        {"bind_addr": NS_ADDR_B, "bind_port": dst_port, "count": 1},
+    )
+    time.sleep(0.2)
+    client = run_netns_scenario(
+        vm,
+        NS_A,
+        "echo_client",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payloads": ["msg1"],
+        },
+    )
+    server_result = server.communicate(timeout=10)
+    assert_completed(client, "echo client after unknown ack payload")
+    assert_completed(server_result, "echo server after unknown ack payload")
+    server_data = parse_guest_json(server_result.stdout, "echo server stdout")
+    if received_messages(server_data) != ["msg1"]:
+        pytest.fail(
+            f"unexpected server messages after unknown ack payload: {received_messages(server_data)!r}"
+        )

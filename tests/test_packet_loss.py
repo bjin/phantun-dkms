@@ -15,7 +15,10 @@ from helpers import (
     ensure_netns_topology,
     make_netns_ingress_flag_drop_probe,
     make_netns_ingress_payload_drop_probe,
+    make_netns_output_flag_probe,
+    make_netns_tcp_payload_probe,
     parse_guest_json,
+    read_module_stats,
     require_guest_command,
     run_netns_scenario,
     spawn_netns_scenario,
@@ -126,6 +129,7 @@ def test_synack_loss_is_retried(phantun_module, vm):
 
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
+    initial_stats = read_module_stats(vm)
     probe = make_netns_ingress_flag_drop_probe(
         vm,
         NS_A,
@@ -138,6 +142,20 @@ def test_synack_loss_is_retried(phantun_module, vm):
                 "dst_port": src_port,
                 "flags_expr": "syn | ack",
                 "comment": "drop_synack",
+            }
+        ],
+    )
+    synack_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "sent_synack",
             }
         ],
     )
@@ -154,6 +172,7 @@ def test_synack_loss_is_retried(phantun_module, vm):
 
     try:
         time.sleep(0.2)
+        baseline_synack = synack_probe.packets(vm, "sent_synack")
         client = spawn_netns_scenario(
             vm,
             NS_A,
@@ -188,8 +207,19 @@ def test_synack_loss_is_retried(phantun_module, vm):
             pytest.fail(
                 f"unexpected server payload after SYN|ACK loss: {server_data.get('received')!r}"
             )
+        if synack_probe.packets(vm, "sent_synack") <= baseline_synack + 1:
+            pytest.fail(
+                "expected responder to re-send SYN|ACK after initiator re-sent SYN"
+            )
+
+        final_stats = read_module_stats(vm)
+        if final_stats["flows_created"] - initial_stats["flows_created"] != 2:
+            pytest.fail(
+                f"duplicate SYN after lost SYN|ACK should not create extra flows: {final_stats!r}"
+            )
     finally:
         probe.cleanup(vm)
+        synack_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 
@@ -342,4 +372,206 @@ def test_handshake_response_loss_drops_one_later_reply(phantun_module, vm):
             )
     finally:
         probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_duplicate_outbound_udp_while_half_open_queues_only_one_skb(phantun_module, vm):
+    load_loss_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    initial_stats = read_module_stats(vm)
+    probe = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "drop_synack",
+            }
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        client = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["client-0", "client-1"],
+            },
+        )
+        time.sleep(1.25)
+        probe.cleanup(vm)
+        server_result = server.communicate(timeout=12)
+        assert_completed(client, "duplicate-half-open sender")
+        assert_completed(server_result, "duplicate-half-open receiver")
+
+        server_data = parse_guest_json(
+            server_result.stdout, "duplicate-half-open server stdout"
+        )
+        if received_messages(server_data) != ["client-0"]:
+            pytest.fail(
+                f"expected only the first half-open payload to survive, got {received_messages(server_data)!r}"
+            )
+
+        final_stats = read_module_stats(vm)
+        if final_stats["flows_created"] - initial_stats["flows_created"] != 2:
+            pytest.fail(
+                f"expected one initiator and one responder flow, got {final_stats!r}"
+            )
+        if final_stats["udp_packets_queued"] - initial_stats["udp_packets_queued"] != 1:
+            pytest.fail(
+                f"expected exactly one queued UDP packet while half-open, got {final_stats!r}"
+            )
+        if final_stats["udp_packets_dropped"] <= initial_stats["udp_packets_dropped"]:
+            pytest.fail(
+                f"expected later duplicate UDP during half-open to be dropped, got {final_stats!r}"
+            )
+    finally:
+        probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_responder_reply_waits_for_ack_covering_handshake_response(phantun_module, vm):
+    load_loss_module(phantun_module, handshake_request=REQ, handshake_response=RESP)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    drop_response = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "payload": RESP,
+                "comment": "drop_resp_hold",
+            }
+        ],
+    )
+    drop_client_payload = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "src_port": src_port,
+                "dst_addr": NS_ADDR_B,
+                "dst_port": dst_port,
+                "payload": "client-0",
+                "comment": "drop_client0",
+            }
+        ],
+    )
+    reply_probe = make_netns_tcp_payload_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "payload": "server-0",
+                "comment": "queued_reply",
+                "action": "accept",
+            }
+        ],
+    )
+    delayed_sender = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "delayed_send",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "payload": "server-0",
+            "delay_ms": 300,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        client_result_1 = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["client-0"],
+            },
+        )
+        assert_completed(client_result_1, "response-pending sender 1")
+        delayed_sender_result = delayed_sender.communicate(timeout=10)
+        assert_completed(delayed_sender_result, "delayed responder sender")
+        time.sleep(0.5)
+        if reply_probe.packets(vm, "queued_reply") != 0:
+            pytest.fail(
+                "responder data must stay queued until an initiator ACK covers handshake_response"
+            )
+
+        drop_response.cleanup(vm)
+        drop_client_payload.cleanup(vm)
+        client_result_2 = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["client-1"],
+            },
+        )
+        assert_completed(client_result_2, "response-pending sender 2")
+        time.sleep(0.5)
+        if reply_probe.packets(vm, "queued_reply") == 0:
+            pytest.fail(
+                "queued responder payload was never released after a later initiator ACK covered handshake_response"
+            )
+    finally:
+        drop_response.cleanup(vm)
+        drop_client_payload.cleanup(vm)
+        reply_probe.cleanup(vm)
         cleanup_netns_topology(vm)

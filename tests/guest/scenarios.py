@@ -242,6 +242,19 @@ def simultaneous_exchange(config):
         )
 
 
+def delayed_send(config):
+    import time
+
+    with _socket(config["bind_addr"], config["bind_port"]) as sock:
+        time.sleep(config.get("delay_ms", 0) / 1000.0)
+        sock.sendto(
+            config["payload"].encode(),
+            (config["target_addr"], config["target_port"]),
+        )
+
+    _emit({"sent": config["payload"]})
+
+
 def _checksum(data):
     if len(data) % 2:
         data += b"\x00"
@@ -435,6 +448,7 @@ SCENARIOS = {
     "echo_client": echo_client,
     "recv_many": recv_many,
     "send_many": send_many,
+    "delayed_send": delayed_send,
     "simultaneous_exchange": simultaneous_exchange,
     "send_tcp_packet": send_tcp_packet,
     "capture_tcp_packet": capture_tcp_packet,

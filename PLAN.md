@@ -45,13 +45,13 @@ It tracks only unfinished work that still matters after the recovery redesign.
 
 ## Phase 2 - targeted state-machine coverage
 
-- [ ] Extend tests for the remaining high-value edge cases
-  - [ ] duplicate outbound UDP while half-open => still only one flow, with at most one queued skb
-  - [ ] duplicate initiator `SYN` after lost `SYN|ACK` => responder re-sends `SYN|ACK` without creating a second flow
-  - [ ] responder-owned queued UDP is released only after an initiator `ACK` covers an injected `handshake_response`
-  - [ ] unknown inbound non-`RST` fake-TCP still gets `RST|ACK`
-  - [ ] delayed old-generation packets after replacement are silently dropped during quarantine
-- [ ] Add at least one packet-loss or reorder-style test that exercises the quarantine path directly
+- [x] Extend tests for the remaining high-value edge cases
+  - [x] duplicate outbound UDP while half-open => still only one flow, with at most one queued skb
+  - [x] duplicate initiator `SYN` after lost `SYN|ACK` => responder re-sends `SYN|ACK` without creating a second flow
+  - [x] responder-owned queued UDP is released only after an initiator `ACK` covers an injected `handshake_response`
+  - [x] unknown inbound non-`RST` fake-TCP still gets `RST|ACK`
+  - [x] delayed old-generation packets after replacement are silently dropped during quarantine
+- [x] Add at least one packet-loss or reorder-style test that exercises the quarantine path directly
 
 ## Phase 3 - operational hardening
 

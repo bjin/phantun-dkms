@@ -839,6 +839,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 	u32 responder_seq;
 	u32 local_isn;
 	u32 peer_syn_next;
+	enum pht_flow_role role_now;
 	u32 quarantine_prev_local_seq_start = 0;
 	u32 quarantine_prev_local_seq_end = 0;
 	u32 quarantine_prev_remote_seq_start = 0;
@@ -945,6 +946,7 @@ process_as_new_syn:
 	expected_ack = flow->local_isn + 1;
 	local_isn = flow->local_isn;
 	peer_syn_next = flow->peer_syn_next;
+	role_now = flow->role;
 	had_queued = flow->queued_skb != NULL;
 	spin_unlock_bh(&flow->lock);
 
@@ -1206,8 +1208,34 @@ process_as_new_syn:
 		}
 
 		if (view.tcp->syn) {
+			if (flow->role == PHT_FLOW_ROLE_INITIATOR &&
+			    view.tcp->ack && view.payload_len == 0 &&
+			    ntohl(view.tcp->ack_seq) == flow->local_isn + 1 &&
+			    ntohl(view.tcp->seq) + 1 == flow->peer_syn_next) {
+				ret = phantun_send_idle_ack(flow, state->net);
+				if (ret)
+					pht_pr_warn("failed to ACK duplicate "
+						    "current-generation "
+						    "SYN|ACK: %d\n",
+						    ret);
+				pht_flow_put(flow);
+				return NF_DROP;
+			}
 			if (phantun_tcp_is_bare_syn(&view) &&
 			    phantun_tcp_syn_is_aligned(&view)) {
+				if (role_now == PHT_FLOW_ROLE_RESPONDER &&
+				    ntohl(view.tcp->seq) + 1 == peer_syn_next) {
+					ret = phantun_send_synack(flow,
+								  state->net);
+					if (ret)
+						pht_pr_warn(
+							"failed to re-emit "
+							"SYN|ACK for duplicate "
+							"established SYN: %d\n",
+							ret);
+					pht_flow_put(flow);
+					return NF_DROP;
+				}
 				spin_lock_bh(&flow->lock);
 				quarantine_prev_local_seq_start =
 					flow->local_isn;
