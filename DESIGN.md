@@ -117,14 +117,47 @@ Per flow, there is exactly one role pair:
 - initiator: the side that creates the flow due to outbound UDP
 - responder: the side that accepts the incoming fake-TCP `SYN`
 
-The module is configured with one or more managed local UDP/TCP ports. For WireGuard, this is the local listen port.
+The module is configured with two interception selectors:
 
-For a managed port:
+- `managed_local_ports`: optional local UDP/TCP ports. For WireGuard, this is usually the local listen port.
+- `managed_remote_peers`: optional exact remote IPv4:port peers in `x.y.z.w:p` form.
+- at least one selector must be non-empty.
 
-- outbound UDP sourced from that local port may create or use a fake-TCP flow
-- inbound fake-TCP destined to that local port may create or use a fake-TCP flow
+## 4.1 Interception selector model
 
-Optional peer restrictions may narrow matching by remote IPv4 CIDR and/or remote port.
+The selectors define which tuples the translator owns. A packet must satisfy every selector that is configured.
+
+Selector modes:
+
+- local-only mode: only `managed_local_ports` is configured
+  - outbound UDP matches by local source port
+  - inbound fake-TCP matches by local destination port
+- peer-only mode: only `managed_remote_peers` is configured
+  - outbound UDP matches by remote destination IPv4:UDP port
+  - inbound fake-TCP matches by remote source IPv4:TCP port
+- intersection mode: both selectors are configured
+  - both the local-port selector and the exact-remote-peer selector must match
+
+
+Important consequence of peer-only mode:
+
+- inbound TCP ownership is broad: a listed `managed_remote_peers` entry claims inbound fake-TCP interception from that peer regardless of local destination port
+- therefore peer-only mode should be used only when that remote IPv4:port is dedicated to this translator, not when the same peer is also expected to talk ordinary TCP to unrelated local services
+This preserves the old fixed-port behavior when `managed_local_ports` alone is used, while also allowing exact-peer-only interception when no local port list is supplied.
+
+## 4.2 Default inbound raw-UDP drop
+
+By default, raw inbound UDP that matches the configured selectors is dropped instead of being delivered to the local UDP socket.
+
+Reason:
+
+- if a tuple is meant to be owned by the fake-TCP translator, letting raw inbound UDP for the same selector space arrive locally would create ambiguous mixed delivery
+- the drop rule keeps the ownership boundary honest: selector-matched inbound wire traffic is either fake-TCP handled by the module or raw UDP rejected by policy
+
+The drop rule is implemented in inbound `PRE_ROUTING`, not `LOCAL_IN`.
+
+- decapsulated UDP reinjected by the module is routed and injected directly into the local-delivery input path after `PRE_ROUTING`
+- reinjected translated UDP therefore still reaches later inbound firewall/local-delivery processing without being mistaken for raw wire UDP
 
 ## 5. Protocol changes relative to today
 
@@ -315,7 +348,7 @@ Actions:
 
 ### `SYN_RCVD`
 
-Entered when inbound `SYN` is seen on a managed port and no existing flow handles the tuple.
+Entered when inbound `SYN` is seen on a selector-matched tuple and no existing flow handles the tuple.
 
 Validation:
 
@@ -375,6 +408,8 @@ Cases that trigger immediate `RST` + flow destruction:
 - impossible flag/state combination
 - non-`RST` packet for unknown tuple
 
+  In peer-only mode, this still applies when a packet from a managed remote peer does not match an existing flow and is not a valid new responder-creating bare `SYN`. The module should reject it with `RST`, not silently drop it, so the peer learns that local state does not recognize that fake-TCP tuple and can recover promptly.
+
 Cases that do not trigger a reply:
 
 - stray inbound `RST` for unknown tuple
@@ -397,9 +432,8 @@ Priority:
 Match policy for v1:
 
 - IPv4 UDP
-- local source port is a managed port
-- if `remote_ipv4_cidr` is configured, outbound destination IPv4 must fall within that CIDR
-- if `remote_port` is configured, outbound destination UDP port must equal that port
+- if `managed_local_ports` is configured, the local source port must be in that list
+- if `managed_remote_peers` is configured, the outbound destination IPv4:UDP port must match one exact managed peer
 
 Behavior:
 
@@ -427,31 +461,55 @@ Priority:
 Match policy for v1:
 
 - IPv4 TCP
-- destination port is a managed port, or tuple already exists in the flow table
-- if `remote_ipv4_cidr` is configured, inbound source IPv4 must fall within that CIDR
-- if `remote_port` is configured, inbound source TCP port must equal that port
+- tuple already exists in the flow table, or the packet is eligible to create a new responder flow under the selector policy
+- if `managed_local_ports` is configured, inbound destination port must be in that list for new responder creation
+- if `managed_remote_peers` is configured, inbound source IPv4:TCP port must match one exact managed peer for new responder creation
 
 Behavior:
 
 - handle handshake packets in module state machine
 - handle data packets in established flows
+- in peer-only mode, a bare aligned `SYN` from a managed remote peer may create a responder flow on any local destination port
+- if no existing flow matches and the packet is not a valid new bare `SYN`, reject it as an unknown tuple rather than passing it to the real TCP stack
 - consume fake-TCP before the real TCP stack can send its own reset
 
-## 9.3 Decapsulated UDP reinjection
+## 9.3 Inbound raw UDP drop
+
+Hook:
+
+- `NF_INET_PRE_ROUTING`
+
+Priority:
+
+- before conntrack and before local UDP processing (same design target: `-400`)
+
+Match policy for v1:
+
+- IPv4 UDP
+- if `managed_local_ports` is configured, inbound destination port must be in that list
+- if `managed_remote_peers` is configured, inbound source IPv4:UDP port must match one exact managed peer
+
+Behavior:
+
+- drop selector-matched raw inbound UDP by default
+- allow unmatched inbound UDP to continue normally
+- this drop does not apply to module-reinjected decapsulated UDP, because reinjection enters after `PRE_ROUTING` rather than as a fresh wire packet
+
+## 9.4 Decapsulated UDP reinjection
 
 For inbound established fake-TCP data:
 
 - build a new UDP skb using the oriented tuple
 - preserve original UDP src/dst IPs and ports
-- inject it via the normal receive path (`netif_receive_skb`-style reinjection)
+- route it for local input and inject it directly into the post-`PRE_ROUTING` local-delivery path (`ip_route_input` + `dst_input`-style reinjection)
 
 Why:
 
 - local UDP sockets, including kernel WireGuard and `wireguard-go`, receive traffic as if it arrived as native UDP
-- other normal receive-path hooks still run
-- the reinjected packet therefore traverses the host's inbound UDP firewall path again before the local socket receives it
+- later local inbound firewall and delivery hooks still run
+- the `PRE_ROUTING` raw-UDP drop rule does not see this skb, so translated traffic is not black-holed
 
-## 9.4 Generated fake-TCP transmission
+## 9.5 Generated fake-TCP transmission
 
 For module-generated fake-TCP packets:
 
@@ -468,16 +526,16 @@ Because the `LOCAL_OUT` hook only steals UDP, not TCP, the module does not need 
 
 Use simple module configuration first, not rule-language integration.
 
-Required config:
+Selector config:
 
-- managed local port list
+- `managed_local_ports`: optional list of up to 16 local UDP/TCP ports
+- `managed_remote_peers`: optional list of up to 16 exact `x.y.z.w:p` peers
+- at least one of those two lists must be non-empty
 
 Recommended optional config:
 
 - `handshake_request`
 - `handshake_response` (effective only when `handshake_request` is also configured)
-- allowed remote IPv4 CIDRs
-- allowed remote ports
 - `keepalive_interval_sec`
 - `keepalive_misses`
 - `hard_idle_timeout_sec`
@@ -487,7 +545,8 @@ Recommended optional config:
 
 Rationale:
 
-- one WireGuard listen port is the main target use case
+- one WireGuard listen port is still the main target use case
+- exact-peer-only mode is also supported when local-port ownership is not the desired selector
 - keep v1 small enough to finish
 - add richer control plane later
 
@@ -511,9 +570,10 @@ Do not attempt TCP fragmentation/resegmentation logic in v1.
 Because the module steals original UDP before normal transmission and emits new TCP packets instead:
 
 - generated fake-TCP will look like new TCP traffic to the host firewall
-- users must allow TCP on the managed port
-- decapsulated inbound payload is reinjected as UDP and will traverse the local inbound UDP firewall path again
-- users must therefore also allow local UDP delivery on the managed port for the reinjected traffic
+- users must allow TCP for selector-matched fake-TCP tuples
+- raw inbound UDP on selector-matched tuples is dropped in `PRE_ROUTING` by design
+- decapsulated inbound payload is reinjected as UDP after `PRE_ROUTING` and will still traverse later local inbound UDP firewall/delivery hooks before the socket receives it
+- users must therefore allow local UDP delivery for reinjected translated traffic on the tuples they intend the module to serve
 - any old Phantun DNAT/SNAT-on-TUN documentation no longer applies
 
 ## 12. Compatibility statement
@@ -523,8 +583,10 @@ This design is intentionally not just “Phantun client/server in kernel”.
 It changes the contract in important ways:
 
 - no node-level client/server split
+- selector-based interception via optional `managed_local_ports` and `managed_remote_peers` lists
 - optional best-effort request/response first-payload shaping instead of mandatory verification
 - local dropping of the first inbound payload when shaping is enabled
+- default dropping of selector-matched raw inbound UDP
 - deterministic simultaneous-initiation collapse
 - no TUN topology
 
@@ -548,9 +610,9 @@ Everything beyond the first queued skb is dropped during handshake.
 
 Chosen because it preserves a single unambiguous initiator/responder pair, keeps one translator per tuple, and leaves any optional first-payload shaping unambiguous.
 
-### Managed local ports, not a fake TCP listener socket
+### Selector-based interception, not a fake TCP listener socket
 
-Chosen because it works with existing UDP applications directly and avoids lying to the kernel by pretending this is normal TCP.
+Chosen because it works with existing UDP applications directly, allows either local-port or exact-peer ownership, and avoids lying to the kernel by pretending this is normal TCP.
 
 ### Netfilter core, not xtables target core
 

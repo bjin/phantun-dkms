@@ -9,15 +9,21 @@ import re
 from pathlib import Path
 from datetime import datetime
 
+
 def pytest_addoption(parser):
     parser.addoption(
-        "--kernel", action="append", default=[],
-        help="Kernel version to test (e.g. host or v6.19.1). Can be specified multiple times."
+        "--kernel",
+        action="append",
+        default=[],
+        help="Kernel version to test (e.g. host or v6.19.1). Can be specified multiple times.",
     )
     parser.addoption(
-        "--all-kernels", action="store_true", default=False,
-        help="Test against all prepared kernels in the kernels/ directory."
+        "--all-kernels",
+        action="store_true",
+        default=False,
+        help="Test against all prepared kernels in the kernels/ directory.",
     )
+
 
 def pytest_generate_tests(metafunc):
     if "vm" in metafunc.fixturenames:
@@ -39,6 +45,7 @@ def pytest_generate_tests(metafunc):
         else:
             metafunc.parametrize("vm", kernels, indirect=True, scope="session")
 
+
 class VM:
     def __init__(self, kernel_set_str, session_log_dir):
         self.kernel_set_str = kernel_set_str
@@ -51,7 +58,7 @@ class VM:
 
     def run(self, cmd, check=True, **kwargs):
         if isinstance(cmd, list):
-            cmd_str = ' '.join(shlex.quote(c) for c in cmd)
+            cmd_str = " ".join(shlex.quote(c) for c in cmd)
         else:
             cmd_str = cmd
 
@@ -65,14 +72,24 @@ class VM:
         return res
 
     def start(self):
-        cmd = ['vng', '--empty-passwords', '--ssh', '--user', 'root', '--exec', 'sleep 3600']
+        cmd = [
+            "vng",
+            "--empty-passwords",
+            "--ssh",
+            "--user",
+            "root",
+            "--exec",
+            "sleep 3600",
+        ]
 
         self.ubuntu_kernel_dir = None
 
         if self.kernel_set_str == "host":
-            self.kernel_ver = subprocess.run(['uname', '-r'], capture_output=True, text=True, check=True).stdout.strip()
+            self.kernel_ver = subprocess.run(
+                ["uname", "-r"], capture_output=True, text=True, check=True
+            ).stdout.strip()
             # Default to host kernel by using -r without argument
-            cmd.extend(['-r'])
+            cmd.extend(["-r"])
         else:
             # Assume it is a pre-extracted ubuntu kernel
             self.kernel_ver = self.kernel_set_str
@@ -80,7 +97,9 @@ class VM:
             kernels_dir = project_root / "kernels" / self.kernel_ver
 
             if not kernels_dir.exists() or not (kernels_dir / ".extracted").exists():
-                pytest.exit(f"Kernel {self.kernel_ver} not found or not extracted in {kernels_dir}. Please run ./prepare-kernels.py {self.kernel_ver} first.")
+                pytest.exit(
+                    f"Kernel {self.kernel_ver} not found or not extracted in {kernels_dir}. Please run ./prepare-kernels.py {self.kernel_ver} first."
+                )
 
             self.ubuntu_kernel_dir = kernels_dir
             vmlinuz_paths = list(kernels_dir.glob("boot/vmlinuz-*"))
@@ -89,37 +108,41 @@ class VM:
 
             vmlinuz = vmlinuz_paths[0]
             # Override kernel_ver with the actual full version string from vmlinuz
-            self.kernel_ver = vmlinuz.name.replace('vmlinuz-', '')
-            cmd.extend(['-r', str(vmlinuz)])
+            self.kernel_ver = vmlinuz.name.replace("vmlinuz-", "")
+            cmd.extend(["-r", str(vmlinuz)])
 
             # Map host kernel modules directory to guest with a COW overlay so DKMS can install into updates/ without modifying host cache
-            host_mod_dir = str(self.ubuntu_kernel_dir / "lib" / "modules" / self.kernel_ver)
-            cmd.append(f'--overlay-rwdir=/lib/modules/{self.kernel_ver}={host_mod_dir}')
+            host_mod_dir = str(
+                self.ubuntu_kernel_dir / "lib" / "modules" / self.kernel_ver
+            )
+            cmd.append(f"--overlay-rwdir=/lib/modules/{self.kernel_ver}={host_mod_dir}")
 
         self.proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            preexec_fn=os.setsid
+            preexec_fn=os.setsid,
         )
 
         # Get SSH cmd
-        res = subprocess.run(['vng', '--ssh-client', '--dry-run'], capture_output=True, text=True)
+        res = subprocess.run(
+            ["vng", "--ssh-client", "--dry-run"], capture_output=True, text=True
+        )
         if res.returncode != 0:
             raise Exception(f"Failed to get ssh client command: {res.stderr}")
         self.base_ssh_cmd = shlex.split(res.stdout.strip())
         try:
-            l_index = self.base_ssh_cmd.index('-l')
-            self.base_ssh_cmd[l_index + 1] = 'root'
+            l_index = self.base_ssh_cmd.index("-l")
+            self.base_ssh_cmd[l_index + 1] = "root"
         except ValueError:
-            self.base_ssh_cmd.extend(['-l', 'root'])
+            self.base_ssh_cmd.extend(["-l", "root"])
 
         # Wait for SSH
         success = False
         for _ in range(60):
             time.sleep(1)
             try:
-                res = self.run(['uname', '-a'], check=False)
+                res = self.run(["uname", "-a"], check=False)
                 if res.returncode == 0:
                     success = True
                     break
@@ -132,20 +155,30 @@ class VM:
             raise Exception("Timeout waiting for vng SSH to be available")
 
         if self.ubuntu_kernel_dir:
-            self.run(['depmod', '-a', self.kernel_ver])
+            self.run(["depmod", "-a", self.kernel_ver])
 
             # Symlink compilers that Ubuntu kernel Makefile might explicitly ask for
             for ver in [12, 13, 14, 15, 16]:
-                self.run(['ln', '-sf', '/usr/bin/gcc', f'/usr/bin/gcc-{ver}'], check=False)
-                self.run(['ln', '-sf', '/usr/bin/gcc', f'/usr/bin/x86_64-linux-gnu-gcc-{ver}'], check=False)
+                self.run(
+                    ["ln", "-sf", "/usr/bin/gcc", f"/usr/bin/gcc-{ver}"], check=False
+                )
+                self.run(
+                    [
+                        "ln",
+                        "-sf",
+                        "/usr/bin/gcc",
+                        f"/usr/bin/x86_64-linux-gnu-gcc-{ver}",
+                    ],
+                    check=False,
+                )
 
         # Start dmesg collector
         self.dmesg_file_path = self.session_log_dir / "dmesg.log"
         self.dmesg_file = open(self.dmesg_file_path, "w")
         self.dmesg_proc = subprocess.Popen(
-            self.base_ssh_cmd + ['dmesg', '-w'],
+            self.base_ssh_cmd + ["dmesg", "-w"],
             stdout=self.dmesg_file,
-            stderr=subprocess.STDOUT
+            stderr=subprocess.STDOUT,
         )
         time.sleep(1)
 
@@ -165,6 +198,7 @@ class VM:
         if self.temp_dir and os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
 
+
 @pytest.fixture(scope="session")
 def session_log_dir():
     tmp_base = os.environ.get("TMPDIR", "/tmp")
@@ -173,6 +207,7 @@ def session_log_dir():
     log_dir = base_dir / ts
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
+
 
 class DmesgMonitor:
     def __init__(self, dmesg_file_path):
@@ -191,7 +226,7 @@ class DmesgMonitor:
         with open(self.dmesg_file_path, "r") as f:
             f.seek(self.offset)
             lines = f.read().splitlines()
-            self.offset = f.tell() # advance offset so we only read new lines each time
+            self.offset = f.tell()  # advance offset so we only read new lines each time
             return lines
 
     def wait_for(self, pattern, timeout=5):
@@ -204,9 +239,11 @@ class DmesgMonitor:
             time.sleep(0.5)
         return False
 
+
 @pytest.fixture(scope="function")
 def dmesg(vm):
     return DmesgMonitor(vm.dmesg_file_path)
+
 
 @pytest.fixture(scope="session")
 def project_info():
@@ -235,6 +272,7 @@ def project_info():
 
     return {"root": proj_root, "version": version, "tar_path": tar_path}
 
+
 @pytest.fixture(scope="session")
 def vm(request, session_log_dir):
     kernel_set_str = request.param
@@ -244,6 +282,7 @@ def vm(request, session_log_dir):
         yield vm_instance
     finally:
         vm_instance.stop()
+
 
 class PhantunModule:
     def __init__(self, vm, project_info):
@@ -259,19 +298,22 @@ class PhantunModule:
         self.vm.run(f"mkdir -p {dkms_src} && tar xf {self.tar_path} -C {dkms_src}")
 
         # Clean up existing entry if present (e.g. from host or failed run)
-        self.vm.run(['dkms', 'remove', self.dkms_name, '--all'], check=False)
-        self.vm.run(['dkms', 'add', self.dkms_name])
+        self.vm.run(["dkms", "remove", self.dkms_name, "--all"], check=False)
+        self.vm.run(["dkms", "add", self.dkms_name])
         try:
-            self.vm.run(['dkms', 'build', self.dkms_name])
+            self.vm.run(["dkms", "build", self.dkms_name])
         except subprocess.CalledProcessError:
-            res_log = self.vm.run(f"cat /var/lib/dkms/{self.dkms_name}/build/make.log || true", check=False)
+            res_log = self.vm.run(
+                f"cat /var/lib/dkms/{self.dkms_name}/build/make.log || true",
+                check=False,
+            )
             print("MAKE.LOG:\n", res_log.stdout)
             raise
-        self.vm.run(['dkms', 'install', self.dkms_name])
+        self.vm.run(["dkms", "install", self.dkms_name])
 
     def uninstall(self):
         self.unload()
-        self.vm.run(['dkms', 'remove', self.dkms_name, '--all'], check=False)
+        self.vm.run(["dkms", "remove", self.dkms_name, "--all"], check=False)
 
     def load(self, **kwargs):
         self.unload()
@@ -279,14 +321,17 @@ class PhantunModule:
         opts_str = " ".join(opts)
 
         if opts_str:
-            self.vm.run(f"echo 'options {self.mod_name} {opts_str}' > /etc/modprobe.d/phantun.conf")
+            self.vm.run(
+                f"echo 'options {self.mod_name} {opts_str}' > /etc/modprobe.d/phantun.conf"
+            )
         else:
-            self.vm.run(['rm', '-f', '/etc/modprobe.d/phantun.conf'])
+            self.vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
 
-        self.vm.run(['modprobe', self.mod_name])
+        self.vm.run(["modprobe", self.mod_name])
 
     def unload(self):
-        self.vm.run(['modprobe', '-r', self.mod_name], check=False)
+        self.vm.run(["modprobe", "-r", self.mod_name], check=False)
+
 
 @pytest.fixture(scope="session")
 def phantun_module(vm, project_info):

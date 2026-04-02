@@ -6,6 +6,7 @@
 
 #define PHANTUN_MODULE_NAME "phantun"
 #define PHANTUN_MAX_MANAGED_PORTS 16
+#define PHANTUN_MAX_MANAGED_PEERS 16
 #define PHANTUN_DEFAULT_HANDSHAKE_TIMEOUT_MS 1000U
 #define PHANTUN_DEFAULT_HANDSHAKE_RETRIES 6U
 #define PHANTUN_DEFAULT_KEEPALIVE_INTERVAL_SEC 30U
@@ -22,9 +23,16 @@
 #define pht_pr_debug(fmt, ...) \
 	pr_debug(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
 
+struct pht_managed_peer {
+	__be32 addr;
+	__be16 port;
+};
+
 struct phantun_config {
-	u16 managed_ports[PHANTUN_MAX_MANAGED_PORTS];
-	unsigned int managed_ports_count;
+	u16 managed_local_ports[PHANTUN_MAX_MANAGED_PORTS];
+	unsigned int managed_local_ports_count;
+	struct pht_managed_peer managed_remote_peers[PHANTUN_MAX_MANAGED_PEERS];
+	unsigned int managed_remote_peers_count;
 	const char *handshake_request;
 	const char *handshake_response;
 	unsigned int handshake_request_len;
@@ -35,11 +43,6 @@ struct phantun_config {
 	unsigned int keepalive_misses;
 	unsigned int hard_idle_timeout_sec;
 	unsigned int reopen_guard_bytes;
-	const char *remote_ipv4_cidr;
-	__be32 remote_ipv4_addr;
-	__be32 remote_ipv4_mask;
-	u16 remote_port;
-	bool remote_ipv4_enabled;
 };
 
 #endif

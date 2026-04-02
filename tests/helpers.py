@@ -15,20 +15,19 @@ PORTS_A = (2222, 4444)
 PORTS_B = (3333, 5555)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-GUEST_SCENARIOS = str(PROJECT_ROOT / 'tests/guest/scenarios.py')
+GUEST_SCENARIOS = str(PROJECT_ROOT / "tests/guest/scenarios.py")
 MODULE_STAT_NAMES = (
-    'flows_created',
-    'flows_established',
-    'request_payloads_injected',
-    'response_payloads_injected',
-    'collisions_won',
-    'collisions_lost',
-    'rst_sent',
-    'udp_packets_queued',
-    'udp_packets_dropped',
-    'shaping_payloads_dropped',
+    "flows_created",
+    "flows_established",
+    "request_payloads_injected",
+    "response_payloads_injected",
+    "collisions_won",
+    "collisions_lost",
+    "rst_sent",
+    "udp_packets_queued",
+    "udp_packets_dropped",
+    "shaping_payloads_dropped",
 )
-
 
 
 class GuestProcess:
@@ -59,19 +58,27 @@ class NetnsNftProbe:
         res = run_in_netns(
             vm,
             self.namespace,
-            ['nft', '-j', 'list', 'chain', self.family, self.table_name, self.chain_name],
+            [
+                "nft",
+                "-j",
+                "list",
+                "chain",
+                self.family,
+                self.table_name,
+                self.chain_name,
+            ],
         )
         data = json.loads(res.stdout)
 
-        for item in data.get('nftables', []):
-            rule = item.get('rule')
-            if not rule or rule.get('comment') != comment:
+        for item in data.get("nftables", []):
+            rule = item.get("rule")
+            if not rule or rule.get("comment") != comment:
                 continue
 
-            for expr in rule.get('expr', []):
-                counter = expr.get('counter')
+            for expr in rule.get("expr", []):
+                counter = expr.get("counter")
                 if counter is not None:
-                    return counter.get('packets', 0)
+                    return counter.get("packets", 0)
 
         raise KeyError(f"Missing nft rule comment in {self.namespace}: {comment}")
 
@@ -79,7 +86,7 @@ class NetnsNftProbe:
         run_in_netns(
             vm,
             self.namespace,
-            ['nft', 'delete', 'table', self.family, self.table_name],
+            ["nft", "delete", "table", self.family, self.table_name],
             check=False,
         )
 
@@ -92,7 +99,7 @@ def run_guest_python(vm, script, check=True):
 
 def run_in_netns(vm, namespace, cmd, check=True, **kwargs):
     if isinstance(cmd, list):
-        return vm.run(['ip', 'netns', 'exec', namespace, *cmd], check=check, **kwargs)
+        return vm.run(["ip", "netns", "exec", namespace, *cmd], check=check, **kwargs)
 
     return vm.run(
         f"ip netns exec {shlex.quote(namespace)} bash -c {shlex.quote(cmd)}",
@@ -103,7 +110,7 @@ def run_in_netns(vm, namespace, cmd, check=True, **kwargs):
 
 def guest_command(cmd):
     if isinstance(cmd, list):
-        return ' '.join(shlex.quote(part) for part in cmd)
+        return " ".join(shlex.quote(part) for part in cmd)
 
     return cmd
 
@@ -124,7 +131,7 @@ def run_netns_scenario(vm, namespace, scenario, config, check=True, **kwargs):
     return run_in_netns(
         vm,
         namespace,
-        ['python3', GUEST_SCENARIOS, scenario, json.dumps(config)],
+        ["python3", GUEST_SCENARIOS, scenario, json.dumps(config)],
         check=check,
         **kwargs,
     )
@@ -133,7 +140,16 @@ def run_netns_scenario(vm, namespace, scenario, config, check=True, **kwargs):
 def spawn_netns_scenario(vm, namespace, scenario, config, **kwargs):
     return spawn_guest_command(
         vm,
-        ['ip', 'netns', 'exec', namespace, 'python3', GUEST_SCENARIOS, scenario, json.dumps(config)],
+        [
+            "ip",
+            "netns",
+            "exec",
+            namespace,
+            "python3",
+            GUEST_SCENARIOS,
+            scenario,
+            json.dumps(config),
+        ],
         **kwargs,
     )
 
@@ -154,10 +170,10 @@ def require_guest_command(vm, command):
 def read_module_stat(vm, name):
     res = run_guest_python(
         vm,
-        f'''
+        f"""
 from pathlib import Path
 print(Path('/sys/module/phantun/stats/{name}').read_text().strip())
-''',
+""",
     )
     return int(res.stdout.strip())
 
@@ -171,27 +187,27 @@ def read_module_stats(vm):
 
 def cleanup_netns_topology(vm, namespaces=(NS_A, NS_B)):
     for namespace in namespaces:
-        vm.run(['ip', 'netns', 'del', namespace], check=False)
+        vm.run(["ip", "netns", "del", namespace], check=False)
 
 
 def ensure_netns_topology(vm):
     cleanup_netns_topology(vm)
 
-    vm.run(['ip', 'netns', 'add', NS_A])
-    vm.run(['ip', 'netns', 'add', NS_B])
-    vm.run(['ip', 'link', 'add', VETH_A, 'type', 'veth', 'peer', 'name', VETH_B])
-    vm.run(['ip', 'link', 'set', VETH_A, 'netns', NS_A])
-    vm.run(['ip', 'link', 'set', VETH_B, 'netns', NS_B])
+    vm.run(["ip", "netns", "add", NS_A])
+    vm.run(["ip", "netns", "add", NS_B])
+    vm.run(["ip", "link", "add", VETH_A, "type", "veth", "peer", "name", VETH_B])
+    vm.run(["ip", "link", "set", VETH_A, "netns", NS_A])
+    vm.run(["ip", "link", "set", VETH_B, "netns", NS_B])
 
-    run_in_netns(vm, NS_A, ['ip', 'link', 'set', 'lo', 'up'])
-    run_in_netns(vm, NS_B, ['ip', 'link', 'set', 'lo', 'up'])
+    run_in_netns(vm, NS_A, ["ip", "link", "set", "lo", "up"])
+    run_in_netns(vm, NS_B, ["ip", "link", "set", "lo", "up"])
 
-    run_in_netns(vm, NS_A, ['ip', 'addr', 'add', f'{NS_ADDR_A}/24', 'dev', VETH_A])
-    run_in_netns(vm, NS_B, ['ip', 'addr', 'add', f'{NS_ADDR_B}/24', 'dev', VETH_B])
-    run_in_netns(vm, NS_A, ['ip', 'link', 'set', VETH_A, 'up'])
-    run_in_netns(vm, NS_B, ['ip', 'link', 'set', VETH_B, 'up'])
-    run_in_netns(vm, NS_A, ['ip', 'route', 'add', f'{NS_ADDR_B}/32', 'dev', VETH_A])
-    run_in_netns(vm, NS_B, ['ip', 'route', 'add', f'{NS_ADDR_A}/32', 'dev', VETH_B])
+    run_in_netns(vm, NS_A, ["ip", "addr", "add", f"{NS_ADDR_A}/24", "dev", VETH_A])
+    run_in_netns(vm, NS_B, ["ip", "addr", "add", f"{NS_ADDR_B}/24", "dev", VETH_B])
+    run_in_netns(vm, NS_A, ["ip", "link", "set", VETH_A, "up"])
+    run_in_netns(vm, NS_B, ["ip", "link", "set", VETH_B, "up"])
+    run_in_netns(vm, NS_A, ["ip", "route", "add", f"{NS_ADDR_B}/32", "dev", VETH_A])
+    run_in_netns(vm, NS_B, ["ip", "route", "add", f"{NS_ADDR_A}/32", "dev", VETH_B])
 
 
 def make_netns_output_probe(vm, namespace, channels):
@@ -208,20 +224,21 @@ def make_netns_output_probe(vm, namespace, channels):
     for src_addr, src_port, dst_addr, dst_port in channels:
         tag = flow_tag(src_addr, src_port, dst_addr, dst_port)
         lines.append(
-            f'nft add rule inet {table_name} output '
-            f'ip saddr {src_addr} ip daddr {dst_addr} '
-            f'udp sport {src_port} udp dport {dst_port} '
+            f"nft add rule inet {table_name} output "
+            f"ip saddr {src_addr} ip daddr {dst_addr} "
+            f"udp sport {src_port} udp dport {dst_port} "
             f'counter drop comment "udp_{tag}"'
         )
         lines.append(
-            f'nft add rule inet {table_name} output '
-            f'ip saddr {src_addr} ip daddr {dst_addr} '
-            f'tcp sport {src_port} tcp dport {dst_port} '
+            f"nft add rule inet {table_name} output "
+            f"ip saddr {src_addr} ip daddr {dst_addr} "
+            f"tcp sport {src_port} tcp dport {dst_port} "
             f'counter accept comment "tcp_{tag}"'
         )
 
     run_in_netns(vm, namespace, "\n".join(lines))
-    return NetnsNftProbe(namespace, 'inet', table_name, 'output')
+    return NetnsNftProbe(namespace, "inet", table_name, "output")
+
 
 def make_netns_output_flag_probe(vm, namespace, rules):
     table_name = f"phantun_out_flags_{uuid.uuid4().hex[:8]}"
@@ -244,7 +261,7 @@ def make_netns_output_flag_probe(vm, namespace, rules):
         )
 
     run_in_netns(vm, namespace, "\n".join(lines))
-    return NetnsNftProbe(namespace, 'inet', table_name, 'output')
+    return NetnsNftProbe(namespace, "inet", table_name, "output")
 
 
 def payload_hex(payload):
@@ -266,19 +283,26 @@ def make_netns_tcp_payload_probe(vm, namespace, payload_rules):
     ]
 
     for rule in payload_rules:
-        payload_bits = len(rule['payload'].encode() if isinstance(rule['payload'], str) else rule['payload']) * 8
-        payload_value = payload_hex(rule['payload'])
-        action = rule.get('action', 'accept')
+        payload_bits = (
+            len(
+                rule["payload"].encode()
+                if isinstance(rule["payload"], str)
+                else rule["payload"]
+            )
+            * 8
+        )
+        payload_value = payload_hex(rule["payload"])
+        action = rule.get("action", "accept")
         lines.append(
-            f'nft add rule inet {table_name} output '
+            f"nft add rule inet {table_name} output "
             f'ip saddr {rule["src_addr"]} ip daddr {rule["dst_addr"]} '
             f'tcp sport {rule["src_port"]} tcp dport {rule["dst_port"]} '
-            f'@th,160,{payload_bits} 0x{payload_value} '
+            f"@th,160,{payload_bits} 0x{payload_value} "
             f'counter {action} comment "{rule["comment"]}"'
         )
 
     run_in_netns(vm, namespace, "\n".join(lines))
-    return NetnsNftProbe(namespace, 'inet', table_name, 'output')
+    return NetnsNftProbe(namespace, "inet", table_name, "output")
 
 
 def make_netns_ingress_flag_drop_probe(vm, namespace, device, rules):
@@ -302,7 +326,7 @@ def make_netns_ingress_flag_drop_probe(vm, namespace, device, rules):
         )
 
     run_in_netns(vm, namespace, "\n".join(lines))
-    return NetnsNftProbe(namespace, 'netdev', table_name, 'ingress')
+    return NetnsNftProbe(namespace, "netdev", table_name, "ingress")
 
 
 def make_netns_ingress_payload_drop_probe(vm, namespace, device, rules):
@@ -317,8 +341,15 @@ def make_netns_ingress_payload_drop_probe(vm, namespace, device, rules):
     ]
 
     for rule in rules:
-        payload_bits = len(rule['payload'].encode() if isinstance(rule['payload'], str) else rule['payload']) * 8
-        payload_value = payload_hex(rule['payload'])
+        payload_bits = (
+            len(
+                rule["payload"].encode()
+                if isinstance(rule["payload"], str)
+                else rule["payload"]
+            )
+            * 8
+        )
+        payload_value = payload_hex(rule["payload"])
         lines.append(
             f"nft 'add rule netdev {table_name} ingress "
             f"ip saddr {rule['src_addr']} ip daddr {rule['dst_addr']} "
@@ -328,7 +359,7 @@ def make_netns_ingress_payload_drop_probe(vm, namespace, device, rules):
         )
 
     run_in_netns(vm, namespace, "\n".join(lines))
-    return NetnsNftProbe(namespace, 'netdev', table_name, 'ingress')
+    return NetnsNftProbe(namespace, "netdev", table_name, "ingress")
 
 
 def probe_comment(prefix, src_addr, src_port, dst_addr, dst_port):
@@ -336,4 +367,4 @@ def probe_comment(prefix, src_addr, src_port, dst_addr, dst_port):
 
 
 def flow_tag(src_addr, src_port, dst_addr, dst_port):
-    return f"{src_addr}_{src_port}_to_{dst_addr}_{dst_port}".replace('.', '_')
+    return f"{src_addr}_{src_port}_to_{dst_addr}_{dst_port}".replace(".", "_")

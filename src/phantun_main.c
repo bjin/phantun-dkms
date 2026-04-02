@@ -19,8 +19,10 @@
 
 #define PHANTUN_REOPEN_ISN_ATTEMPTS 1024U
 
-static unsigned short managed_ports[PHANTUN_MAX_MANAGED_PORTS];
-static int managed_ports_count;
+static unsigned int managed_local_ports[PHANTUN_MAX_MANAGED_PORTS];
+static int managed_local_ports_count;
+static char *managed_remote_peers[PHANTUN_MAX_MANAGED_PEERS];
+static int managed_remote_peers_count;
 static char *handshake_request;
 static char *handshake_response;
 static unsigned int handshake_timeout_ms = PHANTUN_DEFAULT_HANDSHAKE_TIMEOUT_MS;
@@ -31,16 +33,15 @@ static unsigned int keepalive_misses = PHANTUN_DEFAULT_KEEPALIVE_MISSES;
 static unsigned int hard_idle_timeout_sec =
 	PHANTUN_DEFAULT_HARD_IDLE_TIMEOUT_SEC;
 static unsigned int reopen_guard_bytes = PHANTUN_DEFAULT_REOPEN_GUARD_BYTES;
-static char *remote_ipv4_cidr;
-static unsigned short remote_port;
-static __be32 remote_ipv4_addr;
-static __be32 remote_ipv4_mask;
-static bool remote_ipv4_enabled;
 
-module_param_array_named(managed_ports, managed_ports, ushort,
-			 &managed_ports_count, 0444);
-MODULE_PARM_DESC(managed_ports,
+module_param_array_named(managed_local_ports, managed_local_ports, uint,
+			 &managed_local_ports_count, 0444);
+MODULE_PARM_DESC(managed_local_ports,
 		 "Comma-separated local UDP/TCP ports managed by phantun");
+module_param_array_named(managed_remote_peers, managed_remote_peers, charp,
+			 &managed_remote_peers_count, 0444);
+MODULE_PARM_DESC(managed_remote_peers,
+		 "Comma-separated remote IPv4:port peers managed by phantun");
 module_param(handshake_request, charp, 0444);
 MODULE_PARM_DESC(handshake_request, "Optional initiator control payload sent "
 				    "as the first fake-TCP payload");
@@ -67,12 +68,6 @@ MODULE_PARM_DESC(hard_idle_timeout_sec,
 module_param(reopen_guard_bytes, uint, 0444);
 MODULE_PARM_DESC(reopen_guard_bytes,
 		 "Minimum sequence space separation for new connections");
-module_param(remote_ipv4_cidr, charp, 0444);
-MODULE_PARM_DESC(remote_ipv4_cidr, "Optional remote IPv4 CIDR filter (string "
-				   "form, parsed in later phases)");
-module_param(remote_port, ushort, 0444);
-MODULE_PARM_DESC(remote_port,
-		 "Optional remote UDP/TCP port filter; 0 disables the filter");
 
 static struct phantun_config phantun_cfg;
 static unsigned int phantun_net_id;
@@ -92,46 +87,36 @@ static struct pht_flow_table *phantun_net_flows(const struct net *net)
 	return pnet ? &pnet->flows : NULL;
 }
 
-static int phantun_parse_remote_ipv4_cidr(const char *cidr, __be32 *addr,
-					  __be32 *mask)
+static int
+phantun_parse_managed_remote_peer(const char *peer,
+				  struct pht_managed_peer *parsed_peer)
 {
 	char buf[32];
-	char *slash;
-	u8 parsed[4];
-	unsigned int prefix_len;
-	u32 mask_host;
+	char *colon;
+	u8 parsed_addr[4];
+	unsigned int port_host;
 
-	if (!cidr || !*cidr || !addr || !mask)
+	if (!peer || !*peer || !parsed_peer)
 		return -EINVAL;
-	if (strscpy(buf, cidr, sizeof(buf)) < 0)
-		return -EINVAL;
-
-	slash = strchr(buf, '/');
-	if (!slash)
-		return -EINVAL;
-	*slash = '\0';
-	slash++;
-	if (!*buf || !*slash)
-		return -EINVAL;
-	if (!in4_pton(buf, -1, parsed, -1, NULL))
-		return -EINVAL;
-	if (kstrtouint(slash, 10, &prefix_len) || prefix_len > 32U)
+	if (strscpy(buf, peer, sizeof(buf)) < 0)
 		return -EINVAL;
 
-	memcpy(addr, parsed, sizeof(parsed));
-	mask_host = prefix_len ? (~0U << (32U - prefix_len)) : 0;
-	*mask = cpu_to_be32(mask_host);
-	*addr &= *mask;
+	colon = strrchr(buf, ':');
+	if (!colon)
+		return -EINVAL;
+	*colon = '\0';
+	colon++;
+	if (!*buf || !*colon)
+		return -EINVAL;
+	if (!in4_pton(buf, -1, parsed_addr, -1, NULL))
+		return -EINVAL;
+	if (kstrtouint(colon, 10, &port_host) || !port_host ||
+	    port_host > U16_MAX)
+		return -EINVAL;
+
+	memcpy(&parsed_peer->addr, parsed_addr, sizeof(parsed_addr));
+	parsed_peer->port = htons((u16)port_host);
 	return 0;
-}
-
-static bool phantun_remote_addr_allowed(__be32 addr)
-{
-	if (!phantun_cfg.remote_ipv4_enabled)
-		return true;
-
-	return (addr & phantun_cfg.remote_ipv4_mask) ==
-	       phantun_cfg.remote_ipv4_addr;
 }
 
 static void phantun_account_udp_queue_result(bool queued)
@@ -142,22 +127,42 @@ static void phantun_account_udp_queue_result(bool queued)
 		pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
 }
 
-static bool phantun_managed_port(__be16 port)
+static bool phantun_local_port_allowed(__be16 port)
 {
 	unsigned int i;
 
-	for (i = 0; i < phantun_cfg.managed_ports_count; i++) {
-		if (phantun_cfg.managed_ports[i] == ntohs(port))
+	if (!phantun_cfg.managed_local_ports_count)
+		return true;
+
+	for (i = 0; i < phantun_cfg.managed_local_ports_count; i++) {
+		if (phantun_cfg.managed_local_ports[i] == ntohs(port))
 			return true;
 	}
 
 	return false;
 }
 
-static bool phantun_remote_port_allowed(__be16 port)
+static bool phantun_remote_peer_allowed(__be32 addr, __be16 port)
 {
-	return !phantun_cfg.remote_port ||
-	       ntohs(port) == phantun_cfg.remote_port;
+	unsigned int i;
+
+	if (!phantun_cfg.managed_remote_peers_count)
+		return true;
+
+	for (i = 0; i < phantun_cfg.managed_remote_peers_count; i++) {
+		if (phantun_cfg.managed_remote_peers[i].addr == addr &&
+		    phantun_cfg.managed_remote_peers[i].port == port)
+			return true;
+	}
+
+	return false;
+}
+
+static bool phantun_selectors_allow(__be16 local_port, __be32 remote_addr,
+				    __be16 remote_port)
+{
+	return phantun_local_port_allowed(local_port) &&
+	       phantun_remote_peer_allowed(remote_addr, remote_port);
 }
 
 static void phantun_fill_udp_endpoint_pair(const struct pht_l4_view *view,
@@ -564,11 +569,8 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
 	if (ret)
 		return NF_ACCEPT;
 
-	if (!phantun_remote_addr_allowed(view.iph->daddr))
-		return NF_ACCEPT;
-	if (!phantun_managed_port(view.udp->source))
-		return NF_ACCEPT;
-	if (!phantun_remote_port_allowed(view.udp->dest))
+	if (!phantun_selectors_allow(view.udp->source, view.iph->daddr,
+				     view.udp->dest))
 		return NF_ACCEPT;
 
 	phantun_fill_udp_endpoint_pair(&view, &ep);
@@ -685,6 +687,29 @@ retry_lookup:
 	return NF_STOLEN;
 }
 
+static unsigned int
+phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb,
+			     const struct nf_hook_state *state)
+{
+	struct pht_l4_view view;
+	int ret;
+
+	if (!state || !skb)
+		return NF_ACCEPT;
+
+	ret = pht_parse_ipv4_udp(skb, &view);
+	if (ret)
+		return NF_ACCEPT;
+
+	if (!phantun_selectors_allow(view.udp->dest, view.iph->saddr,
+				     view.udp->source))
+		return NF_ACCEPT;
+
+	pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+	kfree_skb(skb);
+	return NF_STOLEN;
+}
+
 static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 					const struct nf_hook_state *state)
 {
@@ -714,11 +739,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 	if (ret)
 		return NF_ACCEPT;
 
-	if (!phantun_remote_addr_allowed(view.iph->saddr))
-		return NF_ACCEPT;
-	if (!phantun_managed_port(view.tcp->dest))
-		return NF_ACCEPT;
-	if (!phantun_remote_port_allowed(view.tcp->source))
+	if (!phantun_selectors_allow(view.tcp->dest, view.iph->saddr,
+				     view.tcp->source))
 		return NF_ACCEPT;
 
 	phantun_fill_tcp_endpoint_pair(&view, &ep);
@@ -1117,6 +1139,12 @@ static struct nf_hook_ops phantun_nf_ops[] = {
 		.priority = PHANTUN_CAPTURE_PRIORITY,
 	},
 	{
+		.hook = phantun_pre_routing_udp_drop,
+		.pf = NFPROTO_IPV4,
+		.hooknum = NF_INET_PRE_ROUTING,
+		.priority = PHANTUN_CAPTURE_PRIORITY,
+	},
+	{
 		.hook = phantun_pre_routing,
 		.pf = NFPROTO_IPV4,
 		.hooknum = NF_INET_PRE_ROUTING,
@@ -1174,25 +1202,35 @@ static struct pernet_operations phantun_pernet_ops = {
 
 static int phantun_validate_config(void)
 {
+	unsigned int i;
 	int ret;
 
-	if (!managed_ports_count) {
-		pht_pr_err("at least one managed_ports entry is required\n");
+	if (!managed_local_ports_count && !managed_remote_peers_count) {
+		pht_pr_err("at least one selector entry is required\n");
 		return -EINVAL;
 	}
 
-	remote_ipv4_enabled = false;
-	remote_ipv4_addr = 0;
-	remote_ipv4_mask = 0;
-	if (remote_ipv4_cidr && strlen(remote_ipv4_cidr)) {
-		ret = phantun_parse_remote_ipv4_cidr(
-			remote_ipv4_cidr, &remote_ipv4_addr, &remote_ipv4_mask);
+	for (i = 0; i < managed_local_ports_count; i++) {
+		if (!managed_local_ports[i] ||
+		    managed_local_ports[i] > U16_MAX) {
+			pht_pr_err("managed_local_ports[%u] must be between 1 "
+				   "and 65535\n",
+				   i);
+			return -EINVAL;
+		}
+	}
+
+	for (i = 0; i < managed_remote_peers_count; i++) {
+		struct pht_managed_peer parsed_peer;
+
+		ret = phantun_parse_managed_remote_peer(managed_remote_peers[i],
+							&parsed_peer);
 		if (ret) {
-			pht_pr_err(
-				"remote_ipv4_cidr must be valid IPv4 CIDR\n");
+			pht_pr_err("managed_remote_peers[%u] must be valid "
+				   "x.y.z.w:p\n",
+				   i);
 			return ret;
 		}
-		remote_ipv4_enabled = true;
 	}
 
 	if (!handshake_timeout_ms) {
@@ -1235,9 +1273,23 @@ static void phantun_snapshot_config(void)
 	unsigned int i;
 
 	memset(&phantun_cfg, 0, sizeof(phantun_cfg));
-	phantun_cfg.managed_ports_count = managed_ports_count;
-	for (i = 0; i < managed_ports_count; i++)
-		phantun_cfg.managed_ports[i] = managed_ports[i];
+	phantun_cfg.managed_local_ports_count = managed_local_ports_count;
+	for (i = 0; i < managed_local_ports_count; i++)
+		phantun_cfg.managed_local_ports[i] =
+			(u16)managed_local_ports[i];
+	phantun_cfg.managed_remote_peers_count = managed_remote_peers_count;
+	for (i = 0; i < managed_remote_peers_count; i++) {
+		if (phantun_parse_managed_remote_peer(
+			    managed_remote_peers[i],
+			    &phantun_cfg.managed_remote_peers[i])) {
+			/* Config was validated earlier; keep impossible parse
+			 * failures from leaking uninitialized data into the hot
+			 * path.
+			 */
+			memset(&phantun_cfg.managed_remote_peers[i], 0,
+			       sizeof(phantun_cfg.managed_remote_peers[i]));
+		}
+	}
 	phantun_cfg.handshake_request =
 		handshake_request && strlen(handshake_request)
 			? handshake_request
@@ -1260,12 +1312,6 @@ static void phantun_snapshot_config(void)
 	phantun_cfg.keepalive_misses = keepalive_misses;
 	phantun_cfg.hard_idle_timeout_sec = hard_idle_timeout_sec;
 	phantun_cfg.reopen_guard_bytes = reopen_guard_bytes;
-	phantun_cfg.remote_ipv4_cidr =
-		remote_ipv4_enabled ? remote_ipv4_cidr : NULL;
-	phantun_cfg.remote_ipv4_addr = remote_ipv4_addr;
-	phantun_cfg.remote_ipv4_mask = remote_ipv4_mask;
-	phantun_cfg.remote_port = remote_port;
-	phantun_cfg.remote_ipv4_enabled = remote_ipv4_enabled;
 }
 
 static void phantun_log_config(void)
@@ -1273,25 +1319,25 @@ static void phantun_log_config(void)
 	unsigned int i;
 
 	pht_pr_info(
-		"loading with %u managed port(s), handshake_timeout_ms=%u, "
+		"loading with %u managed local port(s), %u managed remote "
+		"peer(s), handshake_timeout_ms=%u, "
 		"handshake_retries=%u, keepalive_interval_sec=%u, "
 		"keepalive_misses=%u, hard_idle_timeout_sec=%u, "
 		"reopen_guard_bytes=%u\n",
-		phantun_cfg.managed_ports_count,
+		phantun_cfg.managed_local_ports_count,
+		phantun_cfg.managed_remote_peers_count,
 		phantun_cfg.handshake_timeout_ms, phantun_cfg.handshake_retries,
 		phantun_cfg.keepalive_interval_sec,
 		phantun_cfg.keepalive_misses, phantun_cfg.hard_idle_timeout_sec,
 		phantun_cfg.reopen_guard_bytes);
 
-	for (i = 0; i < phantun_cfg.managed_ports_count; i++)
-		pht_pr_info("managed_ports[%u]=%u\n", i,
-			    phantun_cfg.managed_ports[i]);
-
-	if (phantun_cfg.remote_ipv4_cidr)
-		pht_pr_info("remote_ipv4_cidr=%s\n",
-			    phantun_cfg.remote_ipv4_cidr);
-	if (phantun_cfg.remote_port)
-		pht_pr_info("remote_port=%u\n", phantun_cfg.remote_port);
+	for (i = 0; i < phantun_cfg.managed_local_ports_count; i++)
+		pht_pr_info("managed_local_ports[%u]=%u\n", i,
+			    phantun_cfg.managed_local_ports[i]);
+	for (i = 0; i < phantun_cfg.managed_remote_peers_count; i++)
+		pht_pr_info("managed_remote_peers[%u]=%pI4:%u\n", i,
+			    &phantun_cfg.managed_remote_peers[i].addr,
+			    ntohs(phantun_cfg.managed_remote_peers[i].port));
 }
 
 static int __init phantun_init(void)

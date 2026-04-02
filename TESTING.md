@@ -69,7 +69,7 @@ Logs are automatically saved to `~/.cache/logs/phantun_tests/YYYYMMDD_HHMMSS/`.
 3. **Log Verification**: Use the `dmesg` fixture to verify kernel output.
    ```python
    def test_my_feature(phantun_module, dmesg):
-       phantun_module.load(managed_ports="9999")
+       phantun_module.load(managed_local_ports="9999")
        if not dmesg.wait_for(r"expected log message", timeout=5):
            pytest.fail("Feature failed to log success")
    ```
