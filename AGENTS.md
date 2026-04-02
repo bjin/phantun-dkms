@@ -29,6 +29,9 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 - Fake TCP is strict: 3-way handshake, seq/ack accounting, no FIN, RST on error.
 - First payloads are mandatory control payloads and are never delivered to the UDP app.
 - Initial initiator seq must be a random `u32` aligned so `seq % 4095 == 0`.
+- For packet-loss tests, drop packets on veth ingress with nft `netdev` rules, not on sender `OUTPUT`, so loss is simulated on-path instead of as a local send failure.
+- Prefer checked-in guest helper scripts under `tests/guest/` over embedded Python strings in tests; virtme-ng COW snapshots make tracked repo files visible inside the guest.
+- Braces are structure, not text: if an edit emits `}`, prove the old `}` was removed, then re-read the surrounding block immediately.
 
 ## Coding style / safety
 - Kernel style: tabs, small static helpers, explicit return-value checks.
