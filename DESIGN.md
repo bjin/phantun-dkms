@@ -556,22 +556,3 @@ Chosen because it works with existing UDP applications directly and avoids lying
 
 Chosen because translation/state ownership belongs in a real module, not in a target callback abstraction designed mainly for policy integration.
 
-
-## 14. Remaining refinements not implemented in v1
-
-This design intentionally implements the minimum coherent best-effort recovery package from `REFINES.md`, not every possible refinement.
-
-Still unimplemented or intentionally deferred:
-
-- short quarantine for delayed old-generation packets after replacement (`REFINES.md` recommendation H)
-  - useful, but optional for the first recovery-focused implementation
-  - delayed old-generation traffic is still handled by the normal flag/seq rules immediately after replacement
-
-- seamless roaming or live tuple migration
-  - tuple changes are still handled as break detection plus re-establishment, not as transport-preserving migration
-
-- transport-independent session identity beyond the current tuple plus generation behavior
-  - SYN ISNs provide deterministic collision handling and generation separation, but they do not create a WireGuard-like authenticated session identity
-
-- WireGuard-like endpoint update semantics for the fake-TCP wrapper
-  - the wrapper can reconnect after breakage, but it still cannot safely claim true mobility support across arbitrary middleboxes
