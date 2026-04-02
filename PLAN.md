@@ -36,12 +36,12 @@ It tracks only unfinished work that still matters after the recovery redesign.
 
 ## Phase 1 - recovery refinement
 
-- [ ] Add a short quarantine window after accepting a replacement generation
-  - [ ] keep a small per-flow quarantine record for the immediately previous generation
-  - [ ] during the quarantine window, silently drop stale-looking old-generation traffic instead of replying with `RST`
-  - [ ] expire the quarantine state automatically after a short timeout
-  - [ ] keep the implementation bounded and cheap on the hot path
-- [ ] Document the quarantine rule in `DESIGN.md`
+- [x] Add a short quarantine window after accepting a replacement generation
+  - [x] keep a small per-flow quarantine record for the immediately previous generation
+  - [x] during the quarantine window, silently drop stale-looking old-generation traffic instead of replying with `RST`
+  - [x] expire the quarantine state automatically after a short timeout
+  - [x] keep the implementation bounded and cheap on the hot path
+- [x] Document the quarantine rule in `DESIGN.md`
 
 ## Phase 2 - targeted state-machine coverage
 

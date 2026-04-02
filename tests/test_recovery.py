@@ -411,6 +411,165 @@ def test_established_bare_syn_replacement(phantun_module, vm):
         )
 
 
+def test_replacement_quarantine_drops_delayed_old_generation_packet(phantun_module, vm):
+    load_recovery_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    captured_packet = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payload": "msg1",
+            "timeout_sec": 10,
+        },
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst",
+                "comment": "quarantine_rst",
+            }
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "echo_server",
+        {"bind_addr": NS_ADDR_B, "bind_port": dst_port, "count": 2},
+    )
+
+    try:
+        time.sleep(0.2)
+        client_result_1 = run_netns_scenario(
+            vm,
+            NS_A,
+            "echo_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["msg1"],
+            },
+        )
+        assert_completed(client_result_1, "client send 1")
+
+        captured_result = captured_packet.communicate(timeout=10)
+        assert_completed(captured_result, "capture old generation packet")
+        captured_data = parse_guest_json(captured_result.stdout, "captured old packet")
+        baseline_rst = rst_probe.packets(vm, "quarantine_rst")
+
+        vm.run(["ip", "netns", "exec", NS_B, "nft", "add", "table", "inet", "filter"])
+        vm.run(
+            [
+                "ip",
+                "netns",
+                "exec",
+                NS_B,
+                "nft",
+                "add",
+                "chain",
+                "inet",
+                "filter",
+                "output",
+                "{ type filter hook output priority 10; policy accept; }",
+            ]
+        )
+        vm.run(
+            [
+                "ip",
+                "netns",
+                "exec",
+                NS_B,
+                "nft",
+                "add",
+                "rule",
+                "inet",
+                "filter",
+                "output",
+                f"ip daddr {NS_ADDR_A} drop",
+            ]
+        )
+        time.sleep(4)
+        vm.run(
+            ["ip", "netns", "exec", NS_B, "nft", "delete", "table", "inet", "filter"]
+        )
+
+        client_result_2 = spawn_netns_scenario(
+            vm,
+            NS_A,
+            "echo_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["msg2"],
+            },
+        )
+        time.sleep(0.3)
+        stale_packet = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "seq": captured_data["seq"],
+                "ack": captured_data["ack"],
+                "flags": "ack",
+                "payload": captured_data["payload"],
+            },
+        )
+        assert_completed(stale_packet, "inject stale packet")
+
+        client_result_2 = client_result_2.communicate(timeout=15)
+        assert_completed(client_result_2, "client send 2")
+        client_data = parse_guest_json(client_result_2.stdout, "client send 2 stdout")
+        if client_data.get("echoed") != ["msg2"]:
+            pytest.fail(
+                f"stale packet escaped quarantine and confused the client: {client_data!r}"
+            )
+
+        server_result = server.communicate(timeout=15)
+        assert_completed(server_result, "server")
+        server_data = parse_guest_json(server_result.stdout, "server stdout")
+        if received_messages(server_data) != ["msg1", "msg2"]:
+            pytest.fail(
+                f"stale packet escaped quarantine and reached UDP delivery: {received_messages(server_data)!r}"
+            )
+        if rst_probe.packets(vm, "quarantine_rst") != baseline_rst:
+            pytest.fail(
+                "stale old-generation packet should be dropped without emitting RST"
+            )
+    finally:
+        rst_probe.cleanup(vm)
+        vm.run(
+            ["ip", "netns", "exec", NS_B, "nft", "delete", "table", "inet", "filter"],
+            check=False,
+        )
+        cleanup_netns_topology(vm)
+
+
 def test_established_invalid_syn_destroys_flow(phantun_module, vm):
     phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)

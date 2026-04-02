@@ -201,6 +201,120 @@ static u32 phantun_tcp_seq_advance(const struct tcphdr *th,
 	return advance;
 }
 
+static bool phantun_tcp_is_bare_syn(const struct pht_l4_view *view);
+
+static bool phantun_seq_after_eq(u32 seq1, u32 seq2)
+{
+	return (s32)(seq1 - seq2) >= 0;
+}
+
+static bool phantun_seq_before_eq(u32 seq1, u32 seq2)
+{
+	return (s32)(seq1 - seq2) <= 0;
+}
+
+static bool phantun_seq_between(u32 seq, u32 start, u32 end)
+{
+	return phantun_seq_after_eq(seq, start) &&
+	       phantun_seq_before_eq(seq, end);
+}
+
+static void phantun_flow_arm_prev_generation_quarantine(struct pht_flow *flow,
+							u32 prev_local_start,
+							u32 prev_local_end,
+							u32 prev_remote_start,
+							u32 prev_remote_end)
+{
+	if (!flow)
+		return;
+
+	spin_lock_bh(&flow->lock);
+	flow->quarantine_prev_local_seq_start = prev_local_start;
+	flow->quarantine_prev_local_seq_end = prev_local_end;
+	flow->quarantine_prev_remote_seq_start = prev_remote_start;
+	flow->quarantine_prev_remote_seq_end = prev_remote_end;
+	flow->quarantine_until_jiffies =
+		jiffies + msecs_to_jiffies(PHANTUN_REPLACEMENT_QUARANTINE_MS);
+	flow->quarantine_prev_active = true;
+	spin_unlock_bh(&flow->lock);
+}
+
+static bool
+phantun_flow_matches_quarantine_locked(const struct pht_flow *flow,
+				       const struct pht_l4_view *view)
+{
+	u32 seq;
+	u32 ack;
+	bool seq_matches;
+
+	seq = ntohl(view->tcp->seq);
+	ack = ntohl(view->tcp->ack_seq);
+	seq_matches =
+		phantun_seq_between(seq, flow->quarantine_prev_remote_seq_start,
+				    flow->quarantine_prev_remote_seq_end);
+	if (!seq_matches)
+		return false;
+
+	if (view->tcp->rst && !view->tcp->ack)
+		return true;
+	if (!view->tcp->ack)
+		return false;
+
+	return phantun_seq_between(ack, flow->quarantine_prev_local_seq_start,
+				   flow->quarantine_prev_local_seq_end);
+}
+
+static bool
+phantun_flow_matches_current_generation_locked(const struct pht_flow *flow,
+					       const struct pht_l4_view *view)
+{
+	u32 seq;
+	u32 ack;
+	u32 current_local_end;
+
+	seq = ntohl(view->tcp->seq);
+	ack = ntohl(view->tcp->ack_seq);
+	current_local_end = flow->seq;
+	if (flow->state == PHT_FLOW_STATE_SYN_RCVD)
+		current_local_end = flow->local_isn + 1;
+
+	if (!phantun_seq_between(seq, flow->peer_syn_next, flow->ack))
+		return false;
+	if (view->tcp->rst && !view->tcp->ack)
+		return true;
+	if (!view->tcp->ack)
+		return false;
+
+	return phantun_seq_between(ack, flow->local_isn, current_local_end);
+}
+
+static bool
+phantun_flow_should_drop_quarantined_packet(struct pht_flow *flow,
+					    const struct pht_l4_view *view)
+{
+	bool drop = false;
+
+	if (!flow || !view || phantun_tcp_is_bare_syn(view))
+		return false;
+
+	spin_lock_bh(&flow->lock);
+	if (!flow->quarantine_prev_active)
+		goto out;
+	if (time_after_eq(jiffies, flow->quarantine_until_jiffies)) {
+		flow->quarantine_prev_active = false;
+		goto out;
+	}
+	if (!phantun_flow_matches_quarantine_locked(flow, view))
+		goto out;
+	if (flow->state == PHT_FLOW_STATE_ESTABLISHED &&
+	    phantun_flow_matches_current_generation_locked(flow, view))
+		goto out;
+	drop = true;
+out:
+	spin_unlock_bh(&flow->lock);
+	return drop;
+}
+
 static bool phantun_tcp_is_bare_syn(const struct pht_l4_view *view)
 {
 	return view && view->tcp->syn && !view->tcp->ack &&
@@ -725,6 +839,11 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 	u32 responder_seq;
 	u32 local_isn;
 	u32 peer_syn_next;
+	u32 quarantine_prev_local_seq_start = 0;
+	u32 quarantine_prev_local_seq_end = 0;
+	u32 quarantine_prev_remote_seq_start = 0;
+	u32 quarantine_prev_remote_seq_end = 0;
+	bool carry_quarantine = false;
 	bool had_queued;
 	int ret;
 
@@ -798,6 +917,14 @@ process_as_new_syn:
 		new_flow->local_isn = responder_seq;
 		new_flow->peer_syn_next = new_flow->ack;
 		spin_unlock_bh(&new_flow->lock);
+		if (carry_quarantine) {
+			phantun_flow_arm_prev_generation_quarantine(
+				new_flow, quarantine_prev_local_seq_start,
+				quarantine_prev_local_seq_end,
+				quarantine_prev_remote_seq_start,
+				quarantine_prev_remote_seq_end);
+			carry_quarantine = false;
+		}
 
 		ret = pht_flow_insert(flows, new_flow);
 		if (ret) {
@@ -822,6 +949,10 @@ process_as_new_syn:
 	spin_unlock_bh(&flow->lock);
 
 	if (view.tcp->rst) {
+		if (phantun_flow_should_drop_quarantined_packet(flow, &view)) {
+			pht_flow_put(flow);
+			return NF_DROP;
+		}
 		pht_flow_remove(flow);
 		pht_flow_put(flow);
 		return NF_DROP;
@@ -977,6 +1108,11 @@ process_as_new_syn:
 	if (state_now == PHT_FLOW_STATE_SYN_RCVD) {
 		if (!view.tcp->ack ||
 		    ntohl(view.tcp->ack_seq) != expected_ack) {
+			if (phantun_flow_should_drop_quarantined_packet(
+				    flow, &view)) {
+				pht_flow_put(flow);
+				return NF_DROP;
+			}
 			ret = phantun_send_rstack(state->net, &ep, &view,
 						  false);
 			if (ret)
@@ -1064,9 +1200,23 @@ process_as_new_syn:
 		bool response_acked = false;
 		bool drop_payload = false;
 
+		if (phantun_flow_should_drop_quarantined_packet(flow, &view)) {
+			pht_flow_put(flow);
+			return NF_DROP;
+		}
+
 		if (view.tcp->syn) {
 			if (phantun_tcp_is_bare_syn(&view) &&
 			    phantun_tcp_syn_is_aligned(&view)) {
+				spin_lock_bh(&flow->lock);
+				quarantine_prev_local_seq_start =
+					flow->local_isn;
+				quarantine_prev_local_seq_end = flow->seq;
+				quarantine_prev_remote_seq_start =
+					flow->peer_syn_next;
+				quarantine_prev_remote_seq_end = flow->ack;
+				spin_unlock_bh(&flow->lock);
+				carry_quarantine = true;
 				pht_pr_info("received bare SYN on ESTABLISHED "
 					    "tuple, replacing generation\n");
 				queued_skb = pht_flow_take_queued_skb(flow);

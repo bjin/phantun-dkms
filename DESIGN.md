@@ -258,7 +258,25 @@ Rules:
 
 This directly addresses the requirement that initiators must not create a second session for an already-valid tuple.
 
-## 6.3 Simultaneous initiation policy
+## 6.3 Replacement-generation quarantine
+
+Accepting a bare replacement `SYN` on an existing tuple must not immediately turn every delayed old-generation packet into a fresh protocol error.
+
+Rule:
+
+- when an `ESTABLISHED` flow accepts a bare aligned replacement `SYN`, preserve a small quarantine record for the generation that was just replaced
+- the record is only for the immediately previous generation on that tuple; do not build an unbounded history
+- the quarantine window is short and bounded; it exists only to absorb delayed packets from the just-replaced generation, not to preserve concurrent sessions
+- packets that still look like the quarantined old generation are silently dropped during that window instead of getting `RST`
+- once the quarantine window expires, normal unknown-tuple handling resumes
+
+Intent:
+
+- avoid poisoning recovery when a peer re-establishes on the same tuple and delayed packets from the old generation arrive just after the replacement was accepted
+- keep the hot path cheap by remembering only one previous generation with a short timeout
+
+
+## 6.4 Simultaneous initiation policy
 
 True simultaneous open is rejected.
 
@@ -335,7 +353,7 @@ Actions:
 - from then on translate UDP <-> fake-TCP normally
 - inbound traffic handling prioritizes flag classification:
   - `RST`: destroy local state silently
-  - bare `SYN` (syn=1, ack=0, payload=0, aligned): accept as generation replacement. Destroy old flow state, drop old skb, create new `SYN_RCVD` responder flow, and send `SYN|ACK`.
+  - bare `SYN` (syn=1, ack=0, payload=0, aligned): accept as generation replacement. Destroy old flow state, move the just-replaced generation into a short quarantine window, create new `SYN_RCVD` responder flow, and send `SYN|ACK`.
   - any other packet with `SYN` set: send `RST|ACK` and destroy local state
   - no `SYN`: normal established data processing
 - any valid inbound fake-TCP packet that is accepted for this flow, including pure `ACK`s and handshake-response acknowledgement traffic, refreshes liveness suspicion
@@ -386,7 +404,7 @@ After establishment:
 - `ack` tracks peer `seq + payload_len` on receive
 - inbound traffic handling prioritizes flag classification:
   - `RST`: destroy local state silently
-  - bare `SYN` (syn=1, ack=0, payload=0, aligned): accept as generation replacement. Destroy old flow state, drop old skb, create new `SYN_RCVD` responder flow, and send `SYN|ACK`.
+  - bare `SYN` (syn=1, ack=0, payload=0, aligned): accept as generation replacement. Destroy old flow state, move the just-replaced generation into a short quarantine window, create new `SYN_RCVD` responder flow, and send `SYN|ACK`.
   - any other packet with `SYN` set: send `RST|ACK` and destroy local state
   - no `SYN`: normal established data processing
 - any valid inbound fake-TCP packet that is accepted for this flow, including pure `ACK`s and handshake-response acknowledgement traffic, refreshes liveness suspicion
@@ -414,6 +432,7 @@ Cases that do not trigger a reply:
 
 - stray inbound `RST` for unknown tuple
 - inbound `RST` for an existing tuple: just destroy local state
+- stale-looking packets from the immediately previous generation while its short quarantine window is still active: silently drop them
 
 Missing, duplicated, or unexpected optional request/response payloads are tolerated; later packets continue to drive normal `seq`/`ack` state.
 
