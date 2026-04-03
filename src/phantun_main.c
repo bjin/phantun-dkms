@@ -1459,6 +1459,6 @@ module_init(phantun_init);
 module_exit(phantun_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("OpenAI");
-MODULE_DESCRIPTION("Kernel-mode Phantun skeleton");
-MODULE_VERSION("0.1.0");
+MODULE_AUTHOR("Bin Jin");
+MODULE_DESCRIPTION("Kernel-mode phantun-style fake-tcp tunnel");
+MODULE_VERSION(PACKAGE_VERSION);

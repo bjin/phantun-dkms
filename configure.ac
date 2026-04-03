@@ -1,5 +1,8 @@
 AC_PREREQ([2.69])
-AC_INIT([phantun], [0.1.0], [bjin@protonmail.com])
+
+m4_define([PHANTUN_VERSION], m4_esyscmd([sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' dkms.conf | tr -d '\n']))
+
+AC_INIT([phantun], PHANTUN_VERSION, [bjin@protonmail.com], [phantun], [https://github.com/bjin/phantun-dkms/])
 AC_CONFIG_HEADERS([config.h])
 
 AC_ARG_WITH([kernel],
