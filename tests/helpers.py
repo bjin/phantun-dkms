@@ -263,6 +263,27 @@ def make_netns_output_flag_probe(vm, namespace, rules):
     run_in_netns(vm, namespace, "\n".join(lines))
     return NetnsNftProbe(namespace, "inet", table_name, "output")
 
+def make_netns_ingress_drop_probe(vm, namespace, dev, rules):
+    table_name = f"phantun_in_drop_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table netdev {table_name} >/dev/null 2>&1 || true",
+        f"nft add table netdev {table_name}",
+        (
+            f"nft 'add chain netdev {table_name} ingress "
+            f"{{ type filter hook ingress device {dev} priority 0; policy accept; }}'"
+        ),
+    ]
+
+    for rule in rules:
+        lines.append(
+            f"nft 'add rule netdev {table_name} ingress "
+            f"ip saddr {rule['src_addr']} ip daddr {rule['dst_addr']} "
+            f"tcp sport {rule['src_port']} tcp dport {rule['dst_port']} "
+            f"counter drop comment \"{rule['comment']}\"'"
+        )
+
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsNftProbe(namespace, "netdev", table_name, "ingress")
 
 def payload_hex(payload):
     if isinstance(payload, str):

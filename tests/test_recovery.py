@@ -15,6 +15,7 @@ from helpers import (
     run_netns_scenario,
     spawn_netns_scenario,
     parse_guest_json,
+    make_netns_ingress_drop_probe,
     make_netns_ingress_flag_drop_probe,
     make_netns_output_flag_probe,
     read_module_stats,
@@ -29,6 +30,7 @@ def load_recovery_module(phantun_module, **kwargs):
         managed_local_ports=MANAGED_LOCAL_PORTS,
         keepalive_interval_sec=1,
         keepalive_misses=2,
+        handshake_retries=20,
         **kwargs,
     )
 
@@ -142,16 +144,50 @@ def test_liveness_timeout_recovers(phantun_module, vm):
                 "drop",
             ]
         )
+        vm.run(
+            [
+                "ip",
+                "netns",
+                "exec",
+                NS_A,
+                "nft",
+                "add",
+                "chain",
+                "inet",
+                "filter",
+                "input",
+                "{ type filter hook input priority 10; policy accept; }",
+            ]
+        )
+        vm.run(
+            [
+                "ip",
+                "netns",
+                "exec",
+                NS_A,
+                "nft",
+                "add",
+                "rule",
+                "inet",
+                "filter",
+                "input",
+                "drop",
+            ]
+        )
 
         time.sleep(4.5)
 
-        keepalive_packets = keepalive_probe.packets(vm, "keepalive_ack")
-        rst_packets = keepalive_probe.packets(vm, "liveness_rst")
-        if keepalive_packets <= baseline_keepalive:
-            pytest.fail("expected at least one keepalive ACK before liveness teardown")
-        if rst_packets != baseline_rst:
+        keepalive_packets = (
+            keepalive_probe.packets(vm, "keepalive_ack") - baseline_keepalive
+        )
+        rst_packets = keepalive_probe.packets(vm, "liveness_rst") - baseline_rst
+        if keepalive_packets == 0 or keepalive_packets > 3:
             pytest.fail(
-                f"expected silent liveness teardown without local RST, got {rst_packets - baseline_rst}"
+                f"expected 1-3 keepalive ACKs before liveness teardown, got {keepalive_packets}"
+            )
+        if rst_packets != 0:
+            pytest.fail(
+                f"expected silent liveness teardown without local RST, got {rst_packets}"
             )
 
         vm.run(["ip", "netns", "exec", NS_A, "nft", "flush", "ruleset"])
@@ -180,6 +216,83 @@ def test_liveness_timeout_recovers(phantun_module, vm):
     finally:
         if keepalive_probe is not None:
             keepalive_probe.cleanup(vm)
+        vm.run(["ip", "netns", "exec", NS_A, "nft", "flush", "ruleset"], check=False)
+
+
+def test_liveness_reinitiates_flow_with_queued_packet(phantun_module, vm):
+    load_recovery_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    probe_b = make_netns_ingress_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "comment": "drop all fake tcp",
+            }
+        ],
+    )
+    initial_stats = read_module_stats(vm)
+
+    # Spawn a client that will hang sending msg1 because it gets no replies
+    client = spawn_netns_scenario(
+        vm,
+        NS_A,
+        "echo_client",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payloads": ["msg1"],
+            "timeout_sec": 20,
+        },
+    )
+
+    try:
+        time.sleep(0.5)
+        stats_after_first_syn = read_module_stats(vm)
+        flows_created_1 = (
+            stats_after_first_syn["flows_created"] - initial_stats["flows_created"]
+        )
+        if flows_created_1 != 1:
+            pytest.fail(f"expected 1 flow created (1 initiator), got {flows_created_1}")
+
+        # The flow is created at t=0.
+        # Retransmits happen at t=1s, 2s, 3s, 4s...
+        # Liveness timeout happens at t=2s. When liveness timeout occurs, the queued UDP
+        # packet is reinjected, creating a new flow.
+        # Since VM time can drift or be delayed relative to host time, poll the stats
+        # for up to 10 seconds (20 iterations of 0.5s).
+        success = False
+        for _ in range(20):
+            time.sleep(0.5)
+            stats_after_liveness = read_module_stats(vm)
+            flows_created_2 = (
+                stats_after_liveness["flows_created"]
+                - stats_after_first_syn["flows_created"]
+            )
+            if flows_created_2 >= 2:
+                success = True
+                break
+
+        if not success:
+            pytest.fail(
+                f"expected flow to be re-initiated 2 times due to liveness, got {flows_created_2}"
+            )
+    finally:
+        probe_b.cleanup(vm)
         vm.run(["ip", "netns", "exec", NS_A, "nft", "flush", "ruleset"], check=False)
 
 
