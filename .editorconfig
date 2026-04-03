@@ -7,19 +7,19 @@ insert_final_newline = true
 trim_trailing_whitespace = true
 
 [*.c]
-indent_style = tab
-indent_size = 8
-tab_width = 8
+indent_style = space
+indent_size = 4
+tab_width = 4
 
 [*.h]
-indent_style = tab
-indent_size = 8
-tab_width = 8
+indent_style = space
+indent_size = 4
+tab_width = 4
 
 [Makefile]
 indent_style = tab
-indent_size = 8
-tab_width = 8
+indent_size = 4
+tab_width = 4
 
 [*.md]
 indent_style = space

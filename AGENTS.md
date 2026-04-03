@@ -38,7 +38,7 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 - Braces are structure, not text: if an edit emits `}`, prove the old `}` was removed, then re-read the surrounding block immediately.
 
 ## Coding style / safety
-- Kernel style: tabs, small static helpers, explicit return-value checks.
+- LLVM styles with 4 space tab width, small static helpers, explicit return-value checks.
 * Trailing whitespaces should by removed in C and Python code.
 - Do not sleep in hook/atomic paths; use `GFP_ATOMIC` there.
 - Prefer cached config/state in hot paths instead of reparsing strings.
