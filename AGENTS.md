@@ -10,7 +10,6 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 - `prepare-kernels.py`: CLI to download/verify Ubuntu mainline kernels for matrix testing
 - `DESIGN.md`: protocol/design notes
 - `TESTING.md`: detailed integration testing instructions
-- `PLAN.md`: implementation checklist
 
 ## Build
 - Bootstrap: `./autogen.sh`
