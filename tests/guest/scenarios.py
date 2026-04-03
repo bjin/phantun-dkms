@@ -7,9 +7,9 @@ import sys
 TIMEOUT_SEC = 5
 
 
-def _socket(bind_addr, bind_port):
+def _socket(bind_addr, bind_port, timeout=None):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(TIMEOUT_SEC)
+    sock.settimeout(timeout if timeout is not None else TIMEOUT_SEC)
     sock.bind((bind_addr, bind_port))
     return sock
 
@@ -19,7 +19,9 @@ def _emit(payload):
 
 
 def ping_server(config):
-    with _socket(config["bind_addr"], config["bind_port"]) as sock:
+    with _socket(
+        config["bind_addr"], config["bind_port"], config.get("timeout_sec")
+    ) as sock:
         data, addr = sock.recvfrom(2048)
         sock.sendto(config.get("reply", "pong").encode(), addr)
         _emit(
@@ -31,7 +33,9 @@ def ping_server(config):
 
 
 def ping_client(config):
-    with _socket(config["bind_addr"], config["bind_port"]) as sock:
+    with _socket(
+        config["bind_addr"], config["bind_port"], config.get("timeout_sec")
+    ) as sock:
         sock.sendto(
             config.get("payload", "ping").encode(),
             (config["target_addr"], config["target_port"]),
@@ -49,7 +53,9 @@ def echo_server(config):
     payloads = []
     target_count = config["count"]
 
-    with _socket(config["bind_addr"], config["bind_port"]) as sock:
+    with _socket(
+        config["bind_addr"], config["bind_port"], config.get("timeout_sec")
+    ) as sock:
         while len(payloads) < target_count:
             data, addr = sock.recvfrom(2048)
             text = data.decode()
@@ -63,7 +69,9 @@ def echo_client(config):
     payloads = config["payloads"]
     echoed = []
 
-    with _socket(config["bind_addr"], config["bind_port"]) as sock:
+    with _socket(
+        config["bind_addr"], config["bind_port"], config.get("timeout_sec")
+    ) as sock:
         for payload in payloads:
             sock.sendto(
                 payload.encode(), (config["target_addr"], config["target_port"])
@@ -80,7 +88,9 @@ def recv_many(config):
     received = []
     target_count = config["count"]
 
-    with _socket(config["bind_addr"], config["bind_port"]) as sock:
+    with _socket(
+        config["bind_addr"], config["bind_port"], config.get("timeout_sec")
+    ) as sock:
         while len(received) < target_count:
             data, addr = sock.recvfrom(2048)
             received.append(
@@ -97,7 +107,9 @@ def send_many(config):
     payloads = config["payloads"]
     delay_ms = config.get("delay_ms", 0)
 
-    with _socket(config["bind_addr"], config["bind_port"]) as sock:
+    with _socket(
+        config["bind_addr"], config["bind_port"], config.get("timeout_sec")
+    ) as sock:
         for payload in payloads:
             sock.sendto(
                 payload.encode(), (config["target_addr"], config["target_port"])
@@ -116,7 +128,9 @@ def recv_many_reply(config):
     reply_payloads = config.get("replies", [])
     target_count = config["count"]
 
-    with _socket(config["bind_addr"], config["bind_port"]) as sock:
+    with _socket(
+        config["bind_addr"], config["bind_port"], config.get("timeout_sec")
+    ) as sock:
         while len(received) < target_count:
             data, addr = sock.recvfrom(2048)
             message = data.decode()
@@ -146,7 +160,9 @@ def send_many_recv(config):
     replies = []
     delay_ms = config.get("delay_ms", 0)
 
-    with _socket(config["bind_addr"], config["bind_port"]) as sock:
+    with _socket(
+        config["bind_addr"], config["bind_port"], config.get("timeout_sec")
+    ) as sock:
         for payload in payloads:
             sock.sendto(
                 payload.encode(), (config["target_addr"], config["target_port"])

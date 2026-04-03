@@ -61,6 +61,11 @@ def test_liveness_timeout_recovers(phantun_module, vm):
             "bind_addr": NS_ADDR_B,
             "bind_port": dst_port,
             "count": 2,
+            # The test deliberately sleeps for 4.5s while nftables drops packets
+            # to trigger the module's 3s liveness timeout (1s interval * 2 misses).
+            # The default 5s socket timeout in the guest scenario runner is too tight
+            # and causes the server to crash before the second payload arrives.
+            "timeout_sec": 20,
         },
     )
     keepalive_probe = None
@@ -138,7 +143,7 @@ def test_liveness_timeout_recovers(phantun_module, vm):
             ]
         )
 
-        time.sleep(4)
+        time.sleep(4.5)
 
         keepalive_packets = keepalive_probe.packets(vm, "keepalive_ack")
         rst_packets = keepalive_probe.packets(vm, "liveness_rst")
@@ -319,7 +324,13 @@ def test_established_bare_syn_replacement(phantun_module, vm):
         vm,
         NS_B,
         "echo_server",
-        {"bind_addr": NS_ADDR_B, "bind_port": dst_port, "count": 2},
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+            # 4s sleep below for quarantine expiration requires higher socket timeout
+            "timeout_sec": 20,
+        },
     )
 
     try:
@@ -452,7 +463,13 @@ def test_replacement_quarantine_drops_delayed_old_generation_packet(phantun_modu
         vm,
         NS_B,
         "echo_server",
-        {"bind_addr": NS_ADDR_B, "bind_port": dst_port, "count": 2},
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+            # 4s sleep below for quarantine expiration requires higher socket timeout
+            "timeout_sec": 20,
+        },
     )
 
     try:
