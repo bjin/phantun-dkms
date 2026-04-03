@@ -26,3 +26,12 @@ __pycache__
 
 /kernels
 /.dkms_copy.tar
+
+# automake artifacts
+/autom4te.cache/
+/config.status
+/confdefs.h
+/Makefile
+/config.h.in
+/configure
+/config.h

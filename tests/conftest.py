@@ -261,13 +261,28 @@ def project_info():
     # Prepare tarball BEFORE VM starts because of COW filesystem.
     tar_path = proj_root / ".dkms_copy.tar"
     tar_path.unlink(missing_ok=True)
+    dkms_files = list(
+        filter(
+            None,
+            subprocess.check_output(
+                ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                cwd=proj_root,
+                text=True,
+            ).split("\0"),
+        )
+    )
+    extra_files = ["configure", "config.h.in"]
+    for file in extra_files:
+        if not (proj_root / file).exists():
+            pytest.exit("Please run ./autogen.sh first before running tests")
+    dkms_files.extend(extra_files)
+
     subprocess.run(
-        f"git ls-files -z --cached --others --exclude-standard | "
-        f"tar --null -c -T - -f {tar_path}",
+        ["tar", "--null", "-c", "-T", "-", "-f", str(tar_path)],
         cwd=proj_root,
-        shell=True,
+        input="\0".join(dkms_files),
+        text=True,
         check=True,
-        executable="/bin/bash",
     )
 
     return {"root": proj_root, "version": version, "tar_path": tar_path}
