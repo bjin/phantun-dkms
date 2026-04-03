@@ -13,6 +13,7 @@
 #include <net/route.h>
 #include <net/tcp.h>
 
+#include "phantun_compat.h"
 #include "phantun_packet.h"
 
 static int pht_parse_ipv4_l4(struct sk_buff *skb, u8 protocol, unsigned int min_l4_len, struct pht_l4_view *view)

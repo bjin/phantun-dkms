@@ -10,10 +10,6 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
-#ifndef HAVE_TIMER_CONTAINER_OF
-#define timer_container_of(var, callback_timer, timer_fieldname) from_timer(var, callback_timer, timer_fieldname)
-#endif
-
 #include "phantun.h"
 #include "phantun_packet.h"
 

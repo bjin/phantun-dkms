@@ -81,6 +81,56 @@ AS_IF([test "x$ac_cv_have_timer_container_of" = xyes], [
             [Define to 1 if timer_container_of is available])
 ])
 
+AC_CACHE_CHECK([whether ip_route_input takes DSCP], [ac_cv_have_ip_route_input_dscp], [
+  conftest_dir="$ac_pwd/conftest-kbuild-$$"
+
+  rm -rf "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to remove $conftest_dir])
+  mkdir -p "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to create $conftest_dir])
+
+  trap 'rm -rf "$conftest_dir"' 0 1 2 15
+
+  cat >"$conftest_dir/Makefile" <<'EOF'
+obj-m := conftest.o
+EOF
+
+  cat >"$conftest_dir/conftest.c" <<'EOF'
+#include <linux/module.h>
+#include <linux/skbuff.h>
+#include <linux/ip.h>
+#include <linux/netdevice.h>
+#include <net/ip.h>
+#include <net/route.h>
+
+static int conftest_ip_route_input_dscp(struct sk_buff *skb,
+                                        const struct iphdr *iph,
+                                        struct net_device *dev)
+{
+    return ip_route_input(skb, iph->daddr, iph->saddr, ip4h_dscp(iph), dev);
+}
+
+MODULE_LICENSE("GPL");
+EOF
+
+  if ${MAKE-make} -C "$KDIR" M="$conftest_dir" modules \
+      >"$conftest_dir/build.log" 2>&1; then
+    ac_cv_have_ip_route_input_dscp=yes
+  else
+    ac_cv_have_ip_route_input_dscp=no
+  fi
+
+  rm -rf "$conftest_dir"
+  trap - 0 1 2 15
+])
+
+AS_IF([test "x$ac_cv_have_ip_route_input_dscp" = xyes], [
+  AC_DEFINE(
+    [HAVE_IP_ROUTE_INPUT_DSCP], [1],
+    [Define to 1 if ip_route_input takes DSCP and works with ip4h_dscp()]
+  )
+])
+
 AC_CONFIG_FILES([Makefile])
 
 AC_OUTPUT

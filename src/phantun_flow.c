@@ -7,9 +7,10 @@
 #include <net/ip.h>
 #include <net/route.h>
 
+#include "phantun_compat.h"
 #include "phantun_flow.h"
-#include "phantun_stats.h"
 #include "phantun_packet.h"
+#include "phantun_stats.h"
 static u32 pht_flow_hash_key(const struct pht_flow_key *key)
 {
 	return jhash(key, sizeof(*key), 0) & (PHT_FLOW_BUCKETS - 1);
