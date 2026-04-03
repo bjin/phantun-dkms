@@ -35,7 +35,6 @@ def cleanup_kernel_dir(kernels_dir):
     if kernels_dir.exists():
         print(f"Cleaning up {kernels_dir} due to missing or corrupted files...")
         shutil.rmtree(kernels_dir)
-    kernels_dir.mkdir(parents=True, exist_ok=True)
 
 
 def prepare_ubuntu_kernel(version):
@@ -47,6 +46,7 @@ def prepare_ubuntu_kernel(version):
         return kernels_dir
 
     cleanup_kernel_dir(kernels_dir)
+    kernels_dir.mkdir(parents=True, exist_ok=True)
 
     base_url = f"https://kernel.ubuntu.com/mainline/{version}/amd64/"
     print(f"Fetching deb links from {base_url}...")
@@ -148,13 +148,8 @@ if __name__ == "__main__":
     prepared_versions = list_and_verify_kernels()
 
     if prepared_versions:
-        print("\n" + "=" * 40)
         print("Prepared Ubuntu Kernel Versions:")
         for v in prepared_versions:
-            print(f"  - {v}")
-        print("=" * 40)
-        print(
-            "You can now run tests against these using: pytest tests --kernel <version>"
-        )
+            print(f"- {v}")
     else:
         print("\nNo Ubuntu kernels are currently prepared.")
