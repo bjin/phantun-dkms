@@ -6,6 +6,7 @@ import urllib.request
 import re
 from pathlib import Path
 
+
 def check_kernel_files(kernels_dir):
     # Check for vmlinuz
     vmlinuz = list(kernels_dir.glob("boot/vmlinuz-*"))
@@ -14,7 +15,7 @@ def check_kernel_files(kernels_dir):
         return False
 
     # Check for Makefile in headers
-    kver = vmlinuz[0].name.replace('vmlinuz-', '')
+    kver = vmlinuz[0].name.replace("vmlinuz-", "")
     makefile = kernels_dir / "usr" / "src" / f"linux-headers-{kver}" / "Makefile"
     if not makefile.exists():
         print(f"Missing Makefile in {makefile.parent}")
@@ -22,17 +23,20 @@ def check_kernel_files(kernels_dir):
 
     return True
 
+
 def verify_kernel_dir(kernels_dir):
     extracted_flag = kernels_dir / ".extracted"
     if not extracted_flag.exists():
         return False
     return check_kernel_files(kernels_dir)
 
+
 def cleanup_kernel_dir(kernels_dir):
     if kernels_dir.exists():
         print(f"Cleaning up {kernels_dir} due to missing or corrupted files...")
         shutil.rmtree(kernels_dir)
     kernels_dir.mkdir(parents=True, exist_ok=True)
+
 
 def prepare_ubuntu_kernel(version):
     project_root = Path(__file__).parent
@@ -48,18 +52,23 @@ def prepare_ubuntu_kernel(version):
     print(f"Fetching deb links from {base_url}...")
     try:
         with urllib.request.urlopen(base_url) as response:
-            html = response.read().decode('utf-8')
+            html = response.read().decode("utf-8")
     except Exception as e:
         print(f"Error: Failed to fetch {base_url}: {e}")
         sys.exit(1)
 
     deb_links = re.findall(r'href="([^"]+\.deb)"', html)
-    debs_to_dl = [link for link in deb_links if any(x in link for x in ['linux-headers', 'linux-image', 'linux-modules'])]
+    debs_to_dl = [
+        link
+        for link in deb_links
+        if any(x in link for x in ["linux-headers", "linux-image", "linux-modules"])
+    ]
 
     if not debs_to_dl:
         print(f"Error: No relevant deb packages found for version {version}")
         sys.exit(1)
 
+    (kernels_dir / "usr" / "lib").mkdir(parents=True, exist_ok=True)
     (kernels_dir / "lib").symlink_to("usr/lib")
 
     for deb in debs_to_dl:
@@ -69,7 +78,11 @@ def prepare_ubuntu_kernel(version):
         urllib.request.urlretrieve(deb_url, deb_path)
 
         print(f"Extracting {deb}...")
-        subprocess.run(['dpkg-deb', '-x', str(deb_path), str(kernels_dir)], check=True)
+        subprocess.run(
+            f"dpkg-deb --fsys-tarfile {deb_path} | tar -x --keep-directory-symlink -C {kernels_dir}",
+            shell=True,
+            check=True,
+        )
         deb_path.unlink()
 
     # Fix the build symlink and verify
@@ -78,7 +91,7 @@ def prepare_ubuntu_kernel(version):
         print("Error: Extraction failed to produce vmlinuz")
         sys.exit(1)
 
-    kver = vmlinuz_paths[0].name.replace('vmlinuz-', '')
+    kver = vmlinuz_paths[0].name.replace("vmlinuz-", "")
     build_link = kernels_dir / "lib" / "modules" / kver / "build"
     headers_dir = kernels_dir / "usr" / "src" / f"linux-headers-{kver}"
 
@@ -98,6 +111,7 @@ def prepare_ubuntu_kernel(version):
         sys.exit(1)
 
     return kernels_dir
+
 
 def list_and_verify_kernels():
     project_root = Path(__file__).parent
@@ -122,6 +136,7 @@ def list_and_verify_kernels():
 
     return prepared
 
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         # Process specific versions
@@ -133,11 +148,13 @@ if __name__ == "__main__":
     prepared_versions = list_and_verify_kernels()
 
     if prepared_versions:
-        print("\n" + "="*40)
+        print("\n" + "=" * 40)
         print("Prepared Ubuntu Kernel Versions:")
         for v in prepared_versions:
             print(f"  - {v}")
-        print("="*40)
-        print("You can now run tests against these using: pytest tests --kernel <version>")
+        print("=" * 40)
+        print(
+            "You can now run tests against these using: pytest tests --kernel <version>"
+        )
     else:
         print("\nNo Ubuntu kernels are currently prepared.")
