@@ -536,14 +536,28 @@ static int phantun_reinject_inbound_payload(const struct pht_ipv4_endpoint_pair 
     return ret;
 }
 
-static void phantun_note_inbound_payload(struct pht_flow *flow, const struct pht_l4_view *view) {
+static void phantun_refresh_inbound_progress(struct pht_flow *flow, const struct pht_l4_view *view,
+                                             bool *allow_flush) {
+    u32 seq_end = ntohl(view->tcp->seq) + view->payload_len;
+
     spin_lock_bh(&flow->lock);
-    flow->ack = ntohl(view->tcp->seq) + view->payload_len;
+    /* Reserved shaping payloads can arrive after higher-sequence real data.
+     * Keep our advertised ACK monotonic when we silently drop that delayed
+     * control packet.
+     */
+    if (phantun_seq_after_eq(seq_end, flow->ack))
+        flow->ack = seq_end;
     flow->last_ack = flow->ack;
     flow->last_activity_jiffies = jiffies;
     flow->last_inbound_jiffies = jiffies;
     flow->keepalives_sent = 0;
+    if (allow_flush)
+        *allow_flush = !flow->response_pending_ack;
     spin_unlock_bh(&flow->lock);
+}
+
+static void phantun_note_inbound_payload(struct pht_flow *flow, const struct pht_l4_view *view) {
+    phantun_refresh_inbound_progress(flow, view, NULL);
 }
 
 static int phantun_finalize_established_rx(struct pht_flow *flow,
@@ -555,14 +569,7 @@ static int phantun_finalize_established_rx(struct pht_flow *flow,
     bool allow_flush;
     int ret = 0;
 
-    spin_lock_bh(&flow->lock);
-    flow->ack = ntohl(view->tcp->seq) + view->payload_len;
-    flow->last_ack = flow->ack;
-    flow->last_activity_jiffies = jiffies;
-    flow->last_inbound_jiffies = jiffies;
-    flow->keepalives_sent = 0;
-    allow_flush = !flow->response_pending_ack;
-    spin_unlock_bh(&flow->lock);
+    phantun_refresh_inbound_progress(flow, view, &allow_flush);
 
     if (reinject_payload) {
         ret = phantun_reinject_inbound_payload(ep, skb, view, dev);
@@ -590,6 +597,9 @@ static int phantun_confirm_outbound_udp_conntrack(struct sk_buff *skb) {
     if (!ct || ctinfo == IP_CT_UNTRACKED)
         return 0;
 
+    /* LOCAL_OUT conntrack must survive our NF_STOLEN verdict so translated
+     * inbound UDP replies can match ESTABLISHED host-firewall policy.
+     */
     verdict = nf_conntrack_confirm(skb);
     if (verdict != NF_ACCEPT)
         return verdict == NF_DROP ? -EINVAL : -EIO;

@@ -17,12 +17,13 @@ from helpers import (
     parse_guest_json,
     make_netns_ingress_drop_probe,
     make_netns_ingress_flag_drop_probe,
+    make_netns_ingress_payload_drop_probe,
     make_netns_output_flag_probe,
     read_module_stats,
 )
 
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
-
+REQ = "HSREQ42"
 
 def load_recovery_module(phantun_module, **kwargs):
     # Set keepalive interval to 1s to test liveness.
@@ -680,6 +681,130 @@ def test_replacement_quarantine_drops_delayed_old_generation_packet(phantun_modu
             ["ip", "netns", "exec", NS_B, "nft", "delete", "table", "inet", "filter"],
             check=False,
         )
+        cleanup_netns_topology(vm)
+
+def test_delayed_handshake_request_does_not_regress_ack(phantun_module, vm):
+    load_recovery_module(phantun_module, handshake_request=REQ)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    high_payload = "msg1"
+    syn_capture = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payload": "",
+            "timeout_sec": 10,
+        },
+    )
+    drop_request = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "src_port": src_port,
+                "dst_addr": NS_ADDR_B,
+                "dst_port": dst_port,
+                "payload": REQ,
+                "comment": "drop_delayed_req",
+            }
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "timeout_sec": 15,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": [high_payload],
+            },
+        )
+        syn_result = syn_capture.communicate(timeout=10)
+        assert_completed(syn_result, "capture initiator SYN")
+        syn_data = parse_guest_json(syn_result.stdout, "captured initiator SYN")
+        if (syn_data.get("flags", 0) & 0x02) == 0 or (syn_data.get("flags", 0) & 0x10) != 0:
+            pytest.fail(f"expected bare SYN, got {syn_data!r}")
+
+        server_result = server.communicate(timeout=15)
+        assert_completed(client_result, "delayed-request sender")
+        assert_completed(server_result, "delayed-request receiver")
+        server_data = parse_guest_json(server_result.stdout, "delayed-request server stdout")
+        if [entry["message"] for entry in server_data.get("received", [])] != [high_payload]:
+            pytest.fail(f"unexpected delivered payloads: {server_data!r}")
+        if drop_request.packets(vm, "drop_delayed_req") == 0:
+            pytest.fail("failed to drop the original reserved handshake_request")
+
+        expected_ack = syn_data["seq"] + 1 + len(REQ) + len(high_payload)
+        drop_request.cleanup(vm)
+        delayed_ack_capture = spawn_netns_scenario(
+            vm,
+            NS_A,
+            "capture_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "payload": "",
+                "timeout_sec": 10,
+            },
+        )
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack",
+                # Re-inject the reserved sequence after higher-sequence data to
+                # prove the responder keeps ACK monotonic across delayed shaping.
+                "seq": syn_data["seq"] + 1,
+                "ack": 1,
+                "payload": REQ,
+            },
+        )
+        delayed_ack_result = delayed_ack_capture.communicate(timeout=10)
+        assert_completed(delayed_ack_result, "capture delayed-request ACK")
+        delayed_ack_data = parse_guest_json(delayed_ack_result.stdout, "captured delayed-request ACK")
+        if delayed_ack_data.get("ack") != expected_ack:
+            pytest.fail(
+                "delayed reserved handshake_request moved the responder ACK backward; "
+                f"expected {expected_ack}, got {delayed_ack_data.get('ack')} in {delayed_ack_data!r}"
+            )
+    finally:
+        drop_request.cleanup(vm)
         cleanup_netns_topology(vm)
 
 
