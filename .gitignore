@@ -28,6 +28,7 @@ __pycache__
 /.dkms_copy.tar
 
 # automake artifacts
+*~
 /autom4te.cache/
 /config.status
 /confdefs.h
