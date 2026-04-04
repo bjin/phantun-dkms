@@ -25,6 +25,7 @@ from helpers import (
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
 REQ = "HSREQ42"
 
+
 def load_recovery_module(phantun_module, **kwargs):
     # Set keepalive interval to 1s to test liveness.
     phantun_module.load(
@@ -682,6 +683,7 @@ def test_replacement_quarantine_drops_delayed_old_generation_packet(phantun_modu
             check=False,
         )
         cleanup_netns_topology(vm)
+
 
 def test_delayed_handshake_request_does_not_regress_ack(phantun_module, vm):
     load_recovery_module(phantun_module, handshake_request=REQ)

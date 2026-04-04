@@ -9,11 +9,11 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/random.h>
 
-#include <net/netfilter/nf_conntrack.h>
-#include <net/netfilter/nf_conntrack_core.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <net/netfilter/nf_conntrack.h>
+#include <net/netfilter/nf_conntrack_core.h>
 
 #include "phantun.h"
 #include "phantun_flow.h"
@@ -607,7 +607,6 @@ static int phantun_confirm_outbound_udp_conntrack(struct sk_buff *skb) {
     return 0;
 }
 
-
 static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
                                       const struct nf_hook_state *state) {
     struct pht_l4_view view;
@@ -670,9 +669,7 @@ retry_lookup:
 
             ret = phantun_send_established_udp(flow, &ep, &view, skb, state->net);
             if (ret) {
-                pht_pr_warn("failed to emit fake-TCP payload "
-                            "for established flow: %d\n",
-                            ret);
+                pht_pr_warn("failed to emit fake-TCP payload for established flow: %d\n", ret);
                 phantun_send_flow_rst(flow, state->net);
                 pht_flow_remove(flow);
             }
@@ -953,8 +950,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             if (!phantun_tcp_syn_is_aligned(&view)) {
                 ret = phantun_send_rstack(state->net, &ep, &view, true);
                 if (ret)
-                    pht_pr_warn_rl("failed to emit RST|ACK for misaligned "
-                                   "colliding SYN: %d\n",
+                    pht_pr_warn_rl("failed to emit RST|ACK for misaligned colliding SYN: %d\n",
                                    ret);
                 pht_flow_put(flow);
                 return NF_DROP;
@@ -970,16 +966,14 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             }
 
             if (local_isn < peer_isn) {
-                pht_pr_info("collision on tuple; keeping "
-                            "initiator role\n");
+                pht_pr_info("collision on tuple; keeping initiator role\n");
                 pht_flow_touch_inbound(flow);
                 pht_stats_inc(PHT_STAT_COLLISIONS_WON);
                 pht_flow_put(flow);
                 return NF_DROP;
             }
 
-            pht_pr_info("collision on tuple; switching to "
-                        "responder role\n");
+            pht_pr_info("collision on tuple; switching to responder role\n");
             pht_stats_inc(PHT_STAT_COLLISIONS_LOST);
             queued_skb = pht_flow_take_queued_skb(flow);
             pht_flow_detach(flow);
@@ -1011,9 +1005,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
             ret = phantun_send_synack(new_flow, state->net);
             if (ret) {
-                pht_pr_warn("failed to emit SYN|ACK after "
-                            "collision handoff: %d\n",
-                            ret);
+                pht_pr_warn("failed to emit SYN|ACK after collision handoff: %d\n", ret);
                 pht_flow_remove(new_flow);
             }
             return NF_DROP;
@@ -1034,10 +1026,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             if (phantun_request_enabled()) {
                 ret = phantun_send_handshake_request(flow, state->net);
                 if (ret) {
-                    pht_pr_warn("failed to emit handshake "
-                                "request: "
-                                "%d\n",
-                                ret);
+                    pht_pr_warn("failed to emit handshake request: %d\n", ret);
                     pht_flow_remove(flow);
                     pht_flow_put(flow);
                     return NF_DROP;
@@ -1050,9 +1039,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             if (!ret && !had_queued && !phantun_request_enabled())
                 ret = phantun_send_idle_ack(flow, state->net);
             if (ret) {
-                pht_pr_warn("failed to finalize initiator "
-                            "open: %d\n",
-                            ret);
+                pht_pr_warn("failed to finalize initiator open: %d\n", ret);
                 pht_flow_remove(flow);
             }
             pht_flow_put(flow);
@@ -1111,9 +1098,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
                 ret = phantun_send_handshake_response(flow, state->net);
                 if (ret) {
-                    pht_pr_warn("failed to emit handshake "
-                                "response: %d\n",
-                                ret);
+                    pht_pr_warn("failed to emit handshake response: %d\n", ret);
                     pht_flow_remove(flow);
                     pht_flow_put(flow);
                     return NF_DROP;
@@ -1134,9 +1119,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
                                                       true, true);
                 if (ret) {
-                    pht_pr_warn("failed to process responder open payload: "
-                                "%d\n",
-                                ret);
+                    pht_pr_warn("failed to process responder open payload: %d\n", ret);
                     pht_flow_remove(flow);
                 }
                 pht_flow_put(flow);
@@ -1166,9 +1149,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
                                                   !drop_open_payload, true);
             if (ret) {
-                pht_pr_warn("failed to process responder open payload: "
-                            "%d\n",
-                            ret);
+                pht_pr_warn("failed to process responder open payload: %d\n", ret);
                 pht_flow_remove(flow);
             }
             pht_flow_put(flow);
@@ -1191,10 +1172,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 ntohl(view.tcp->seq) + 1 == flow->peer_syn_next) {
                 ret = phantun_send_idle_ack(flow, state->net);
                 if (ret)
-                    pht_pr_warn("failed to ACK duplicate "
-                                "current-generation "
-                                "SYN|ACK: %d\n",
-                                ret);
+                    pht_pr_warn("failed to ACK duplicate current-generation SYN|ACK: %d\n", ret);
                 pht_flow_put(flow);
                 return NF_DROP;
             }
@@ -1203,9 +1181,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                     ntohl(view.tcp->seq) + 1 == peer_syn_next) {
                     ret = phantun_send_synack(flow, state->net);
                     if (ret)
-                        pht_pr_warn("failed to re-emit "
-                                    "SYN|ACK for duplicate "
-                                    "established SYN: %d\n",
+                        pht_pr_warn("failed to re-emit SYN|ACK for duplicate established SYN: %d\n",
                                     ret);
                     pht_flow_put(flow);
                     return NF_DROP;
@@ -1217,8 +1193,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 quarantine_prev_remote_seq_end = flow->ack;
                 spin_unlock_bh(&flow->lock);
                 carry_quarantine = true;
-                pht_pr_info("received bare SYN on ESTABLISHED "
-                            "tuple, replacing generation\n");
+                pht_pr_info("received bare SYN on ESTABLISHED tuple, replacing generation\n");
                 queued_skb = pht_flow_take_queued_skb(flow);
                 if (queued_skb)
                     kfree_skb(queued_skb);
@@ -1273,9 +1248,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
                                               !drop_payload, true);
         if (ret) {
-            pht_pr_warn("failed to process established inbound "
-                        "payload: %d\n",
-                        ret);
+            pht_pr_warn("failed to process established inbound payload: %d\n", ret);
             pht_flow_remove(flow);
         }
         pht_flow_put(flow);
@@ -1365,9 +1338,7 @@ static int phantun_validate_config(void) {
 
     for (i = 0; i < managed_local_ports_count; i++) {
         if (!managed_local_ports[i] || managed_local_ports[i] > U16_MAX) {
-            pht_pr_err("managed_local_ports[%u] must be between 1 "
-                       "and 65535\n",
-                       i);
+            pht_pr_err("managed_local_ports[%u] must be between 1 and 65535\n", i);
             return -EINVAL;
         }
     }
@@ -1377,9 +1348,7 @@ static int phantun_validate_config(void) {
 
         ret = phantun_parse_managed_remote_peer(managed_remote_peers[i], &parsed_peer);
         if (ret) {
-            pht_pr_err("managed_remote_peers[%u] must be valid "
-                       "x.y.z.w:p\n",
-                       i);
+            pht_pr_err("managed_remote_peers[%u] must be valid x.y.z.w:p\n", i);
             return ret;
         }
     }
@@ -1556,8 +1525,8 @@ static int phantun_snapshot_config(void) {
 static void phantun_log_config(void) {
     unsigned int i;
 
-    pht_pr_info("loading with %u managed local port(s), %u managed remote "
-                "peer(s), handshake_timeout_ms=%u, handshake_retries=%u, "
+    pht_pr_info("loading with %u managed local port(s), %u managed remote peer(s), "
+                "handshake_timeout_ms=%u, handshake_retries=%u, "
                 "keepalive_interval_sec=%u, keepalive_misses=%u, "
                 "hard_idle_timeout_sec=%u, reopen_guard_bytes=%u\n",
                 phantun_cfg.managed_local_ports_count, phantun_cfg.managed_remote_peers_count,

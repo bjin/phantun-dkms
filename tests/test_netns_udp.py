@@ -36,7 +36,6 @@ def assert_completed(result, label):
 
 # Build small INPUT policies that mimic stateful host firewalls. The reply path
 # should survive on conntrack state alone when there is no explicit UDP allow.
-
 def make_netns_input_probe(vm, namespace, dst_port, allow_udp_dport):
     table_name = f"phantun_in_valid_{uuid.uuid4().hex[:8]}"
     run_in_netns(vm, namespace, ["nft", "delete", "table", "inet", table_name], check=False)
@@ -283,7 +282,6 @@ def test_netns_reinjected_udp_passes_conntrack_input_policy(phantun_module, vm):
 # This matches the real WireGuard host setup: replies must be admitted by
 # ESTABLISHED/RELATED state, not by a dedicated allow rule for the ephemeral
 # local listen port.
-
 def test_netns_reinjected_udp_is_established_without_explicit_port_allow(phantun_module, vm):
     load_netns_module(phantun_module)
     ensure_netns_topology(vm)
