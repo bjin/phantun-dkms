@@ -1,8 +1,11 @@
+import json
+import subprocess
 import time
 
 import pytest
 
 from helpers import (
+    GUEST_SCENARIOS,
     MODULE_STAT_NAMES,
     NS_A,
     NS_ADDR_A,
@@ -17,6 +20,7 @@ from helpers import (
     probe_comment,
     read_module_stats,
     run_netns_scenario,
+    spawn_guest_command,
     spawn_netns_scenario,
 )
 
@@ -28,6 +32,14 @@ RESP = "HSRESP42"
 def assert_completed(result, label):
     if result.returncode != 0:
         pytest.fail(f"{label} failed: {result.stderr!r}")
+
+
+def run_guest_scenario(vm, scenario, config, check=True, **kwargs):
+    return vm.run(["python3", GUEST_SCENARIOS, scenario, json.dumps(config)], check=check, **kwargs)
+
+
+def spawn_guest_scenario(vm, scenario, config, **kwargs):
+    return spawn_guest_command(vm, ["python3", GUEST_SCENARIOS, scenario, json.dumps(config)], **kwargs)
 
 
 def test_sysfs_stats_exist_and_increment(phantun_module, vm):
@@ -334,6 +346,67 @@ def test_intersection_mode_requires_local_and_remote_match(phantun_module, vm):
 
     finally:
         cleanup_netns_topology(vm)
+
+
+def test_loopback_localhost_udp_on_managed_port_is_ignored(phantun_module, vm):
+    managed_port = PORTS_A[0]
+    other_port = PORTS_B[0]
+
+    phantun_module.load(managed_local_ports=str(managed_port))
+    initial_stats = read_module_stats(vm)
+    server = spawn_guest_scenario(
+        vm,
+        "ping_server",
+        {
+            "bind_addr": "127.0.0.1",
+            "bind_port": other_port,
+        },
+    )
+    server_result = None
+
+    try:
+        time.sleep(0.2)
+        client = run_guest_scenario(
+            vm,
+            "ping_client",
+            {
+                "bind_addr": "127.0.0.1",
+                "bind_port": managed_port,
+                "target_addr": "127.0.0.1",
+                "target_port": other_port,
+                "payload": "loopback-localhost",
+            },
+            check=False,
+            timeout=10,
+        )
+        try:
+            server_result = server.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pytest.fail("loopback localhost server did not receive UDP on a managed_local_ports tuple")
+
+        assert_completed(client, "loopback localhost client")
+        assert_completed(server_result, "loopback localhost server")
+
+        client_data = parse_guest_json(client.stdout, "loopback localhost client stdout")
+        server_data = parse_guest_json(server_result.stdout, "loopback localhost server stdout")
+        if server_data.get("received") != "loopback-localhost":
+            pytest.fail(f"unexpected localhost server payload: {server_data!r}")
+        if client_data.get("reply") != "pong":
+            pytest.fail(f"unexpected localhost client reply: {client_data!r}")
+
+        stats = read_module_stats(vm)
+        if stats != initial_stats:
+            pytest.fail(
+                "localhost UDP between managed_local_ports and another localhost port must bypass phantun "
+                f"entirely; expected stats {initial_stats!r}, got {stats!r}"
+            )
+    finally:
+        if server_result is None and server.proc.poll() is None:
+            server.terminate()
+            try:
+                server.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pytest.fail("loopback localhost server did not exit after termination")
 
 
 def test_inbound_udp_to_managed_local_port_is_dropped(phantun_module, vm):

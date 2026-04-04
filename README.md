@@ -51,7 +51,7 @@ The most important differences are:
   - optional shaping payloads are best-effort hints here, not a required verified sub-protocol
 - Selector model instead of TUN endpoints
   - this module decides what it owns using `managed_local_ports` and/or `managed_remote_peers`
-  - raw inbound UDP matching those selectors is dropped by default
+  - raw inbound UDP matching those selectors is dropped by default on non-loopback ingress
 
 What stays the same comes from section 2 of `DESIGN.md`: this module deliberately carries forward the fake-TCP wire semantics from old Phantun's `fake-tcp` crate.
 
@@ -90,7 +90,7 @@ A basic mental model:
    - later local inbound firewall/delivery hooks still run
 
 5. Raw inbound UDP matching the selectors is dropped in `PRE_ROUTING`.
-   - this prevents ambiguous mixed delivery
+   - this prevents ambiguous mixed delivery on non-loopback ingress
    - module-reinjected UDP is not black-holed because reinjection happens after `PRE_ROUTING`
 
 ## Interception model
@@ -115,6 +115,15 @@ Selector modes:
 - Intersection mode
   - both are set
   - both must match
+
+Loopback-device exclusion:
+
+- selector ownership applies only to non-loopback traffic
+- outbound UDP routed to a loopback device is left as UDP
+- inbound fake TCP arriving from a loopback device is ignored by the module
+- raw inbound UDP arriving from a loopback device is not subject to the selector-matched drop rule
+
+This lets a local user-space Phantun process or any other localhost UDP/TCP traffic use `127.0.0.1` without fighting the kernel module.
 
 Important peer-only caveat:
 
@@ -232,8 +241,9 @@ You need to allow:
 
 You should expect:
 
-- raw inbound UDP matching the selectors is dropped in `PRE_ROUTING`
+- raw inbound UDP matching the selectors is dropped in `PRE_ROUTING` only for non-loopback ingress
 - module-reinjected UDP is exempt from that raw-wire drop path because it is injected after `PRE_ROUTING`
+- localhost traffic on loopback devices bypasses selector ownership entirely
 
 In practice:
 

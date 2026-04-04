@@ -5,6 +5,7 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/net_namespace.h>
+#include <linux/netdevice.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/random.h>
@@ -119,6 +120,26 @@ static void phantun_account_udp_queue_result(bool queued) {
         pht_stats_inc(PHT_STAT_UDP_PACKETS_QUEUED);
     else
         pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+}
+
+static bool phantun_dev_is_loopback(const struct net_device *dev) {
+    return dev && (dev->flags & IFF_LOOPBACK);
+}
+
+static bool phantun_local_out_uses_loopback_dev(const struct sk_buff *skb,
+                                                const struct nf_hook_state *state) {
+    const struct net_device *out_dev;
+
+    out_dev = state->out ? state->out : skb->dev;
+    return phantun_dev_is_loopback(out_dev);
+}
+
+static bool phantun_pre_routing_uses_loopback_dev(const struct sk_buff *skb,
+                                                  const struct nf_hook_state *state) {
+    const struct net_device *in_dev;
+
+    in_dev = state->in ? state->in : skb->dev;
+    return phantun_dev_is_loopback(in_dev);
 }
 
 static bool phantun_local_port_allowed(__be16 port) {
@@ -632,6 +653,9 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
     if (ret)
         return NF_ACCEPT;
 
+    if (phantun_local_out_uses_loopback_dev(skb, state))
+        return NF_ACCEPT;
+
     if (!phantun_selectors_allow(view.udp->source, view.iph->daddr, view.udp->dest))
         return NF_ACCEPT;
 
@@ -802,6 +826,9 @@ static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb
         return NF_ACCEPT;
     }
 
+    if (phantun_pre_routing_uses_loopback_dev(skb, state))
+        return NF_ACCEPT;
+
     ret = pht_parse_ipv4_udp(skb, &view);
     if (ret)
         return NF_ACCEPT;
@@ -838,6 +865,9 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     int ret;
 
     if (!state || !skb)
+        return NF_ACCEPT;
+
+    if (phantun_pre_routing_uses_loopback_dev(skb, state))
         return NF_ACCEPT;
 
     flows = phantun_net_flows(state->net);

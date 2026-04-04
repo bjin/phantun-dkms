@@ -139,6 +139,15 @@ Selector modes:
   - both the local-port selector and the exact-remote-peer selector must match
 
 
+Loopback-device exclusion:
+
+- selector ownership applies only to non-loopback traffic
+- outbound UDP routed to a loopback device is left as UDP
+- inbound fake TCP arriving from a loopback device is ignored by the module
+- raw inbound UDP arriving from a loopback device is not subject to the selector-matched drop rule
+
+This keeps localhost traffic available for other local components, including a user-space Phantun instance talking to `127.0.0.1`.
+
 Important consequence of peer-only mode:
 
 - inbound TCP ownership is broad: a listed `managed_remote_peers` entry claims inbound fake-TCP interception from that peer regardless of local destination port
@@ -147,12 +156,13 @@ This preserves the old fixed-port behavior when `managed_local_ports` alone is u
 
 ## 4.2 Default inbound raw-UDP drop
 
-By default, raw inbound UDP that matches the configured selectors is dropped instead of being delivered to the local UDP socket.
+By default, raw inbound UDP that matches the configured selectors and arrives from a non-loopback device is dropped instead of being delivered to the local UDP socket.
 
 Reason:
 
 - if a tuple is meant to be owned by the fake-TCP translator, letting raw inbound UDP for the same selector space arrive locally would create ambiguous mixed delivery
 - the drop rule keeps the ownership boundary honest: selector-matched inbound wire traffic is either fake-TCP handled by the module or raw UDP rejected by policy
+- loopback-device traffic is exempt so localhost applications can keep using those ports without interference
 
 The drop rule is implemented in inbound `PRE_ROUTING`, not `LOCAL_IN`.
 
@@ -451,6 +461,7 @@ Priority:
 Match policy for v1:
 
 - IPv4 UDP
+- skip packets whose routed egress device is loopback
 - if `managed_local_ports` is configured, the local source port must be in that list
 - if `managed_remote_peers` is configured, the outbound destination IPv4:UDP port must match one exact managed peer
 
@@ -481,6 +492,7 @@ Match policy for v1:
 
 - IPv4 TCP
 - tuple already exists in the flow table, or the packet is eligible to create a new responder flow under the selector policy
+- skip packets arriving on loopback devices
 - if `managed_local_ports` is configured, inbound destination port must be in that list for new responder creation
 - if `managed_remote_peers` is configured, inbound source IPv4:TCP port must match one exact managed peer for new responder creation
 
@@ -505,6 +517,7 @@ Priority:
 Match policy for v1:
 
 - IPv4 UDP
+- skip packets arriving on loopback devices
 - if `managed_local_ports` is configured, inbound destination port must be in that list
 - if `managed_remote_peers` is configured, inbound source IPv4:UDP port must match one exact managed peer
 
