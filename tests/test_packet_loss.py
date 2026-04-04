@@ -207,7 +207,7 @@ def test_synack_loss_is_retried(phantun_module, vm):
         cleanup_netns_topology(vm)
 
 
-def test_handshake_request_loss_drops_one_later_payload(phantun_module, vm):
+def test_handshake_request_loss_does_not_drop_later_payloads(phantun_module, vm):
     load_loss_module(phantun_module, handshake_request=REQ)
     ensure_netns_topology(vm)
 
@@ -239,7 +239,7 @@ def test_handshake_request_loss_drops_one_later_payload(phantun_module, vm):
         {
             "bind_addr": NS_ADDR_B,
             "bind_port": dst_port,
-            "count": 2,
+            "count": 3,
         },
     )
 
@@ -266,9 +266,9 @@ def test_handshake_request_loss_drops_one_later_payload(phantun_module, vm):
         assert_completed(server_result, "request-loss receiver")
 
         server_data = parse_guest_json(server_result.stdout, "request-loss server stdout")
-        if received_messages(server_data) != ["client-1", "client-2"]:
+        if received_messages(server_data) != ["client-0", "client-1", "client-2"]:
             pytest.fail(
-                "lost handshake_request should cause exactly one later payload drop; "
+                "lost handshake_request must not cause later higher-sequence payloads to be dropped; "
                 f"got {received_messages(server_data)!r}"
             )
     finally:
@@ -276,7 +276,7 @@ def test_handshake_request_loss_drops_one_later_payload(phantun_module, vm):
         cleanup_netns_topology(vm)
 
 
-def test_handshake_response_loss_drops_one_later_reply(phantun_module, vm):
+def test_handshake_response_loss_does_not_drop_later_replies(phantun_module, vm):
     load_loss_module(phantun_module, handshake_request=REQ, handshake_response=RESP)
     ensure_netns_topology(vm)
 
@@ -325,7 +325,7 @@ def test_handshake_response_loss_drops_one_later_reply(phantun_module, vm):
                 "target_addr": NS_ADDR_B,
                 "target_port": dst_port,
                 "payloads": ["client-0", "client-1", "client-2"],
-                "recv_count": 2,
+                "recv_count": 3,
                 "delay_ms": 400,
             },
             timeout=20,
@@ -341,9 +341,9 @@ def test_handshake_response_loss_drops_one_later_reply(phantun_module, vm):
         server_data = parse_guest_json(server_result.stdout, "response-loss server stdout")
         if received_messages(server_data) != ["client-0", "client-1", "client-2"]:
             pytest.fail(f"unexpected responder receive set after response loss: {received_messages(server_data)!r}")
-        if reply_messages(client_data) != ["reply-1", "reply-2"]:
+        if reply_messages(client_data) != ["reply-0", "reply-1", "reply-2"]:
             pytest.fail(
-                "lost handshake_response should cause exactly one later responder payload drop; "
+                "lost handshake_response must not cause later higher-sequence replies to be dropped; "
                 f"got {reply_messages(client_data)!r}"
             )
     finally:

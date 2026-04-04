@@ -56,8 +56,8 @@ For the kernel design, this becomes a best-effort shaping hint rather than a ver
 
 - `handshake_request` can optionally replace the initiator's first user payload
 - `handshake_response` can optionally replace the responder's first user payload, but only when `handshake_request` is also configured
-- when those hints are active, the matching first inbound payload is ignored locally and is never delivered to the UDP socket
-- loss, duplication, or absence of those payloads does not break flow establishment
+- when those hints are active, the matching first inbound payload is defined by the lowest payload sequence number reserved for that flow generation, not by arrival order
+- loss, duplication, delay, or absence of those payloads does not break flow establishment; later higher-sequence payloads may still proceed normally
 
 ### `xt_wgobfs`
 
@@ -172,12 +172,12 @@ Module parameters / config:
 
 Protocol rules:
 
-- if `handshake_request` is configured, the initiator sends it as the first fake-TCP payload
-- if `handshake_request` is configured, the responder ignores the first inbound payload it sees for that flow
+- if `handshake_request` is configured, the initiator sends it as the first fake-TCP payload, starting at initiator sequence `initiator_isn + 1`
+- if `handshake_request` is configured, the responder suppresses inbound payload whose starting sequence is `initiator_isn + 1`; a higher-sequence payload that arrives first is not reclassified as the ignored payload
 - if `handshake_request` is not configured, the initiator sends the first queued UDP packet as its first fake-TCP payload; if no queued packet exists, it sends a pure final `ACK`
-- if both `handshake_request` and `handshake_response` are configured, the responder sends `handshake_response` as its first fake-TCP payload and the initiator ignores the first inbound payload it sees for that flow
+- if both `handshake_request` and `handshake_response` are configured, the responder sends `handshake_response` as its first fake-TCP payload, starting at responder sequence `responder_isn + 1`, and the initiator suppresses inbound payload whose starting sequence is `responder_isn + 1`
 - if only `handshake_response` is configured, it has no effect
-- these payloads are best-effort shaping hints, not a verified handshake; missing, duplicated, or unexpected payloads do not trigger `RST` or teardown
+- these payloads are best-effort shaping hints, not a verified handshake; missing, duplicated, or delayed reserved sequence ranges do not trigger `RST` or teardown, and later higher-sequence payloads may still drive normal state
 
 Only payloads intentionally ignored by the shaping logic are kept away from the UDP socket.
 
@@ -203,9 +203,9 @@ Expected behaviors:
 
 - lost initiator `SYN`: initiator stays in `SYN_SENT`, retransmits `SYN` on each handshake timeout, and keeps at most one queued UDP skb until either a valid `SYN|ACK` arrives or the retry budget is exhausted
 - lost responder `SYN|ACK`: responder stays in `SYN_RCVD`; duplicate/retransmitted `SYN` and the responder retransmit timer both re-send `SYN|ACK` until a valid final `ACK` arrives or the retry budget is exhausted
-- lost `handshake_request`: flow establishment is not revoked; responder still applies the one-shot “ignore first inbound payload” rule, so the next inbound payload it sees is dropped once, and later payloads continue normally
-- lost `handshake_response`: flow establishment is not revoked; initiator still applies its one-shot “ignore first inbound responder payload” rule, so the next responder payload it sees is dropped once, and later responder payloads continue normally
-- duplicate or delayed optional shaping payloads never trigger `RST`; they only affect which payload is ignored once on the receiving side
+- lost `handshake_request`: flow establishment is not revoked; if the reserved initiator first-payload sequence never arrives, later higher-sequence initiator payloads are still deliverable, and a delayed copy of that reserved sequence is ignored if it arrives later
+- lost `handshake_response`: flow establishment is not revoked; if the reserved responder first-payload sequence never arrives, later higher-sequence responder payloads are still deliverable, and a delayed copy of that reserved sequence is ignored if it arrives later
+- duplicate or delayed optional shaping payloads never trigger `RST`; only the reserved lowest-sequence control-payload slot is ignored locally
 
 If retries are exhausted before the three-way handshake completes, the half-open flow is torn down and signaled with `RST`. Optional shaping-payload loss by itself must never be promoted into handshake failure.
 
@@ -308,8 +308,8 @@ Each flow contains:
 - receive acknowledgement number
 - last acknowledged value
 - one queued UDP skb pointer
-- one-shot first-inbound-payload ignore flag
-- responder control-response pending-ACK flag
+- reserved first-payload-sequence ignore slot
+- responder control-response pending-ACK / pending-release flag
 - retransmit timer state
 - idle timestamp
 - refcount + lock
@@ -339,7 +339,7 @@ On valid `SYN|ACK`:
 - set `ack = responder_seq + 1`
 - if `handshake_request` is configured, send `ACK + handshake_request`
 - otherwise, if a queued UDP skb exists, send it as the first fake-TCP payload; if none exists, send a pure final `ACK`
-- if both `handshake_request` and `handshake_response` are configured, arm a one-shot drop for the first responder payload
+- if both `handshake_request` and `handshake_response` are configured, arm an ignore slot for payload whose starting sequence is `responder_seq + 1`
 - transition immediately to `ESTABLISHED`
 
 ### `ESTABLISHED`
@@ -349,7 +349,7 @@ Entered as soon as the three-way handshake completes.
 Actions:
 
 - if `handshake_request` was configured, flush the initiator-owned queued UDP skb after the injected request packet
-- if the one-shot inbound ignore flag is armed, drop the first responder payload received and then clear the flag
+- if the responder first-payload ignore slot is armed, drop inbound payload only when its starting sequence matches the reserved `handshake_response` sequence; later higher-sequence responder payloads are delivered normally
 - from then on translate UDP <-> fake-TCP normally
 - inbound traffic handling prioritizes flag classification:
   - `RST`: destroy local state silently
@@ -389,9 +389,9 @@ Accepts while still half-open:
 On valid final `ACK`:
 
 - advance local `seq` to `responder_seq + 1`
-- if `handshake_request` is configured and the final `ACK` already carries payload, drop that payload immediately
-- if `handshake_request` is configured and the final `ACK` carries no payload, arm a one-shot drop for the first later inbound payload
-- if both `handshake_request` and `handshake_response` are configured, send `ACK + handshake_response`, advance `seq` by `handshake_response.len()`, and keep responder-owned queued UDP blocked until a later initiator `ACK` covers the end of that injected response
+- if `handshake_request` is configured and the final `ACK` already carries payload, suppress that payload immediately because it occupies the reserved initiator first-payload sequence
+- if `handshake_request` is configured and the final `ACK` carries no payload, arm an ignore slot for inbound payload whose starting sequence is `initiator_seq + 1`
+- if both `handshake_request` and `handshake_response` are configured, send `ACK + handshake_response`, advance `seq` by `handshake_response.len()`, and keep responder-owned queued UDP blocked until either a later initiator `ACK` covers the end of that injected response or later initiator traffic establishes that the reserved responder first-payload sequence was skipped
 - otherwise transition directly to `ESTABLISHED`; responder-owned queued UDP may flow immediately
 
 ### `ESTABLISHED`
@@ -399,7 +399,7 @@ On valid final `ACK`:
 After establishment:
 
 - outbound UDP becomes fake-TCP `ACK + payload`
-- incoming fake-TCP payload becomes local UDP unless the one-shot ignore flag is still armed; if it is armed, drop that first payload and clear the flag
+- incoming fake-TCP payload becomes local UDP unless the first-payload-sequence ignore slot is armed for that payload's starting sequence; the reserved control-sequence payload is dropped locally and later higher-sequence payloads are delivered normally
 - `seq` grows by payload length on send
 - `ack` tracks peer `seq + payload_len` on receive
 - inbound traffic handling prioritizes flag classification:
@@ -408,7 +408,7 @@ After establishment:
   - any other packet with `SYN` set: send `RST|ACK` and destroy local state
   - no `SYN`: normal established data processing
 - any valid inbound fake-TCP packet that is accepted for this flow, including pure `ACK`s and handshake-response acknowledgement traffic, refreshes liveness suspicion
-- if an injected responder `handshake_response` is still waiting for acknowledgement, local responder UDP is queued/dropped by the one-skb rule until a later initiator `ACK` covers the end of that injected response; inbound initiator traffic is still processed normally
+- if an injected responder `handshake_response` is still waiting for acknowledgement, local responder UDP is queued/dropped by the one-skb rule until either a later initiator `ACK` covers the injected response or later initiator traffic arrives and releases the queue while keeping the reserved ignore slot tied to responder sequence `responder_isn + 1`
 - if no valid inbound packet has been seen for `keepalive_interval_sec`, send a pure `ACK` keepalive
 - if no valid inbound packet has been seen for `keepalive_misses * keepalive_interval_sec`, destroy local state silently
   - if a queued outbound UDP skb already exists, immediately create a fresh `SYN_SENT` flow, carry one queued skb into it, and send `SYN`
@@ -604,7 +604,7 @@ It changes the contract in important ways:
 - no node-level client/server split
 - selector-based interception via optional `managed_local_ports` and `managed_remote_peers` lists
 - optional best-effort request/response first-payload shaping instead of mandatory verification
-- local dropping of the first inbound payload when shaping is enabled
+- local dropping of only the reserved first inbound payload sequence when shaping is enabled
 - default dropping of selector-matched raw inbound UDP
 - deterministic simultaneous-initiation collapse
 - no TUN topology

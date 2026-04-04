@@ -68,6 +68,7 @@ struct pht_flow {
     unsigned long quarantine_until_jiffies;
     unsigned int keepalives_sent;
     bool local_is_low;
+    u32 drop_next_rx_seq;
     bool drop_next_rx_payload;
     bool response_pending_ack;
     bool retransmit_armed;
