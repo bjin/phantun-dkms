@@ -1,6 +1,6 @@
 # phantun-dkms
 
-`phantun-dkms` is a Linux kernel module that runs a Phantun-style fake-TCP transport in kernel space.
+`phantun-dkms` is a Linux kernel module that runs a [Phantun](https://github.com/dndx/phantun.git)-style fake-TCP transport in kernel space.
 
 Its main goal is to let existing UDP applications, especially kernel WireGuard and `wireguard-go`, use fake TCP without a TUN device and without a separate user-space forwarding daemon.
 
@@ -58,7 +58,7 @@ What stays the same comes from section 2 of `DESIGN.md`: this module deliberatel
 Those carried-forward properties include:
 
 - strict 3-way handshake
-- responder only accepts `SYN` where `seq % 4095 == 0`
+- responder only accepts `SYN` where `seq` follows protocol
 - data rides in `ACK` packets carrying payload
 - TCP `seq` and `ack` still track payload bytes
 - no FIN-based close state machine
@@ -301,9 +301,7 @@ It is not a drop-in compatibility mode for legacy user-space Phantun because it 
 
 ### Concise operational examples
 
-#### Kernel WireGuard
-
-Typical case:
+Typical case (WireGuard):
 
 - WireGuard kernel module listens on UDP port `51820`
 - you want traffic for that local socket to use fake TCP
@@ -322,22 +320,24 @@ sudo modprobe phantun \
   managed_remote_peers=198.51.100.20:51820
 ```
 
-#### `wireguard-go`
+Alternatively, you could write options to `/etc/modprobe.d/phantun.conf`:
 
-`wireguard-go` still uses a normal UDP socket, so the interception model is the same.
-
-If `wireguard-go` binds local UDP port `51820`:
-
-```bash
-sudo modprobe phantun managed_local_ports=51820
 ```
-
-Or restrict it to one remote peer:
-
-```bash
-sudo modprobe phantun \
+options phantun \
   managed_local_ports=51820 \
   managed_remote_peers=198.51.100.20:51820
+```
+
+And then run:
+
+```bash
+sudo modprobe phantun
+```
+
+If you want to unload this module:
+
+```bash
+sudo rmmod phantun
 ```
 
 ## Build and test
