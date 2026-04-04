@@ -217,7 +217,7 @@ cat /sys/module/phantun/stats/rst_sent
 | `udp_packets_dropped` | Count of UDP packets dropped by module policy or queue-pressure behavior. This includes the raw inbound UDP drop path. |
 | `shaping_payloads_dropped` | Count of payloads intentionally dropped because shaping logic said they should not reach the UDP app. |
 
-## Operational notes from Phase 4
+## Operational notes
 
 ### Firewall policy changes
 
@@ -324,9 +324,16 @@ sudo modprobe phantun \
 
 ## Build and test
 
+Bootstrap:
+
+```bash
+./autogen.sh
+```
+
 Build:
 
 ```bash
+./configure
 make
 ```
 

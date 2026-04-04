@@ -85,9 +85,7 @@ class VM:
         self.ubuntu_kernel_dir = None
 
         if self.kernel_set_str == "host":
-            self.kernel_ver = subprocess.run(
-                ["uname", "-r"], capture_output=True, text=True, check=True
-            ).stdout.strip()
+            self.kernel_ver = subprocess.run(["uname", "-r"], capture_output=True, text=True, check=True).stdout.strip()
             # Default to host kernel by using -r without argument
             cmd.extend(["-r"])
         else:
@@ -112,9 +110,7 @@ class VM:
             cmd.extend(["-r", str(vmlinuz)])
 
             # Map host kernel modules directory to guest with a COW overlay so DKMS can install into updates/ without modifying host cache
-            host_mod_dir = str(
-                self.ubuntu_kernel_dir / "lib" / "modules" / self.kernel_ver
-            )
+            host_mod_dir = str(self.ubuntu_kernel_dir / "lib" / "modules" / self.kernel_ver)
             cmd.append(f"--overlay-rwdir=/lib/modules/{self.kernel_ver}={host_mod_dir}")
 
         self.proc = subprocess.Popen(
@@ -125,9 +121,7 @@ class VM:
         )
 
         # Get SSH cmd
-        res = subprocess.run(
-            ["vng", "--ssh-client", "--dry-run"], capture_output=True, text=True
-        )
+        res = subprocess.run(["vng", "--ssh-client", "--dry-run"], capture_output=True, text=True)
         if res.returncode != 0:
             raise Exception(f"Failed to get ssh client command: {res.stderr}")
         self.base_ssh_cmd = shlex.split(res.stdout.strip())
@@ -159,9 +153,7 @@ class VM:
 
             # Symlink compilers that Ubuntu kernel Makefile might explicitly ask for
             for ver in [12, 13, 14, 15, 16]:
-                self.run(
-                    ["ln", "-sf", "/usr/bin/gcc", f"/usr/bin/gcc-{ver}"], check=False
-                )
+                self.run(["ln", "-sf", "/usr/bin/gcc", f"/usr/bin/gcc-{ver}"], check=False)
                 self.run(
                     [
                         "ln",
@@ -336,9 +328,7 @@ class PhantunModule:
         opts_str = " ".join(opts)
 
         if opts_str:
-            self.vm.run(
-                f"echo 'options {self.mod_name} {opts_str}' > /etc/modprobe.d/phantun.conf"
-            )
+            self.vm.run(f"echo 'options {self.mod_name} {opts_str}' > /etc/modprobe.d/phantun.conf")
         else:
             self.vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
 

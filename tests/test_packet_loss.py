@@ -107,13 +107,9 @@ def test_syn_loss_is_retried(phantun_module, vm):
         client_data = parse_guest_json(client_result.stdout, "syn-loss client stdout")
         server_data = parse_guest_json(server_result.stdout, "syn-loss server stdout")
         if client_data.get("reply") != "pong":
-            pytest.fail(
-                f"unexpected client reply after SYN loss: {client_data.get('reply')!r}"
-            )
+            pytest.fail(f"unexpected client reply after SYN loss: {client_data.get('reply')!r}")
         if server_data.get("received") != "ping":
-            pytest.fail(
-                f"unexpected server payload after SYN loss: {server_data.get('received')!r}"
-            )
+            pytest.fail(f"unexpected server payload after SYN loss: {server_data.get('received')!r}")
     finally:
         probe.cleanup(vm)
         cleanup_netns_topology(vm)
@@ -193,30 +189,18 @@ def test_synack_loss_is_retried(phantun_module, vm):
         assert_completed(client_result, "synack-loss client")
         assert_completed(server_result, "synack-loss server")
 
-        client_data = parse_guest_json(
-            client_result.stdout, "synack-loss client stdout"
-        )
-        server_data = parse_guest_json(
-            server_result.stdout, "synack-loss server stdout"
-        )
+        client_data = parse_guest_json(client_result.stdout, "synack-loss client stdout")
+        server_data = parse_guest_json(server_result.stdout, "synack-loss server stdout")
         if client_data.get("reply") != "pong":
-            pytest.fail(
-                f"unexpected client reply after SYN|ACK loss: {client_data.get('reply')!r}"
-            )
+            pytest.fail(f"unexpected client reply after SYN|ACK loss: {client_data.get('reply')!r}")
         if server_data.get("received") != "ping":
-            pytest.fail(
-                f"unexpected server payload after SYN|ACK loss: {server_data.get('received')!r}"
-            )
+            pytest.fail(f"unexpected server payload after SYN|ACK loss: {server_data.get('received')!r}")
         if synack_probe.packets(vm, "sent_synack") <= baseline_synack + 1:
-            pytest.fail(
-                "expected responder to re-send SYN|ACK after initiator re-sent SYN"
-            )
+            pytest.fail("expected responder to re-send SYN|ACK after initiator re-sent SYN")
 
         final_stats = read_module_stats(vm)
         if final_stats["flows_created"] - initial_stats["flows_created"] != 2:
-            pytest.fail(
-                f"duplicate SYN after lost SYN|ACK should not create extra flows: {final_stats!r}"
-            )
+            pytest.fail(f"duplicate SYN after lost SYN|ACK should not create extra flows: {final_stats!r}")
     finally:
         probe.cleanup(vm)
         synack_probe.cleanup(vm)
@@ -281,9 +265,7 @@ def test_handshake_request_loss_drops_one_later_payload(phantun_module, vm):
         assert_completed(client_result, "request-loss sender")
         assert_completed(server_result, "request-loss receiver")
 
-        server_data = parse_guest_json(
-            server_result.stdout, "request-loss server stdout"
-        )
+        server_data = parse_guest_json(server_result.stdout, "request-loss server stdout")
         if received_messages(server_data) != ["client-1", "client-2"]:
             pytest.fail(
                 "lost handshake_request should cause exactly one later payload drop; "
@@ -355,16 +337,10 @@ def test_handshake_response_loss_drops_one_later_reply(phantun_module, vm):
         assert_completed(client_result, "response-loss client")
         assert_completed(server_result, "response-loss server")
 
-        client_data = parse_guest_json(
-            client_result.stdout, "response-loss client stdout"
-        )
-        server_data = parse_guest_json(
-            server_result.stdout, "response-loss server stdout"
-        )
+        client_data = parse_guest_json(client_result.stdout, "response-loss client stdout")
+        server_data = parse_guest_json(server_result.stdout, "response-loss server stdout")
         if received_messages(server_data) != ["client-0", "client-1", "client-2"]:
-            pytest.fail(
-                f"unexpected responder receive set after response loss: {received_messages(server_data)!r}"
-            )
+            pytest.fail(f"unexpected responder receive set after response loss: {received_messages(server_data)!r}")
         if reply_messages(client_data) != ["reply-1", "reply-2"]:
             pytest.fail(
                 "lost handshake_response should cause exactly one later responder payload drop; "
@@ -432,27 +408,17 @@ def test_duplicate_outbound_udp_while_half_open_queues_only_one_skb(phantun_modu
         assert_completed(client, "duplicate-half-open sender")
         assert_completed(server_result, "duplicate-half-open receiver")
 
-        server_data = parse_guest_json(
-            server_result.stdout, "duplicate-half-open server stdout"
-        )
+        server_data = parse_guest_json(server_result.stdout, "duplicate-half-open server stdout")
         if received_messages(server_data) != ["client-0"]:
-            pytest.fail(
-                f"expected only the first half-open payload to survive, got {received_messages(server_data)!r}"
-            )
+            pytest.fail(f"expected only the first half-open payload to survive, got {received_messages(server_data)!r}")
 
         final_stats = read_module_stats(vm)
         if final_stats["flows_created"] - initial_stats["flows_created"] != 2:
-            pytest.fail(
-                f"expected one initiator and one responder flow, got {final_stats!r}"
-            )
+            pytest.fail(f"expected one initiator and one responder flow, got {final_stats!r}")
         if final_stats["udp_packets_queued"] - initial_stats["udp_packets_queued"] != 1:
-            pytest.fail(
-                f"expected exactly one queued UDP packet while half-open, got {final_stats!r}"
-            )
+            pytest.fail(f"expected exactly one queued UDP packet while half-open, got {final_stats!r}")
         if final_stats["udp_packets_dropped"] <= initial_stats["udp_packets_dropped"]:
-            pytest.fail(
-                f"expected later duplicate UDP during half-open to be dropped, got {final_stats!r}"
-            )
+            pytest.fail(f"expected later duplicate UDP during half-open to be dropped, got {final_stats!r}")
     finally:
         probe.cleanup(vm)
         cleanup_netns_topology(vm)
@@ -546,9 +512,7 @@ def test_responder_reply_waits_for_ack_covering_handshake_response(phantun_modul
         assert_completed(delayed_sender_result, "delayed responder sender")
         time.sleep(0.5)
         if reply_probe.packets(vm, "queued_reply") != 0:
-            pytest.fail(
-                "responder data must stay queued until an initiator ACK covers handshake_response"
-            )
+            pytest.fail("responder data must stay queued until an initiator ACK covers handshake_response")
 
         drop_response.cleanup(vm)
         drop_client_payload.cleanup(vm)

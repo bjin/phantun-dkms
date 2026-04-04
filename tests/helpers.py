@@ -215,10 +215,7 @@ def make_netns_output_probe(vm, namespace, channels):
     lines = [
         f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
         f"nft add table inet {table_name}",
-        (
-            f"nft 'add chain inet {table_name} output "
-            "{ type filter hook output priority 0; policy accept; }'"
-        ),
+        (f"nft 'add chain inet {table_name} output " "{ type filter hook output priority 0; policy accept; }'"),
     ]
 
     for src_addr, src_port, dst_addr, dst_port in channels:
@@ -245,10 +242,7 @@ def make_netns_output_flag_probe(vm, namespace, rules):
     lines = [
         f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
         f"nft add table inet {table_name}",
-        (
-            f"nft 'add chain inet {table_name} output "
-            "{ type filter hook output priority 0; policy accept; }'"
-        ),
+        (f"nft 'add chain inet {table_name} output " "{ type filter hook output priority 0; policy accept; }'"),
     ]
 
     for rule in rules:
@@ -262,6 +256,7 @@ def make_netns_output_flag_probe(vm, namespace, rules):
 
     run_in_netns(vm, namespace, "\n".join(lines))
     return NetnsNftProbe(namespace, "inet", table_name, "output")
+
 
 def make_netns_ingress_drop_probe(vm, namespace, dev, rules):
     table_name = f"phantun_in_drop_{uuid.uuid4().hex[:8]}"
@@ -285,6 +280,7 @@ def make_netns_ingress_drop_probe(vm, namespace, dev, rules):
     run_in_netns(vm, namespace, "\n".join(lines))
     return NetnsNftProbe(namespace, "netdev", table_name, "ingress")
 
+
 def payload_hex(payload):
     if isinstance(payload, str):
         payload = payload.encode()
@@ -297,21 +293,11 @@ def make_netns_tcp_payload_probe(vm, namespace, payload_rules):
     lines = [
         f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
         f"nft add table inet {table_name}",
-        (
-            f"nft 'add chain inet {table_name} output "
-            "{ type filter hook output priority 0; policy accept; }'"
-        ),
+        (f"nft 'add chain inet {table_name} output " "{ type filter hook output priority 0; policy accept; }'"),
     ]
 
     for rule in payload_rules:
-        payload_bits = (
-            len(
-                rule["payload"].encode()
-                if isinstance(rule["payload"], str)
-                else rule["payload"]
-            )
-            * 8
-        )
+        payload_bits = len(rule["payload"].encode() if isinstance(rule["payload"], str) else rule["payload"]) * 8
         payload_value = payload_hex(rule["payload"])
         action = rule.get("action", "accept")
         lines.append(
@@ -362,14 +348,7 @@ def make_netns_ingress_payload_drop_probe(vm, namespace, device, rules):
     ]
 
     for rule in rules:
-        payload_bits = (
-            len(
-                rule["payload"].encode()
-                if isinstance(rule["payload"], str)
-                else rule["payload"]
-            )
-            * 8
-        )
+        payload_bits = len(rule["payload"].encode() if isinstance(rule["payload"], str) else rule["payload"]) * 8
         payload_value = payload_hex(rule["payload"])
         lines.append(
             f"nft 'add rule netdev {table_name} ingress "

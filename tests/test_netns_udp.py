@@ -41,12 +41,8 @@ def test_netns_ping_pong_uses_tcp_output_only(phantun_module, vm):
 
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
-    probe_a = make_netns_output_probe(
-        vm, NS_A, [(NS_ADDR_A, src_port, NS_ADDR_B, dst_port)]
-    )
-    probe_b = make_netns_output_probe(
-        vm, NS_B, [(NS_ADDR_B, dst_port, NS_ADDR_A, src_port)]
-    )
+    probe_a = make_netns_output_probe(vm, NS_A, [(NS_ADDR_A, src_port, NS_ADDR_B, dst_port)])
+    probe_b = make_netns_output_probe(vm, NS_B, [(NS_ADDR_B, dst_port, NS_ADDR_A, src_port)])
     server = spawn_netns_scenario(
         vm,
         NS_B,
@@ -81,39 +77,23 @@ def test_netns_ping_pong_uses_tcp_output_only(phantun_module, vm):
         client_data = parse_guest_json(client_result.stdout, "ping client stdout")
 
         if server_data.get("received") != "ping":
-            pytest.fail(
-                f"expected server to receive 'ping', got {server_data.get('received')!r}"
-            )
+            pytest.fail(f"expected server to receive 'ping', got {server_data.get('received')!r}")
         if server_data.get("peer") != [NS_ADDR_A, src_port]:
             pytest.fail(f"unexpected server peer: {server_data.get('peer')!r}")
         if client_data.get("reply") != "pong":
-            pytest.fail(
-                f"expected client to receive 'pong', got {client_data.get('reply')!r}"
-            )
+            pytest.fail(f"expected client to receive 'pong', got {client_data.get('reply')!r}")
         if client_data.get("peer") != [NS_ADDR_B, dst_port]:
             pytest.fail(f"unexpected client peer: {client_data.get('peer')!r}")
 
-        udp_a = probe_a.packets(
-            vm, probe_comment("udp", NS_ADDR_A, src_port, NS_ADDR_B, dst_port)
-        )
-        tcp_a = probe_a.packets(
-            vm, probe_comment("tcp", NS_ADDR_A, src_port, NS_ADDR_B, dst_port)
-        )
-        udp_b = probe_b.packets(
-            vm, probe_comment("udp", NS_ADDR_B, dst_port, NS_ADDR_A, src_port)
-        )
-        tcp_b = probe_b.packets(
-            vm, probe_comment("tcp", NS_ADDR_B, dst_port, NS_ADDR_A, src_port)
-        )
+        udp_a = probe_a.packets(vm, probe_comment("udp", NS_ADDR_A, src_port, NS_ADDR_B, dst_port))
+        tcp_a = probe_a.packets(vm, probe_comment("tcp", NS_ADDR_A, src_port, NS_ADDR_B, dst_port))
+        udp_b = probe_b.packets(vm, probe_comment("udp", NS_ADDR_B, dst_port, NS_ADDR_A, src_port))
+        tcp_b = probe_b.packets(vm, probe_comment("tcp", NS_ADDR_B, dst_port, NS_ADDR_A, src_port))
 
         if udp_a != 0 or udp_b != 0:
-            pytest.fail(
-                f"raw UDP escaped LOCAL_OUT in netns: ns_a={udp_a}, ns_b={udp_b}"
-            )
+            pytest.fail(f"raw UDP escaped LOCAL_OUT in netns: ns_a={udp_a}, ns_b={udp_b}")
         if tcp_a == 0 or tcp_b == 0:
-            pytest.fail(
-                f"expected translated TCP on both netns output paths, got ns_a={tcp_a}, ns_b={tcp_b}"
-            )
+            pytest.fail(f"expected translated TCP on both netns output paths, got ns_a={tcp_a}, ns_b={tcp_b}")
     finally:
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
@@ -165,9 +145,7 @@ def test_netns_echo_ten_packets(phantun_module, vm):
         echoed = sorted(client_data.get("echoed", []))
 
         if server_seen != expected:
-            pytest.fail(
-                f"server payload mismatch: expected {expected}, got {server_seen}"
-            )
+            pytest.fail(f"server payload mismatch: expected {expected}, got {server_seen}")
         if echoed != expected:
             pytest.fail(f"client echo mismatch: expected {expected}, got {echoed}")
     finally:
@@ -245,13 +223,10 @@ def test_netns_all_four_channels(phantun_module, vm):
         server_results = [server.communicate(timeout=15) for server in servers]
 
         assert_completed(client_result, "multi-channel client")
-        client_data = parse_guest_json(
-            client_result.stdout, "multi-channel client stdout"
-        )
+        client_data = parse_guest_json(client_result.stdout, "multi-channel client stdout")
 
         expected_channels = {
-            (entry["src_port"], entry["dst_port"]): entry["message"]
-            for entry in client_data.get("channels", [])
+            (entry["src_port"], entry["dst_port"]): entry["message"] for entry in client_data.get("channels", [])
         }
         if len(expected_channels) != 4:
             pytest.fail(f"expected 4 channel definitions, got {expected_channels!r}")
@@ -259,21 +234,15 @@ def test_netns_all_four_channels(phantun_module, vm):
         received = {}
         for index, result in enumerate(server_results):
             assert_completed(result, f"multi-channel server {index}")
-            server_data = parse_guest_json(
-                result.stdout, f"multi-channel server {index} stdout"
-            )
+            server_data = parse_guest_json(result.stdout, f"multi-channel server {index} stdout")
             for entry in server_data.get("received", []):
                 peer = entry.get("peer", [None, None])
                 received[(peer[1], server_data.get("port"))] = entry.get("message")
                 if peer[0] != NS_ADDR_A:
-                    pytest.fail(
-                        f"unexpected sender address for server port {server_data.get('port')}: {peer!r}"
-                    )
+                    pytest.fail(f"unexpected sender address for server port {server_data.get('port')}: {peer!r}")
 
         if received != expected_channels:
-            pytest.fail(
-                f"server channel mismatch: expected {expected_channels}, got {received}"
-            )
+            pytest.fail(f"server channel mismatch: expected {expected_channels}, got {received}")
 
         replies = {}
         for reply in client_data.get("replies", []):
@@ -281,13 +250,9 @@ def test_netns_all_four_channels(phantun_module, vm):
             key = (reply.get("local_port"), peer[1])
             replies[key] = reply.get("message")
             if peer[0] != NS_ADDR_B:
-                pytest.fail(
-                    f"unexpected reply address for local port {reply.get('local_port')}: {peer!r}"
-                )
+                pytest.fail(f"unexpected reply address for local port {reply.get('local_port')}: {peer!r}")
 
-        expected_replies = {
-            key: f"ack:{message}" for key, message in expected_channels.items()
-        }
+        expected_replies = {key: f"ack:{message}" for key, message in expected_channels.items()}
         if replies != expected_replies:
             pytest.fail(f"reply mismatch: expected {expected_replies}, got {replies}")
     finally:

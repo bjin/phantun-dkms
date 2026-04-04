@@ -96,13 +96,9 @@ def test_handshake_request_is_injected_and_hidden_from_udp_app(phantun_module, v
         assert_completed(client_result, "request-only sender")
         assert_completed(server_result, "request-only receiver")
 
-        server_data = parse_guest_json(
-            server_result.stdout, "request-only server stdout"
-        )
+        server_data = parse_guest_json(server_result.stdout, "request-only server stdout")
         if received_messages(server_data) != ["client-0", "client-1"]:
-            pytest.fail(
-                f"unexpected responder payloads: {received_messages(server_data)!r}"
-            )
+            pytest.fail(f"unexpected responder payloads: {received_messages(server_data)!r}")
         if REQ in received_messages(server_data):
             pytest.fail("handshake_request leaked to responder UDP app")
         if probe.packets(vm, "req_only") == 0:
@@ -112,9 +108,7 @@ def test_handshake_request_is_injected_and_hidden_from_udp_app(phantun_module, v
         cleanup_netns_topology(vm)
 
 
-def test_handshake_request_and_response_are_both_hidden_from_udp_apps(
-    phantun_module, vm
-):
+def test_handshake_request_and_response_are_both_hidden_from_udp_apps(phantun_module, vm):
     load_handshake_module(
         phantun_module,
         handshake_request=REQ,
@@ -192,33 +186,21 @@ def test_handshake_request_and_response_are_both_hidden_from_udp_apps(
         assert_completed(client_result, "request-response client")
         assert_completed(server_result, "request-response server")
 
-        server_data = parse_guest_json(
-            server_result.stdout, "request-response server stdout"
-        )
-        client_data = parse_guest_json(
-            client_result.stdout, "request-response client stdout"
-        )
+        server_data = parse_guest_json(server_result.stdout, "request-response server stdout")
+        client_data = parse_guest_json(client_result.stdout, "request-response client stdout")
 
         if received_messages(server_data) != ["client-0", "client-1"]:
-            pytest.fail(
-                f"unexpected responder payloads: {received_messages(server_data)!r}"
-            )
+            pytest.fail(f"unexpected responder payloads: {received_messages(server_data)!r}")
         if REQ in received_messages(server_data):
             pytest.fail("handshake_request leaked to responder UDP app")
         if reply_messages(client_data) != ["reply-0", "reply-1"]:
-            pytest.fail(
-                f"unexpected initiator replies: {reply_messages(client_data)!r}"
-            )
+            pytest.fail(f"unexpected initiator replies: {reply_messages(client_data)!r}")
         if RESP in reply_messages(client_data):
             pytest.fail("handshake_response leaked to initiator UDP app")
         if probe_a.packets(vm, "req_both") == 0:
-            pytest.fail(
-                "did not observe handshake_request on the initiator TCP output path"
-            )
+            pytest.fail("did not observe handshake_request on the initiator TCP output path")
         if probe_b.packets(vm, "resp_both") == 0:
-            pytest.fail(
-                "did not observe handshake_response on the responder TCP output path"
-            )
+            pytest.fail("did not observe handshake_response on the responder TCP output path")
     finally:
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
@@ -280,23 +262,15 @@ def test_handshake_response_without_request_is_disabled(phantun_module, vm):
         assert_completed(client_result, "response-only client")
         assert_completed(server_result, "response-only server")
 
-        server_data = parse_guest_json(
-            server_result.stdout, "response-only server stdout"
-        )
-        client_data = parse_guest_json(
-            client_result.stdout, "response-only client stdout"
-        )
+        server_data = parse_guest_json(server_result.stdout, "response-only server stdout")
+        client_data = parse_guest_json(client_result.stdout, "response-only client stdout")
 
         if server_data.get("received") != "ping":
-            pytest.fail(
-                f"unexpected responder payload: {server_data.get('received')!r}"
-            )
+            pytest.fail(f"unexpected responder payload: {server_data.get('received')!r}")
         if client_data.get("reply") != "pong":
             pytest.fail(f"unexpected initiator reply: {client_data.get('reply')!r}")
         if probe.packets(vm, "resp_disabled") != 0:
-            pytest.fail(
-                "handshake_response should not be emitted when handshake_request is unset"
-            )
+            pytest.fail("handshake_response should not be emitted when handshake_request is unset")
     finally:
         probe.cleanup(vm)
         cleanup_netns_topology(vm)

@@ -16,9 +16,7 @@ def test_module_load_success(phantun_module, dmesg, vm):
     if "phantun" not in res.stdout:
         pytest.fail("phantun module is not loaded in lsmod")
 
-    if not dmesg.wait_for(
-        r"registered IPv4 LOCAL_OUT and PRE_ROUTING hooks", timeout=5
-    ):
+    if not dmesg.wait_for(r"registered IPv4 LOCAL_OUT and PRE_ROUTING hooks", timeout=5):
         pytest.fail("Module did not log successful netfilter hook registration")
 
 
@@ -43,17 +41,13 @@ def test_module_unload_success(phantun_module, dmesg, vm):
 def test_module_reload_new_params(phantun_module, dmesg):
     """Test that the module can be reloaded with different parameters seamlessly."""
     phantun_module.load(managed_local_ports="1111")
-    if not dmesg.wait_for(
-        r"registered IPv4 LOCAL_OUT and PRE_ROUTING hooks", timeout=5
-    ):
+    if not dmesg.wait_for(r"registered IPv4 LOCAL_OUT and PRE_ROUTING hooks", timeout=5):
         pytest.fail("First load failed")
 
     # .load() automatically unloads before loading new options
     phantun_module.load(managed_local_ports="2222")
 
-    if not dmesg.wait_for(
-        r"registered IPv4 LOCAL_OUT and PRE_ROUTING hooks", timeout=5
-    ):
+    if not dmesg.wait_for(r"registered IPv4 LOCAL_OUT and PRE_ROUTING hooks", timeout=5):
         pytest.fail("Second load (reload) failed")
 
 
@@ -68,15 +62,11 @@ def test_module_rejects_too_large_reopen_guard(phantun_module, vm):
         if res.returncode == 0:
             pytest.fail("modprobe unexpectedly accepted oversized reopen_guard_bytes")
         if "Invalid argument" not in res.stderr:
-            pytest.fail(
-                f"unexpected modprobe stderr for oversized reopen_guard_bytes: {res.stderr!r}"
-            )
+            pytest.fail(f"unexpected modprobe stderr for oversized reopen_guard_bytes: {res.stderr!r}")
 
         lsmod = vm.run(["lsmod"])
         if "phantun" in lsmod.stdout:
-            pytest.fail(
-                "phantun module should not remain loaded after invalid reopen_guard_bytes"
-            )
+            pytest.fail("phantun module should not remain loaded after invalid reopen_guard_bytes")
     finally:
         vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
 
@@ -89,27 +79,19 @@ def test_module_rejects_missing_selectors(phantun_module, vm):
         if res.returncode == 0:
             pytest.fail("modprobe unexpectedly accepted missing selectors")
         if "Invalid argument" not in res.stderr:
-            pytest.fail(
-                f"unexpected modprobe stderr for missing selectors: {res.stderr!r}"
-            )
+            pytest.fail(f"unexpected modprobe stderr for missing selectors: {res.stderr!r}")
     finally:
         vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
 
 
 def test_module_rejects_malformed_managed_remote_peer(phantun_module, vm):
     phantun_module.unload()
-    vm.run(
-        "echo 'options phantun managed_remote_peers=not-a-peer' > /etc/modprobe.d/phantun.conf"
-    )
+    vm.run("echo 'options phantun managed_remote_peers=not-a-peer' > /etc/modprobe.d/phantun.conf")
     try:
         res = vm.run(["modprobe", "phantun"], check=False)
         if res.returncode == 0:
-            pytest.fail(
-                "modprobe unexpectedly accepted malformed managed_remote_peers entry"
-            )
+            pytest.fail("modprobe unexpectedly accepted malformed managed_remote_peers entry")
         if "Invalid argument" not in res.stderr:
-            pytest.fail(
-                f"unexpected modprobe stderr for malformed managed_remote_peers: {res.stderr!r}"
-            )
+            pytest.fail(f"unexpected modprobe stderr for malformed managed_remote_peers: {res.stderr!r}")
     finally:
         vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])

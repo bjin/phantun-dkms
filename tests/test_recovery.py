@@ -177,18 +177,12 @@ def test_liveness_timeout_recovers(phantun_module, vm):
 
         time.sleep(4.5)
 
-        keepalive_packets = (
-            keepalive_probe.packets(vm, "keepalive_ack") - baseline_keepalive
-        )
+        keepalive_packets = keepalive_probe.packets(vm, "keepalive_ack") - baseline_keepalive
         rst_packets = keepalive_probe.packets(vm, "liveness_rst") - baseline_rst
         if keepalive_packets == 0 or keepalive_packets > 3:
-            pytest.fail(
-                f"expected 1-3 keepalive ACKs before liveness teardown, got {keepalive_packets}"
-            )
+            pytest.fail(f"expected 1-3 keepalive ACKs before liveness teardown, got {keepalive_packets}")
         if rst_packets != 0:
-            pytest.fail(
-                f"expected silent liveness teardown without local RST, got {rst_packets}"
-            )
+            pytest.fail(f"expected silent liveness teardown without local RST, got {rst_packets}")
 
         vm.run(["ip", "netns", "exec", NS_A, "nft", "flush", "ruleset"])
 
@@ -210,9 +204,7 @@ def test_liveness_timeout_recovers(phantun_module, vm):
         assert_completed(server_result, "server")
         server_data = parse_guest_json(server_result.stdout, "server stdout")
         if received_messages(server_data) != ["msg1", "msg2"]:
-            pytest.fail(
-                f"unexpected messages received by server: {received_messages(server_data)!r}"
-            )
+            pytest.fail(f"unexpected messages received by server: {received_messages(server_data)!r}")
     finally:
         if keepalive_probe is not None:
             keepalive_probe.cleanup(vm)
@@ -263,9 +255,7 @@ def test_liveness_reinitiates_flow_with_queued_packet(phantun_module, vm):
     try:
         time.sleep(0.5)
         stats_after_first_syn = read_module_stats(vm)
-        flows_created_1 = (
-            stats_after_first_syn["flows_created"] - initial_stats["flows_created"]
-        )
+        flows_created_1 = stats_after_first_syn["flows_created"] - initial_stats["flows_created"]
         if flows_created_1 != 1:
             pytest.fail(f"expected 1 flow created (1 initiator), got {flows_created_1}")
 
@@ -279,18 +269,13 @@ def test_liveness_reinitiates_flow_with_queued_packet(phantun_module, vm):
         for _ in range(20):
             time.sleep(0.5)
             stats_after_liveness = read_module_stats(vm)
-            flows_created_2 = (
-                stats_after_liveness["flows_created"]
-                - stats_after_first_syn["flows_created"]
-            )
+            flows_created_2 = stats_after_liveness["flows_created"] - stats_after_first_syn["flows_created"]
             if flows_created_2 >= 2:
                 success = True
                 break
 
         if not success:
-            pytest.fail(
-                f"expected flow to be re-initiated 2 times due to liveness, got {flows_created_2}"
-            )
+            pytest.fail(f"expected flow to be re-initiated 2 times due to liveness, got {flows_created_2}")
     finally:
         probe_b.cleanup(vm)
         vm.run(["ip", "netns", "exec", NS_A, "nft", "flush", "ruleset"], check=False)
@@ -392,13 +377,9 @@ def test_syn_isn_tie_break(phantun_module, vm):
         lost_diff = final_stats["collisions_lost"] - initial_stats["collisions_lost"]
 
         if won_diff != 1:
-            pytest.fail(
-                f"expected exactly one collision win, got {won_diff} (stats {final_stats!r})"
-            )
+            pytest.fail(f"expected exactly one collision win, got {won_diff} (stats {final_stats!r})")
         if lost_diff != 1:
-            pytest.fail(
-                f"expected exactly one collision loss, got {lost_diff} (stats {final_stats!r})"
-            )
+            pytest.fail(f"expected exactly one collision loss, got {lost_diff} (stats {final_stats!r})")
     finally:
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
@@ -510,9 +491,7 @@ def test_established_bare_syn_replacement(phantun_module, vm):
         )
 
         time.sleep(4)
-        vm.run(
-            ["ip", "netns", "exec", NS_B, "nft", "delete", "table", "inet", "filter"]
-        )
+        vm.run(["ip", "netns", "exec", NS_B, "nft", "delete", "table", "inet", "filter"])
 
         client_result_2 = run_netns_scenario(
             vm,
@@ -650,9 +629,7 @@ def test_replacement_quarantine_drops_delayed_old_generation_packet(phantun_modu
             ]
         )
         time.sleep(4)
-        vm.run(
-            ["ip", "netns", "exec", NS_B, "nft", "delete", "table", "inet", "filter"]
-        )
+        vm.run(["ip", "netns", "exec", NS_B, "nft", "delete", "table", "inet", "filter"])
 
         client_result_2 = spawn_netns_scenario(
             vm,
@@ -688,21 +665,15 @@ def test_replacement_quarantine_drops_delayed_old_generation_packet(phantun_modu
         assert_completed(client_result_2, "client send 2")
         client_data = parse_guest_json(client_result_2.stdout, "client send 2 stdout")
         if client_data.get("echoed") != ["msg2"]:
-            pytest.fail(
-                f"stale packet escaped quarantine and confused the client: {client_data!r}"
-            )
+            pytest.fail(f"stale packet escaped quarantine and confused the client: {client_data!r}")
 
         server_result = server.communicate(timeout=15)
         assert_completed(server_result, "server")
         server_data = parse_guest_json(server_result.stdout, "server stdout")
         if received_messages(server_data) != ["msg1", "msg2"]:
-            pytest.fail(
-                f"stale packet escaped quarantine and reached UDP delivery: {received_messages(server_data)!r}"
-            )
+            pytest.fail(f"stale packet escaped quarantine and reached UDP delivery: {received_messages(server_data)!r}")
         if rst_probe.packets(vm, "quarantine_rst") != baseline_rst:
-            pytest.fail(
-                "stale old-generation packet should be dropped without emitting RST"
-            )
+            pytest.fail("stale old-generation packet should be dropped without emitting RST")
     finally:
         rst_probe.cleanup(vm)
         vm.run(
@@ -788,13 +759,9 @@ def test_established_invalid_syn_destroys_flow(phantun_module, vm):
         time.sleep(0.2)
 
         if invalid_probe.packets(vm, "invalid_rst") <= baseline_invalid_rst:
-            pytest.fail(
-                "expected RST|ACK in response to invalid established SYN packet"
-            )
+            pytest.fail("expected RST|ACK in response to invalid established SYN packet")
         if invalid_probe.packets(vm, "invalid_synack") != baseline_invalid_synack:
-            pytest.fail(
-                "invalid established SYN packet must not be accepted as replacement"
-            )
+            pytest.fail("invalid established SYN packet must not be accepted as replacement")
 
         res2 = run_netns_scenario(
             vm,
@@ -898,9 +865,7 @@ def test_unknown_synack_is_rejected_without_creating_flow(phantun_module, vm):
     assert_completed(server_result, "echo server after unknown synack")
     server_data = parse_guest_json(server_result.stdout, "echo server stdout")
     if received_messages(server_data) != ["msg1"]:
-        pytest.fail(
-            f"unexpected server messages after unknown synack: {received_messages(server_data)!r}"
-        )
+        pytest.fail(f"unexpected server messages after unknown synack: {received_messages(server_data)!r}")
 
 
 def test_unknown_ack_payload_is_rejected_with_rstack(phantun_module, vm):
@@ -974,6 +939,4 @@ def test_unknown_ack_payload_is_rejected_with_rstack(phantun_module, vm):
     assert_completed(server_result, "echo server after unknown ack payload")
     server_data = parse_guest_json(server_result.stdout, "echo server stdout")
     if received_messages(server_data) != ["msg1"]:
-        pytest.fail(
-            f"unexpected server messages after unknown ack payload: {received_messages(server_data)!r}"
-        )
+        pytest.fail(f"unexpected server messages after unknown ack payload: {received_messages(server_data)!r}")

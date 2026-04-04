@@ -123,6 +123,7 @@ Logs are automatically saved to `~/.cache/logs/phantun_tests/YYYYMMDD_HHMMSS/`.
    - `pytest tests/test_packet_loss.py -q`
    - `pytest tests/test_recovery.py::test_established_bare_syn_replacement -q -vv`
    - Expand to the broader regression suite once the focused case passes.
+
 11. **Control timing instead of hoping for it**
    - If a test requires specific events to cross in flight (e.g., simultaneous connection opens), do not rely on Python's sequential execution or small `time.sleep()` calls. The CPU scheduler will ruin your assumptions under load, causing flakiness.
    - Instead, enforce the timing in the data plane by adding latency with `tc netem`:
