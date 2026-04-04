@@ -12,8 +12,8 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
+#include <net/gso.h>
 #include <net/netns/generic.h>
-
 #include "phantun.h"
 #include "phantun_flow.h"
 #include "phantun_packet.h"
@@ -715,6 +715,46 @@ retry_lookup:
     return NF_STOLEN;
 }
 
+static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
+                                        const struct nf_hook_state *state);
+
+/* GRO can merge multiple fake-TCP packets into one skb before PRE_ROUTING.
+ * Our translator relies on per-packet boundaries, so segment managed TCP GSO
+ * skbs back into individual packets before running the state machine.
+ */
+static unsigned int phantun_pre_routing_segment_gso(void *priv, struct sk_buff *skb,
+                                                    const struct nf_hook_state *state) {
+    netdev_features_t features = NETIF_F_SG | NETIF_F_IP_CSUM;
+    struct sk_buff *segs;
+    struct sk_buff *seg;
+    struct sk_buff *next;
+    long err;
+
+    if (!skb_is_gso(skb) || !skb_is_gso_tcp(skb))
+        return NF_ACCEPT;
+
+    segs = __skb_gso_segment(skb, features, false);
+    if (IS_ERR_OR_NULL(segs)) {
+        err = IS_ERR(segs) ? PTR_ERR(segs) : -EINVAL;
+        pht_pr_warn("failed to segment inbound TCP GRO skb: %ld\n", err);
+        return NF_DROP;
+    }
+
+    consume_skb(skb);
+
+    skb_list_walk_safe(segs, seg, next) {
+        unsigned int verdict;
+
+        skb_mark_not_on_list(seg);
+        verdict = phantun_pre_routing(priv, seg, state);
+        if (verdict == NF_ACCEPT)
+            pht_pr_warn_rl("segmented inbound TCP packet unexpectedly escaped fake-TCP handler\n");
+        kfree_skb(seg);
+    }
+
+    return NF_STOLEN;
+}
+
 static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb,
                                                  const struct nf_hook_state *state) {
     struct pht_l4_view view;
@@ -771,6 +811,10 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
     if (!phantun_selectors_allow(view.tcp->dest, view.iph->saddr, view.tcp->source))
         return NF_ACCEPT;
+
+    ret = phantun_pre_routing_segment_gso(priv, skb, state);
+    if (ret != NF_ACCEPT)
+        return ret;
 
     phantun_fill_tcp_endpoint_pair(&view, &ep);
     in_dev = state->in ? state->in : skb->dev;
