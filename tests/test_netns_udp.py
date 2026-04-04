@@ -1,4 +1,5 @@
 import time
+import uuid
 
 import pytest
 
@@ -7,6 +8,7 @@ from helpers import (
     NS_ADDR_A,
     NS_ADDR_B,
     NS_B,
+    NetnsNftProbe,
     PORTS_A,
     PORTS_B,
     cleanup_netns_topology,
@@ -15,6 +17,7 @@ from helpers import (
     parse_guest_json,
     probe_comment,
     require_guest_command,
+    run_in_netns,
     run_netns_scenario,
     spawn_netns_scenario,
 )
@@ -29,6 +32,101 @@ def load_netns_module(phantun_module):
 def assert_completed(result, label):
     if result.returncode != 0:
         pytest.fail(f"{label} failed: {result.stderr!r}")
+
+
+def make_netns_input_invalid_drop_probe(vm, namespace, dst_port):
+    table_name = f"phantun_in_valid_{uuid.uuid4().hex[:8]}"
+    run_in_netns(vm, namespace, ["nft", "delete", "table", "inet", table_name], check=False)
+    run_in_netns(vm, namespace, ["nft", "add", "table", "inet", table_name])
+    run_in_netns(
+        vm,
+        namespace,
+        [
+            "nft",
+            "add",
+            "chain",
+            "inet",
+            table_name,
+            "input",
+            "{ type filter hook input priority 0; policy drop; }",
+        ],
+    )
+    run_in_netns(
+        vm,
+        namespace,
+        [
+            "nft",
+            "add",
+            "rule",
+            "inet",
+            table_name,
+            "input",
+            "iifname",
+            "lo",
+            "counter",
+            "accept",
+            "comment",
+            "loopback",
+        ],
+    )
+    run_in_netns(
+        vm,
+        namespace,
+        [
+            "nft",
+            "add",
+            "rule",
+            "inet",
+            table_name,
+            "input",
+            "ct",
+            "state",
+            "established,related",
+            "counter",
+            "accept",
+            "comment",
+            "established",
+        ],
+    )
+    run_in_netns(
+        vm,
+        namespace,
+        [
+            "nft",
+            "add",
+            "rule",
+            "inet",
+            table_name,
+            "input",
+            "ct",
+            "state",
+            "invalid",
+            "counter",
+            "drop",
+            "comment",
+            "invalid_drop",
+        ],
+    )
+    run_in_netns(
+        vm,
+        namespace,
+        [
+            "nft",
+            "add",
+            "rule",
+            "inet",
+            table_name,
+            "input",
+            "udp",
+            "dport",
+            str(dst_port),
+            "counter",
+            "accept",
+            "comment",
+            "udp_accept",
+        ],
+    )
+    return NetnsNftProbe(namespace, "inet", table_name, "input")
 
 
 def test_netns_ping_pong_uses_tcp_output_only(phantun_module, vm):
@@ -97,6 +195,64 @@ def test_netns_ping_pong_uses_tcp_output_only(phantun_module, vm):
     finally:
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_netns_reinjected_udp_passes_conntrack_input_policy(phantun_module, vm):
+    load_netns_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    input_probe = make_netns_input_invalid_drop_probe(vm, NS_B, dst_port)
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "ping_server",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "reply": "pong",
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payload": "ping",
+            },
+            timeout=10,
+        )
+        server_result = server.communicate(timeout=10)
+
+        assert_completed(client_result, "stateful firewall client")
+        assert_completed(server_result, "stateful firewall server")
+
+        server_data = parse_guest_json(server_result.stdout, "stateful firewall server stdout")
+        client_data = parse_guest_json(client_result.stdout, "stateful firewall client stdout")
+
+        if server_data.get("received") != "ping":
+            pytest.fail(f"expected server to receive 'ping', got {server_data.get('received')!r}")
+        if client_data.get("reply") != "pong":
+            pytest.fail(f"expected client to receive 'pong', got {client_data.get('reply')!r}")
+        if input_probe.packets(vm, "invalid_drop") != 0:
+            pytest.fail("reinjected UDP must not hit ct state invalid input policy")
+        if input_probe.packets(vm, "udp_accept") == 0:
+            pytest.fail("reinjected UDP did not traverse the input accept rule")
+    finally:
+        input_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 

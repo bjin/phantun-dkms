@@ -17,6 +17,7 @@
 #define PHANTUN_DEFAULT_REOPEN_GUARD_BYTES 4194304U
 #define PHANTUN_REPLACEMENT_QUARANTINE_MS 1000U
 #define PHANTUN_CAPTURE_PRIORITY (-400)
+#define PHANTUN_REINJECT_MARK 0x50485455U
 
 #define pht_pr_err(fmt, ...) pr_err(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
 #define pht_pr_warn(fmt, ...) pr_warn(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)

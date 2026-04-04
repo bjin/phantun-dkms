@@ -763,6 +763,11 @@ static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb
     if (!state || !skb)
         return NF_ACCEPT;
 
+    if (skb->mark == PHANTUN_REINJECT_MARK) {
+        skb->mark = 0;
+        return NF_ACCEPT;
+    }
+
     ret = pht_parse_ipv4_udp(skb, &view);
     if (ret)
         return NF_ACCEPT;

@@ -13,6 +13,7 @@
 #include <net/route.h>
 #include <net/tcp.h>
 
+#include "phantun.h"
 #include "phantun_packet.h"
 
 static int pht_parse_ipv4_l4(struct sk_buff *skb, u8 protocol, unsigned int min_l4_len,
@@ -325,27 +326,25 @@ int pht_emit_fake_tcp_v4(struct net *net, const struct pht_ipv4_endpoint_pair *e
 }
 
 int pht_reinject_udp_v4(struct sk_buff *skb, struct net_device *dev) {
-    const struct iphdr *iph;
-    enum skb_drop_reason reason;
+    int ret;
 
     if (!skb || !dev) {
         kfree_skb(skb);
         return -EINVAL;
     }
 
+    /* Re-enter through ingress so conntrack and LOCAL_IN firewall policy see
+     * the packet exactly as a real receive. The PRE_ROUTING UDP drop hook
+     * clears PHANTUN_REINJECT_MARK and skips re-capturing this skb.
+     */
+    skb->mark = PHANTUN_REINJECT_MARK;
     skb->dev = dev;
     skb->skb_iif = dev->ifindex;
     skb->pkt_type = PACKET_HOST;
     skb->protocol = htons(ETH_P_IP);
 
-    iph = ip_hdr(skb);
-    reason = ip_route_input(skb, iph->daddr, iph->saddr, ip4h_dscp(iph), dev);
-    if (reason) {
-        kfree_skb(skb);
-        return -EINVAL;
-    }
-
-    return dst_input(skb);
+    ret = netif_rx(skb);
+    return ret == NET_RX_DROP ? -ENOBUFS : 0;
 }
 
 int pht_reinject_udp_payload_v4(struct net_device *dev, const struct pht_ipv4_endpoint_pair *ep,
