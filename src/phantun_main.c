@@ -1025,7 +1025,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
                 ret = phantun_send_handshake_response(flow, state->net);
                 if (ret) {
-                    pht_pr_warn("failed to emit handshake ",
+                    pht_pr_warn("failed to emit handshake "
                                 "response: %d\n",
                                 ret);
                     pht_flow_remove(flow);
@@ -1048,7 +1048,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
                                                       true, true);
                 if (ret) {
-                    pht_pr_warn("failed to process responder open payload: ",
+                    pht_pr_warn("failed to process responder open payload: "
                                 "%d\n",
                                 ret);
                     pht_flow_remove(flow);
@@ -1080,7 +1080,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
                                                   !drop_open_payload, true);
             if (ret) {
-                pht_pr_warn("failed to process responder open payload: ",
+                pht_pr_warn("failed to process responder open payload: "
                             "%d\n",
                             ret);
                 pht_flow_remove(flow);
