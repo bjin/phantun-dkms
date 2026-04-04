@@ -351,6 +351,74 @@ def test_handshake_response_loss_drops_one_later_reply(phantun_module, vm):
         cleanup_netns_topology(vm)
 
 
+def test_lost_handshake_request_with_response_enabled_does_not_trigger_rstack(phantun_module, vm):
+    load_loss_module(phantun_module, handshake_request=REQ, handshake_response=RESP)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    drop_request = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "src_port": src_port,
+                "dst_addr": NS_ADDR_B,
+                "dst_port": dst_port,
+                "payload": REQ,
+                "comment": "drop_req_with_resp",
+            }
+        ],
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "bad_followup_rst",
+            }
+        ],
+    )
+
+    try:
+        baseline_bad_followup_rst = rst_probe.packets(vm, "bad_followup_rst")
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["client-0"],
+            },
+        )
+        assert_completed(client_result, "response-enabled request-loss sender")
+        time.sleep(0.5)
+
+        if rst_probe.packets(vm, "bad_followup_rst") != baseline_bad_followup_rst:
+            pytest.fail(
+                "lost handshake_request with handshake_response enabled must not turn the "
+                "next initiator payload into a bad final ACK reset"
+            )
+    finally:
+        drop_request.cleanup(vm)
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
 def test_duplicate_outbound_udp_while_half_open_queues_only_one_skb(phantun_module, vm):
     load_loss_module(phantun_module)
     ensure_netns_topology(vm)

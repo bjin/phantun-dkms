@@ -783,6 +783,88 @@ def test_established_invalid_syn_destroys_flow(phantun_module, vm):
         invalid_probe.cleanup(vm)
 
 
+def test_bad_final_ack_payload_is_rejected_with_rstack(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    drop_synack = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "drop_half_open_synack",
+            }
+        ],
+    )
+    invalid_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "bad_final_rst",
+            }
+        ],
+    )
+
+    try:
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn",
+                "seq": 4095,
+            },
+        )
+        time.sleep(0.2)
+        baseline_bad_final_rst = invalid_probe.packets(vm, "bad_final_rst")
+
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack",
+                "seq": 4096,
+                "ack": 0,
+                "payload": "junk",
+            },
+        )
+        time.sleep(0.2)
+
+        if invalid_probe.packets(vm, "bad_final_rst") <= baseline_bad_final_rst:
+            pytest.fail("expected RST|ACK for payload-bearing final ACK with wrong ack number")
+    finally:
+        drop_synack.cleanup(vm)
+        invalid_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
 def test_unknown_synack_is_rejected_without_creating_flow(phantun_module, vm):
     phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)

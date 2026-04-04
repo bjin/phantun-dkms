@@ -960,13 +960,6 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                     pht_flow_put(flow);
                     return NF_DROP;
                 }
-                if (phantun_response_enabled()) {
-                    spin_lock_bh(&flow->lock);
-                    flow->ack += phantun_cfg.handshake_response_len;
-                    flow->peer_syn_next = flow->ack;
-                    flow->last_ack = flow->ack;
-                    spin_unlock_bh(&flow->lock);
-                }
             }
 
             pht_flow_touch_inbound(flow);
@@ -1084,7 +1077,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     }
 
     if (state_now == PHT_FLOW_STATE_ESTABLISHED) {
-        bool response_acked = false;
+        bool response_unblocked = false;
         bool drop_payload = false;
 
         if (phantun_flow_should_drop_quarantined_packet(flow, &view)) {
@@ -1141,10 +1134,19 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         }
 
         spin_lock_bh(&flow->lock);
-        if (flow->response_pending_ack && view.tcp->ack &&
-            ntohl(view.tcp->ack_seq) >= flow->local_isn + 1 + phantun_cfg.handshake_response_len) {
-            flow->response_pending_ack = false;
-            response_acked = true;
+        if (flow->response_pending_ack) {
+            if (view.tcp->ack &&
+                ntohl(view.tcp->ack_seq) >= flow->local_isn + 1 + phantun_cfg.handshake_response_len) {
+                flow->response_pending_ack = false;
+                response_unblocked = true;
+            } else if (view.payload_len > 0) {
+                /* A lost handshake_response can never be ACKed directly.
+                 * Once later initiator data arrives, release queued
+                 * responder data and let the initiator's one-shot drop
+                 * consume the first responder payload it sees. */
+                flow->response_pending_ack = false;
+                response_unblocked = true;
+            }
         }
         if (view.payload_len && flow->drop_next_rx_payload) {
             drop_payload = true;
@@ -1154,12 +1156,10 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
         if (view.payload_len == 0) {
             pht_flow_touch_inbound(flow);
-            if (response_acked) {
+            if (response_unblocked) {
                 ret = phantun_flush_queued_udp(flow, state->net);
                 if (ret) {
-                    pht_pr_warn("failed to flush responder "
-                                "queue: %d\n",
-                                ret);
+                    pht_pr_warn("failed to flush responder queue: %d\n", ret);
                     pht_flow_remove(flow);
                 }
             }
