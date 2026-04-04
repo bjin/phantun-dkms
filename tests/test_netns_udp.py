@@ -34,7 +34,7 @@ def assert_completed(result, label):
         pytest.fail(f"{label} failed: {result.stderr!r}")
 
 
-def make_netns_input_invalid_drop_probe(vm, namespace, dst_port):
+def make_netns_input_probe(vm, namespace, dst_port, allow_udp_dport):
     table_name = f"phantun_in_valid_{uuid.uuid4().hex[:8]}"
     run_in_netns(vm, namespace, ["nft", "delete", "table", "inet", table_name], check=False)
     run_in_netns(vm, namespace, ["nft", "add", "table", "inet", table_name])
@@ -107,6 +107,26 @@ def make_netns_input_invalid_drop_probe(vm, namespace, dst_port):
             "invalid_drop",
         ],
     )
+    if allow_udp_dport:
+        run_in_netns(
+            vm,
+            namespace,
+            [
+                "nft",
+                "add",
+                "rule",
+                "inet",
+                table_name,
+                "input",
+                "udp",
+                "dport",
+                str(dst_port),
+                "counter",
+                "accept",
+                "comment",
+                "udp_accept",
+            ],
+        )
     run_in_netns(
         vm,
         namespace,
@@ -117,16 +137,17 @@ def make_netns_input_invalid_drop_probe(vm, namespace, dst_port):
             "inet",
             table_name,
             "input",
-            "udp",
-            "dport",
-            str(dst_port),
             "counter",
-            "accept",
+            "drop",
             "comment",
-            "udp_accept",
+            "final_drop",
         ],
     )
     return NetnsNftProbe(namespace, "inet", table_name, "input")
+
+
+def make_netns_input_invalid_drop_probe(vm, namespace, dst_port):
+    return make_netns_input_probe(vm, namespace, dst_port, allow_udp_dport=True)
 
 
 def test_netns_ping_pong_uses_tcp_output_only(phantun_module, vm):
@@ -251,6 +272,72 @@ def test_netns_reinjected_udp_passes_conntrack_input_policy(phantun_module, vm):
             pytest.fail("reinjected UDP must not hit ct state invalid input policy")
         if input_probe.packets(vm, "udp_accept") == 0:
             pytest.fail("reinjected UDP did not traverse the input accept rule")
+    finally:
+        input_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_netns_reinjected_udp_is_established_without_explicit_port_allow(phantun_module, vm):
+    load_netns_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    input_probe = make_netns_input_probe(vm, NS_A, src_port, allow_udp_dport=False)
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "ping_server",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "reply": "pong",
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payload": "ping",
+            },
+            check=False,
+            timeout=10,
+        )
+        server_result = server.communicate(timeout=10)
+
+        if client_result.returncode == 0:
+            assert_completed(server_result, "established-only firewall server")
+            client_data = parse_guest_json(client_result.stdout, "established-only firewall client stdout")
+            server_data = parse_guest_json(server_result.stdout, "established-only firewall server stdout")
+            if client_data.get("reply") != "pong":
+                pytest.fail(f"expected client to receive 'pong', got {client_data.get('reply')!r}")
+            if server_data.get("received") != "ping":
+                pytest.fail(f"expected server to receive 'ping', got {server_data.get('received')!r}")
+        else:
+            if server_result.returncode != 0:
+                pytest.fail(f"established-only firewall server failed: {server_result.stderr!r}")
+
+        if input_probe.packets(vm, "established") == 0:
+            pytest.fail(
+                "translated UDP reply must enter INPUT as established/related even when the original UDP send "
+                "was stolen in LOCAL_OUT"
+            )
+        if input_probe.packets(vm, "invalid_drop") != 0:
+            pytest.fail("translated UDP reply incorrectly hit ct state invalid")
+        if input_probe.packets(vm, "final_drop") != 0:
+            pytest.fail("translated UDP reply fell through to the default input drop rule")
     finally:
         input_probe.cleanup(vm)
         cleanup_netns_topology(vm)

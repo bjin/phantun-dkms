@@ -8,6 +8,9 @@
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/random.h>
+
+#include <net/netfilter/nf_conntrack.h>
+#include <net/netfilter/nf_conntrack_core.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -578,6 +581,23 @@ static int phantun_finalize_established_rx(struct pht_flow *flow,
     return ret;
 }
 
+static int phantun_confirm_outbound_udp_conntrack(struct sk_buff *skb) {
+    enum ip_conntrack_info ctinfo;
+    struct nf_conn *ct;
+    int verdict;
+
+    ct = nf_ct_get(skb, &ctinfo);
+    if (!ct || ctinfo == IP_CT_UNTRACKED)
+        return 0;
+
+    verdict = nf_conntrack_confirm(skb);
+    if (verdict != NF_ACCEPT)
+        return verdict == NF_DROP ? -EINVAL : -EIO;
+
+    return 0;
+}
+
+
 static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
                                       const struct nf_hook_state *state) {
     struct pht_l4_view view;
@@ -605,6 +625,13 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
 
     if (!phantun_selectors_allow(view.udp->source, view.iph->daddr, view.udp->dest))
         return NF_ACCEPT;
+
+    ret = phantun_confirm_outbound_udp_conntrack(skb);
+    if (ret) {
+        pht_pr_warn_rl("failed to confirm outbound UDP conntrack before translation: %d\n", ret);
+        kfree_skb(skb);
+        return NF_STOLEN;
+    }
 
     phantun_fill_udp_endpoint_pair(&view, &ep);
 
@@ -1254,19 +1281,22 @@ static struct nf_hook_ops phantun_nf_ops[] = {
         .hook = phantun_local_out,
         .pf = NFPROTO_IPV4,
         .hooknum = NF_INET_LOCAL_OUT,
-        .priority = PHANTUN_CAPTURE_PRIORITY,
+        /* Let LOCAL_OUT conntrack observe the original UDP before we steal
+         * it, so translated inbound replies can match ESTABLISHED policy.
+         */
+        .priority = PHANTUN_LOCAL_OUT_PRIORITY,
     },
     {
         .hook = phantun_pre_routing_udp_drop,
         .pf = NFPROTO_IPV4,
         .hooknum = NF_INET_PRE_ROUTING,
-        .priority = PHANTUN_CAPTURE_PRIORITY,
+        .priority = PHANTUN_PRE_ROUTING_PRIORITY,
     },
     {
         .hook = phantun_pre_routing,
         .pf = NFPROTO_IPV4,
         .hooknum = NF_INET_PRE_ROUTING,
-        .priority = PHANTUN_CAPTURE_PRIORITY,
+        .priority = PHANTUN_PRE_ROUTING_PRIORITY,
     },
 };
 
