@@ -144,8 +144,8 @@ Rules:
 
 | Parameter | Type | Default | Meaning |
 |---|---|---:|---|
-| `handshake_request` | string | empty | Optional initiator control payload sent as the first fake-TCP payload. |
-| `handshake_response` | string | empty | Optional responder control payload. Only effective when `handshake_request` is also set. |
+| `handshake_request` | string | empty | Optional initiator control payload sent as the first fake-TCP payload. Can be a plain string, or prefixed with `hex:` or `base64:` for binary payloads. |
+| `handshake_response` | string | empty | Optional responder control payload. Can be a plain string, or prefixed with `hex:` or `base64:`. Only effective when `handshake_request` is also set. |
 | `handshake_timeout_ms` | uint | `1000` | Handshake retransmit timeout in milliseconds. |
 | `handshake_retries` | uint | `6` | Maximum handshake retry count before teardown with `RST`. |
 | `keepalive_interval_sec` | uint | `30` | Idle interval before sending a keepalive ACK. |
@@ -250,6 +250,14 @@ This module does not implement TCP fragmentation/resegmentation logic in v1, so 
 For WireGuard, reduce MTU enough to account for the extra TCP header overhead in the outer transport.
 
 ### Exact shaping semantics
+
+`handshake_request` / `handshake_response` formatting
+
+These parameters accept a plain string by default. For binary payloads, you can prefix the value:
+- `base64:YWJj` — decodes the remaining string as Base64.
+- `hex:deadbeef` — decodes the remaining string as hex.
+
+Invalid Base64 or hex characters (or an odd-length hex string) will cause the parameter to be safely ignored, with a warning printed to the kernel log.
 
 `handshake_request`
 

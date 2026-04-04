@@ -1,3 +1,4 @@
+#include <linux/base64.h>
 #include <linux/inet.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -10,6 +11,7 @@
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+
 #include <net/netns/generic.h>
 
 #include "phantun.h"
@@ -40,11 +42,13 @@ module_param_array_named(managed_remote_peers, managed_remote_peers, charp,
 MODULE_PARM_DESC(managed_remote_peers, "Comma-separated remote IPv4:port peers managed by phantun");
 module_param(handshake_request, charp, 0444);
 MODULE_PARM_DESC(handshake_request, "Optional initiator control payload sent "
-                                    "as the first fake-TCP payload");
+                                    "as the first fake-TCP payload (plain string, "
+                                    "or hex/base64 if prefixed with 'hex:'/'base64:')");
 module_param(handshake_response, charp, 0444);
 MODULE_PARM_DESC(handshake_response, "Optional responder control payload sent "
                                      "as the first fake-TCP payload when "
-                                     "handshake_request is also set");
+                                     "handshake_request is also set (plain string, "
+                                     "or hex/base64 if prefixed with 'hex:'/'base64:')");
 module_param(handshake_timeout_ms, uint, 0444);
 MODULE_PARM_DESC(handshake_timeout_ms, "Handshake retransmit timeout in milliseconds");
 module_param(handshake_retries, uint, 0444);
@@ -60,6 +64,8 @@ module_param(reopen_guard_bytes, uint, 0444);
 MODULE_PARM_DESC(reopen_guard_bytes, "Minimum sequence space separation for new connections");
 
 static struct phantun_config phantun_cfg;
+static void *phantun_alloc_req;
+static void *phantun_alloc_resp;
 static unsigned int phantun_net_id;
 
 struct phantun_net {
@@ -1301,12 +1307,105 @@ static int phantun_validate_config(void) {
         pht_pr_err("reopen_guard_bytes must be smaller than 2147483648\n");
         return -EINVAL;
     }
+    return 0;
+}
+static int phantun_base64_decode(const char *src, size_t srclen, u8 **out_dst,
+                                 unsigned int *out_len) {
+    u8 *dst;
+    int decoded_len;
+
+    if (srclen % 4 != 0)
+        return -EINVAL;
+
+    dst = kmalloc((srclen / 4) * 3, GFP_KERNEL);
+    if (!dst)
+        return -ENOMEM;
+
+#if defined(HAVE_BASE64_DECODE_5ARGS)
+    decoded_len = base64_decode(src, srclen, dst, true, BASE64_STD);
+#else
+    decoded_len = base64_decode(src, srclen, dst);
+#endif
+
+    if (decoded_len < 0) {
+        kfree(dst);
+        return -EINVAL;
+    }
+
+    *out_dst = dst;
+    *out_len = decoded_len;
+    return 0;
+}
+
+static int phantun_parse_payload_param(const char *raw_str, void **out_buf, unsigned int *out_len) {
+    size_t len;
+    int ret;
+
+    *out_buf = NULL;
+    *out_len = 0;
+
+    if (!raw_str || !*raw_str)
+        return 0;
+
+    len = strlen(raw_str);
+
+    if (len >= 7 && strncmp(raw_str, "base64:", 7) == 0) {
+        raw_str += 7;
+        len -= 7;
+        if (len == 0)
+            return 0;
+
+        ret = phantun_base64_decode(raw_str, len, (u8 **)out_buf, out_len);
+        if (ret == -ENOMEM)
+            return -ENOMEM;
+        if (ret) {
+            pht_pr_warn("failed to base64 decode parameter, ignoring\n");
+            *out_buf = NULL;
+            *out_len = 0;
+        }
+        return 0;
+    }
+
+    if (len >= 4 && strncmp(raw_str, "hex:", 4) == 0) {
+        raw_str += 4;
+        len -= 4;
+
+        if (len == 0)
+            return 0;
+
+        if (len % 2 != 0) {
+            pht_pr_warn("hex parameter must have an even length, ignoring\n");
+            return 0;
+        }
+
+        *out_buf = kmalloc(len / 2, GFP_KERNEL);
+        if (!*out_buf)
+            return -ENOMEM;
+
+        if (hex2bin(*out_buf, raw_str, len / 2)) {
+            pht_pr_warn("invalid hex characters in parameter, ignoring\n");
+            kfree(*out_buf);
+            *out_buf = NULL;
+            return 0;
+        }
+
+        *out_len = len / 2;
+        return 0;
+    }
+
+    /* Plain string fallback */
+    *out_buf = kmalloc(len, GFP_KERNEL);
+    if (!*out_buf)
+        return -ENOMEM;
+    memcpy(*out_buf, raw_str, len);
+    *out_len = len;
 
     return 0;
 }
 
-static void phantun_snapshot_config(void) {
+static int phantun_snapshot_config(void) {
     unsigned int i;
+    int ret;
 
     memset(&phantun_cfg, 0, sizeof(phantun_cfg));
     phantun_cfg.managed_local_ports_count = managed_local_ports_count;
@@ -1324,20 +1423,28 @@ static void phantun_snapshot_config(void) {
                    sizeof(phantun_cfg.managed_remote_peers[i]));
         }
     }
-    phantun_cfg.handshake_request =
-        handshake_request && strlen(handshake_request) ? handshake_request : NULL;
-    phantun_cfg.handshake_response =
-        handshake_response && strlen(handshake_response) ? handshake_response : NULL;
-    phantun_cfg.handshake_request_len =
-        phantun_cfg.handshake_request ? strlen(phantun_cfg.handshake_request) : 0;
-    phantun_cfg.handshake_response_len =
-        phantun_cfg.handshake_response ? strlen(phantun_cfg.handshake_response) : 0;
+    ret = phantun_parse_payload_param(handshake_request, &phantun_alloc_req,
+                                      &phantun_cfg.handshake_request_len);
+    if (ret)
+        return ret;
+    phantun_cfg.handshake_request = phantun_alloc_req;
+
+    ret = phantun_parse_payload_param(handshake_response, &phantun_alloc_resp,
+                                      &phantun_cfg.handshake_response_len);
+    if (ret) {
+        kfree(phantun_alloc_req);
+        phantun_alloc_req = NULL;
+        return ret;
+    }
+    phantun_cfg.handshake_response = phantun_alloc_resp;
     phantun_cfg.handshake_timeout_ms = handshake_timeout_ms;
     phantun_cfg.handshake_retries = handshake_retries;
     phantun_cfg.keepalive_interval_sec = keepalive_interval_sec;
     phantun_cfg.keepalive_misses = keepalive_misses;
     phantun_cfg.hard_idle_timeout_sec = hard_idle_timeout_sec;
     phantun_cfg.reopen_guard_bytes = reopen_guard_bytes;
+
+    return 0;
 }
 
 static void phantun_log_config(void) {
@@ -1367,22 +1474,35 @@ static int __init phantun_init(void) {
     if (ret)
         return ret;
 
-    phantun_snapshot_config();
+    ret = phantun_snapshot_config();
+    if (ret)
+        goto err_alloc;
+
     phantun_log_config();
     pht_stats_reset();
     ret = pht_stats_init_sysfs();
     if (ret)
-        return ret;
+        goto err_alloc;
 
     ret = register_pernet_subsys(&phantun_pernet_ops);
     if (ret)
-        pht_stats_exit_sysfs();
+        goto err_sysfs;
+
+    return 0;
+
+err_sysfs:
+    pht_stats_exit_sysfs();
+err_alloc:
+    kfree(phantun_alloc_req);
+    kfree(phantun_alloc_resp);
     return ret;
 }
 
 static void __exit phantun_exit(void) {
     unregister_pernet_subsys(&phantun_pernet_ops);
     pht_stats_exit_sysfs();
+    kfree(phantun_alloc_req);
+    kfree(phantun_alloc_resp);
 }
 
 module_init(phantun_init);
