@@ -303,6 +303,9 @@ def test_syn_isn_tie_break(phantun_module, vm):
     if not require_guest_command(vm, "nft"):
         cleanup_netns_topology(vm)
         pytest.skip("nft is not available in the guest")
+    if not require_guest_command(vm, "tc"):
+        cleanup_netns_topology(vm)
+        pytest.skip("tc is not available in the guest")
 
     initial_stats = read_module_stats(vm)
     src_port = PORTS_A[0]
@@ -338,6 +341,10 @@ def test_syn_isn_tie_break(phantun_module, vm):
             }
         ],
     )
+
+    # Add delay so retransmitted SYNs cross in flight, ensuring both evaluate the collision
+    vm.run(["ip", "netns", "exec", NS_A, "tc", "qdisc", "add", "dev", VETH_A, "root", "netem", "delay", "150ms"])
+    vm.run(["ip", "netns", "exec", NS_B, "tc", "qdisc", "add", "dev", VETH_B, "root", "netem", "delay", "150ms"])
 
     try:
         client_a = spawn_netns_scenario(
@@ -381,17 +388,22 @@ def test_syn_isn_tie_break(phantun_module, vm):
             pytest.fail(f"client B unexpected reply: {data_b.get('received')!r}")
 
         final_stats = read_module_stats(vm)
-        if final_stats["collisions_won"] - initial_stats["collisions_won"] != 1:
+        won_diff = final_stats["collisions_won"] - initial_stats["collisions_won"]
+        lost_diff = final_stats["collisions_lost"] - initial_stats["collisions_lost"]
+
+        if won_diff != 1:
             pytest.fail(
-                f"expected exactly one collision win, got stats {final_stats!r}"
+                f"expected exactly one collision win, got {won_diff} (stats {final_stats!r})"
             )
-        if final_stats["collisions_lost"] - initial_stats["collisions_lost"] != 1:
+        if lost_diff != 1:
             pytest.fail(
-                f"expected exactly one collision loss, got stats {final_stats!r}"
+                f"expected exactly one collision loss, got {lost_diff} (stats {final_stats!r})"
             )
     finally:
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
+        vm.run(["ip", "netns", "exec", NS_A, "tc", "qdisc", "del", "dev", VETH_A, "root", "netem"], check=False)
+        vm.run(["ip", "netns", "exec", NS_B, "tc", "qdisc", "del", "dev", VETH_B, "root", "netem"], check=False)
 
 
 def test_established_bare_syn_replacement(phantun_module, vm):
