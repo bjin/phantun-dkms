@@ -12,12 +12,12 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
-#include <net/gso.h>
-#include <net/netns/generic.h>
 #include "phantun.h"
 #include "phantun_flow.h"
 #include "phantun_packet.h"
 #include "phantun_stats.h"
+#include <net/gso.h>
+#include <net/netns/generic.h>
 
 #define PHANTUN_REOPEN_ISN_ATTEMPTS 1024U
 
@@ -1198,8 +1198,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
         spin_lock_bh(&flow->lock);
         if (flow->response_pending_ack) {
-            if (view.tcp->ack &&
-                ntohl(view.tcp->ack_seq) >= flow->local_isn + 1 + phantun_cfg.handshake_response_len) {
+            if (view.tcp->ack && ntohl(view.tcp->ack_seq) >=
+                                     flow->local_isn + 1 + phantun_cfg.handshake_response_len) {
                 flow->response_pending_ack = false;
                 response_unblocked = true;
             } else if (view.payload_len > 0) {
