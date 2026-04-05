@@ -1426,11 +1426,7 @@ static int phantun_base64_decode(const char *src, size_t srclen, u8 **out_dst,
     if (!dst)
         return -ENOMEM;
 
-#if defined(HAVE_BASE64_DECODE_5ARGS)
-    decoded_len = base64_decode(src, srclen, dst, true, BASE64_STD);
-#else
-    decoded_len = base64_decode(src, srclen, dst);
-#endif
+    decoded_len = BASE64_DECODE_COMPAT(src, srclen, dst);
 
     if (decoded_len < 0) {
         kfree(dst);
