@@ -45,14 +45,14 @@ module_param_array_named(managed_remote_peers, managed_remote_peers, charp,
                          &managed_remote_peers_count, 0444);
 MODULE_PARM_DESC(managed_remote_peers, "Comma-separated remote IPv4:port peers managed by phantun");
 module_param(handshake_request, charp, 0444);
-MODULE_PARM_DESC(handshake_request, "Optional initiator control payload sent "
-                                    "as the first fake-TCP payload (plain string, "
-                                    "or hex/base64 if prefixed with 'hex:'/'base64:')");
+MODULE_PARM_DESC(handshake_request,
+                 "Optional initiator control payload sent as the first fake-TCP payload (plain "
+                 "string, or hex/base64 if prefixed with 'hex:'/'base64:')");
 module_param(handshake_response, charp, 0444);
-MODULE_PARM_DESC(handshake_response, "Optional responder control payload sent "
-                                     "as the first fake-TCP payload when "
-                                     "handshake_request is also set (plain string, "
-                                     "or hex/base64 if prefixed with 'hex:'/'base64:')");
+MODULE_PARM_DESC(
+    handshake_response,
+    "Optional responder control payload sent as the first fake-TCP payload when handshake_request "
+    "is also set (plain string, or hex/base64 if prefixed with 'hex:'/'base64:')");
 module_param(handshake_timeout_ms, uint, 0444);
 MODULE_PARM_DESC(handshake_timeout_ms, "Handshake retransmit timeout in milliseconds");
 module_param(handshake_retries, uint, 0444);
