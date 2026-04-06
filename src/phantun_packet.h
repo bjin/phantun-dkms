@@ -64,9 +64,9 @@ struct sk_buff *pht_build_udp_v4(const struct pht_ipv4_endpoint_pair *ep, const 
                                  size_t payload_len);
 
 int pht_tx_fake_tcp_v4(struct net *net, struct sk_buff *skb,
-                       const struct pht_ipv4_endpoint_pair *ep);
+                       const struct pht_ipv4_endpoint_pair *ep, int *out_ifindex);
 int pht_emit_fake_tcp_v4(struct net *net, const struct pht_ipv4_endpoint_pair *ep, u32 seq, u32 ack,
-                         u8 flags, const void *payload, size_t payload_len);
+                         u8 flags, const void *payload, size_t payload_len, int *out_ifindex);
 int pht_reinject_udp_v4(struct sk_buff *skb, struct net_device *dev);
 int pht_reinject_udp_payload_v4(struct net_device *dev, const struct pht_ipv4_endpoint_pair *ep,
                                 const void *payload, size_t payload_len);

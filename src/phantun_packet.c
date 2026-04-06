@@ -290,9 +290,12 @@ struct sk_buff *pht_build_udp_v4(const struct pht_ipv4_endpoint_pair *ep, const 
 }
 
 int pht_tx_fake_tcp_v4(struct net *net, struct sk_buff *skb,
-                       const struct pht_ipv4_endpoint_pair *ep) {
+                       const struct pht_ipv4_endpoint_pair *ep, int *out_ifindex) {
     struct flowi4 fl4;
     struct rtable *rt;
+
+    if (out_ifindex)
+        *out_ifindex = 0;
 
     if (!net || !skb || !ep) {
         kfree_skb(skb);
@@ -308,6 +311,9 @@ int pht_tx_fake_tcp_v4(struct net *net, struct sk_buff *skb,
         return PTR_ERR(rt);
     }
 
+    if (out_ifindex && rt->dst.dev)
+        *out_ifindex = rt->dst.dev->ifindex;
+
     skb_dst_set(skb, &rt->dst);
     skb->dev = rt->dst.dev;
     skb->protocol = htons(ETH_P_IP);
@@ -315,14 +321,14 @@ int pht_tx_fake_tcp_v4(struct net *net, struct sk_buff *skb,
 }
 
 int pht_emit_fake_tcp_v4(struct net *net, const struct pht_ipv4_endpoint_pair *ep, u32 seq, u32 ack,
-                         u8 flags, const void *payload, size_t payload_len) {
+                         u8 flags, const void *payload, size_t payload_len, int *out_ifindex) {
     struct sk_buff *skb;
 
     skb = pht_build_fake_tcp_v4(ep, seq, ack, flags, payload, payload_len);
     if (!skb)
         return -ENOMEM;
 
-    return pht_tx_fake_tcp_v4(net, skb, ep);
+    return pht_tx_fake_tcp_v4(net, skb, ep, out_ifindex);
 }
 
 int pht_reinject_udp_v4(struct sk_buff *skb, struct net_device *dev) {

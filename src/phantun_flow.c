@@ -36,15 +36,18 @@ static void pht_flow_free(struct pht_flow *flow) {
 }
 
 static int pht_flow_send_local_rst(struct pht_flow *flow) {
+    int ifindex;
     int ret;
 
     if (!flow || !flow->table || !flow->table->net)
         return -EINVAL;
 
     ret = pht_emit_fake_tcp_v4(flow->table->net, &flow->oriented, flow->seq, 0, PHT_TCP_FLAG_RST,
-                               NULL, 0);
-    if (!ret)
+                               NULL, 0, &ifindex);
+    if (!ret) {
+        pht_flow_set_egress_ifindex(flow, ifindex);
         pht_stats_inc(PHT_STAT_RST_SENT);
+    }
     return ret;
 }
 
@@ -76,7 +79,15 @@ static int pht_flow_retransmit_now(struct pht_flow *flow) {
     if (!flags)
         return 0;
 
-    return pht_emit_fake_tcp_v4(flow->table->net, &ep, seq, ack, flags, NULL, 0);
+    {
+        int ifindex;
+        int ret;
+
+        ret = pht_emit_fake_tcp_v4(flow->table->net, &ep, seq, ack, flags, NULL, 0, &ifindex);
+        if (!ret)
+            pht_flow_set_egress_ifindex(flow, ifindex);
+        return ret;
+    }
 }
 
 static void pht_flow_gc_worker(struct work_struct *work);
@@ -306,11 +317,15 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
             }
 
             if (send_keepalive && !expired_flow && !is_liveness_failure) {
-                /* Send a pure ACK as keepalive */
+                int ifindex;
+                int ret;
+
                 spin_lock(&flow->lock);
                 if (flow->table && flow->table->net) {
-                    pht_emit_fake_tcp_v4(flow->table->net, &flow->oriented, flow->seq, flow->ack,
-                                         PHT_TCP_FLAG_ACK, NULL, 0);
+                    ret = pht_emit_fake_tcp_v4(flow->table->net, &flow->oriented, flow->seq,
+                                               flow->ack, PHT_TCP_FLAG_ACK, NULL, 0, &ifindex);
+                    if (!ret)
+                        flow->egress_ifindex = ifindex;
                 }
                 spin_unlock(&flow->lock);
             }
@@ -537,6 +552,15 @@ void pht_flow_touch(struct pht_flow *flow) {
     spin_unlock_bh(&flow->lock);
 }
 
+void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex) {
+    if (!flow)
+        return;
+
+    spin_lock_bh(&flow->lock);
+    flow->egress_ifindex = ifindex;
+    spin_unlock_bh(&flow->lock);
+}
+
 /* On success the flow takes ownership of @skb. On failure the caller still
  * owns @skb and must decide whether to free or reuse it.
  */
@@ -656,4 +680,93 @@ void pht_flow_cancel_retransmit(struct pht_flow *flow) {
     deleted = timer_delete(&flow->retransmit_timer);
     if (deleted > 0 && drop_ref)
         pht_flow_put(flow);
+}
+
+struct pht_flow_invalidate_match {
+    int egress_ifindex;
+    __be32 local_addr;
+};
+
+static bool pht_flow_matches_egress_ifindex_locked(const struct pht_flow *flow,
+                                                   const struct pht_flow_invalidate_match *match) {
+    return flow->egress_ifindex > 0 && flow->egress_ifindex == match->egress_ifindex;
+}
+
+static bool pht_flow_matches_local_addr_locked(const struct pht_flow *flow,
+                                               const struct pht_flow_invalidate_match *match) {
+    return flow->oriented.local_addr == match->local_addr;
+}
+
+/* Topology-driven invalidation is best-effort local cleanup: the path or
+ * source identity already changed underneath us, so unhash silently and let
+ * the next packet build a fresh generation instead of fabricating an RST from
+ * a dead path.
+ */
+static unsigned int
+pht_flow_invalidate_matching(struct pht_flow_table *table,
+                             bool (*matches_locked)(const struct pht_flow *flow,
+                                                    const struct pht_flow_invalidate_match *match),
+                             const struct pht_flow_invalidate_match *match) {
+    LIST_HEAD(expired);
+    unsigned int count = 0;
+    unsigned int i;
+
+    if (!table || !matches_locked || !match)
+        return 0;
+
+    for (i = 0; i < PHT_FLOW_BUCKETS; i++) {
+        struct pht_flow_bucket *bucket = &table->buckets[i];
+        struct pht_flow *flow;
+        struct hlist_node *tmp;
+
+        spin_lock_bh(&bucket->lock);
+        hlist_for_each_entry_safe(flow, tmp, &bucket->head, hnode) {
+            bool matched;
+
+            spin_lock(&flow->lock);
+            matched = flow->state != PHT_FLOW_STATE_DEAD && matches_locked(flow, match);
+            if (matched)
+                flow->state = PHT_FLOW_STATE_DEAD;
+            spin_unlock(&flow->lock);
+            if (!matched)
+                continue;
+
+            hlist_del_init(&flow->hnode);
+            list_add_tail(&flow->gc_node, &expired);
+            count++;
+        }
+        spin_unlock_bh(&bucket->lock);
+    }
+
+    while (!list_empty(&expired)) {
+        struct pht_flow *flow = list_first_entry(&expired, struct pht_flow, gc_node);
+
+        list_del_init(&flow->gc_node);
+        pht_flow_cancel_retransmit(flow);
+        pht_flow_put(flow);
+    }
+
+    return count;
+}
+
+unsigned int pht_flow_invalidate_egress_ifindex(struct pht_flow_table *table, int ifindex) {
+    struct pht_flow_invalidate_match match = {
+        .egress_ifindex = ifindex,
+    };
+
+    if (ifindex <= 0)
+        return 0;
+
+    return pht_flow_invalidate_matching(table, pht_flow_matches_egress_ifindex_locked, &match);
+}
+
+unsigned int pht_flow_invalidate_local_addr(struct pht_flow_table *table, __be32 local_addr) {
+    struct pht_flow_invalidate_match match = {
+        .local_addr = local_addr,
+    };
+
+    if (!local_addr)
+        return 0;
+
+    return pht_flow_invalidate_matching(table, pht_flow_matches_local_addr_locked, &match);
 }

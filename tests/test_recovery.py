@@ -1149,3 +1149,141 @@ def test_unknown_ack_payload_is_rejected_with_rstack(phantun_module, vm):
     server_data = parse_guest_json(server_result.stdout, "echo server stdout")
     if received_messages(server_data) != ["msg1"]:
         pytest.fail(f"unexpected server messages after unknown ack payload: {received_messages(server_data)!r}")
+
+
+def assert_flow_recreated_after_local_topology_change(vm, change_steps, label):
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    reconnect_probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "flags_expr": "syn",
+                "comment": "reconnect_syn",
+            }
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "echo_server",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+            "timeout_sec": 20,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        first = run_netns_scenario(
+            vm,
+            NS_A,
+            "echo_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["msg1"],
+            },
+        )
+        assert_completed(first, f"{label} first echo")
+
+        baseline_syn = reconnect_probe.packets(vm, "reconnect_syn")
+        if baseline_syn == 0:
+            pytest.fail(f"expected initial SYN before {label}, got {baseline_syn}")
+
+        for step in change_steps:
+            vm.run(step)
+        time.sleep(0.2)
+
+        second = run_netns_scenario(
+            vm,
+            NS_A,
+            "echo_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["msg2"],
+            },
+        )
+        assert_completed(second, f"{label} second echo")
+
+        new_syns = reconnect_probe.packets(vm, "reconnect_syn") - baseline_syn
+        if new_syns < 1:
+            pytest.fail(f"expected a fresh SYN after {label}, got {new_syns}")
+
+        server_result = server.communicate(timeout=15)
+        assert_completed(server_result, f"{label} server")
+        server_data = parse_guest_json(server_result.stdout, f"{label} server stdout")
+        if received_messages(server_data) != ["msg1", "msg2"]:
+            pytest.fail(f"unexpected server messages after {label}: {received_messages(server_data)!r}")
+    finally:
+        reconnect_probe.cleanup(vm)
+
+
+def test_device_down_invalidation_recreates_flow(phantun_module, vm):
+    load_recovery_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    assert_flow_recreated_after_local_topology_change(
+        vm,
+        [
+            ["ip", "netns", "exec", NS_A, "ip", "link", "set", "dev", VETH_A, "down"],
+            ["ip", "netns", "exec", NS_A, "ip", "link", "set", "dev", VETH_A, "up"],
+        ],
+        "device bounce invalidation",
+    )
+
+
+def test_local_addr_removal_invalidation_recreates_flow(phantun_module, vm):
+    load_recovery_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    assert_flow_recreated_after_local_topology_change(
+        vm,
+        [
+            [
+                "ip",
+                "netns",
+                "exec",
+                NS_A,
+                "ip",
+                "addr",
+                "del",
+                f"{NS_ADDR_A}/24",
+                "dev",
+                VETH_A,
+            ],
+            [
+                "ip",
+                "netns",
+                "exec",
+                NS_A,
+                "ip",
+                "addr",
+                "add",
+                f"{NS_ADDR_A}/24",
+                "dev",
+                VETH_A,
+            ],
+        ],
+        "local IPv4 removal invalidation",
+    )

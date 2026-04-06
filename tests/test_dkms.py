@@ -16,7 +16,7 @@ def test_module_load_success(phantun_module, dmesg, vm):
     if "phantun" not in res.stdout:
         pytest.fail("phantun module is not loaded in lsmod")
 
-    if not dmesg.wait_for(r"registered IPv4 LOCAL_OUT and PRE_ROUTING hooks", timeout=5):
+    if not dmesg.wait_for(r"registered IPv4 LOCAL_OUT/PRE_ROUTING hooks", timeout=5):
         pytest.fail("Module did not log successful netfilter hook registration")
 
 
@@ -41,13 +41,13 @@ def test_module_unload_success(phantun_module, dmesg, vm):
 def test_module_reload_new_params(phantun_module, dmesg):
     """Test that the module can be reloaded with different parameters seamlessly."""
     phantun_module.load(managed_local_ports="1111")
-    if not dmesg.wait_for(r"registered IPv4 LOCAL_OUT and PRE_ROUTING hooks", timeout=5):
+    if not dmesg.wait_for(r"registered IPv4 LOCAL_OUT/PRE_ROUTING hooks", timeout=5):
         pytest.fail("First load failed")
 
     # .load() automatically unloads before loading new options
     phantun_module.load(managed_local_ports="2222")
 
-    if not dmesg.wait_for(r"registered IPv4 LOCAL_OUT and PRE_ROUTING hooks", timeout=5):
+    if not dmesg.wait_for(r"registered IPv4 LOCAL_OUT/PRE_ROUTING hooks", timeout=5):
         pytest.fail("Second load (reload) failed")
 
 

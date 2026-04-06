@@ -96,6 +96,10 @@ struct pht_flow {
     unsigned long retransmit_at_jiffies;
     unsigned long quarantine_until_jiffies;
     unsigned int keepalives_sent;
+    /* Last successful routed egress device toward the remote peer. Used only
+     * for best-effort invalidation when that device goes away.
+     */
+    int egress_ifindex;
     /* True when the local endpoint occupies key.low_{addr,port}. */
     bool local_is_low;
     /* Optional first-payload shaping state. drop_next_rx_* suppresses exactly
@@ -155,11 +159,14 @@ void pht_flow_get(struct pht_flow *flow);
 void pht_flow_put(struct pht_flow *flow);
 void pht_flow_touch(struct pht_flow *flow);
 void pht_flow_touch_inbound(struct pht_flow *flow);
+void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex);
 bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb);
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb);
 struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow);
 void pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state);
 void pht_flow_arm_retransmit(struct pht_flow *flow);
 void pht_flow_cancel_retransmit(struct pht_flow *flow);
+unsigned int pht_flow_invalidate_egress_ifindex(struct pht_flow_table *table, int ifindex);
+unsigned int pht_flow_invalidate_local_addr(struct pht_flow_table *table, __be32 local_addr);
 
 #endif

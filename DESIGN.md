@@ -553,6 +553,24 @@ For module-generated fake-TCP packets:
 
 Because the `LOCAL_OUT` hook only steals UDP, not TCP, the module does not need a complicated self-loop bypass just to transmit its own fake-TCP packets.
 
+## 9.6 Best-effort local flow invalidation
+
+Some local topology changes make an existing fake-TCP generation no longer safely reusable even if the peer has not timed it out yet.
+
+Chosen policy:
+
+- each flow caches the last successful routed egress device used for fake-TCP transmission
+- if that cached egress device goes `GOING_DOWN`, `DOWN`, or is unregistered, invalidate the local flow immediately
+- if the exact local IPv4 address bound into the flow tuple is removed, invalidate the local flow immediately
+- invalidation is silent local teardown: do not fabricate `RST` from a path/source identity that just disappeared
+- next local outbound UDP may create a fresh flow generation normally
+
+Intentionally not done in v1:
+
+- do not invalidate on default-gateway or general FIB changes
+- do not invalidate merely because some other IPv4 on the device changed, or because a different address became primary
+
+Reason: every outbound fake-TCP send already performs a fresh route lookup using the flow's fixed local/remote IPv4 tuple. If that exact local source address is still valid, ordinary route/gateway migration may remain seamless, so reacting to broader routing churn would add complexity and false positives without clear benefit.
 ## 10. Configuration model
 
 ## v1 choice

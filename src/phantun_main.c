@@ -1,5 +1,6 @@
 #include <linux/base64.h>
 #include <linux/inet.h>
+#include <linux/inetdevice.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -71,9 +72,11 @@ static struct phantun_config phantun_cfg;
 static void *phantun_alloc_req;
 static void *phantun_alloc_resp;
 static unsigned int phantun_net_id;
+static struct notifier_block phantun_inetaddr_nb;
 
 struct phantun_net {
     struct pht_flow_table flows;
+    struct notifier_block netdev_nb;
 };
 
 static struct pht_flow_table *phantun_net_flows(const struct net *net) {
@@ -84,6 +87,58 @@ static struct pht_flow_table *phantun_net_flows(const struct net *net) {
 
     pnet = net_generic(net, phantun_net_id);
     return pnet ? &pnet->flows : NULL;
+}
+
+/* Invalidate only on topology changes that break the current source identity or
+ * cached egress path outright. Route/gateway changes are intentionally ignored:
+ * every transmit does a fresh route lookup, so a stable local IPv4 can migrate
+ * without tearing the fake-TCP generation down.
+ */
+static int phantun_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr) {
+    struct phantun_net *pnet = container_of(nb, struct phantun_net, netdev_nb);
+    struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+    unsigned int invalidated;
+
+    if (!dev)
+        return NOTIFY_DONE;
+
+    switch (event) {
+    case NETDEV_GOING_DOWN:
+    case NETDEV_DOWN:
+    case NETDEV_UNREGISTER:
+        break;
+    default:
+        return NOTIFY_DONE;
+    }
+
+    invalidated = pht_flow_invalidate_egress_ifindex(&pnet->flows, dev->ifindex);
+    if (invalidated)
+        pht_pr_info("invalidated %u flow(s) on egress device %s(%d) after netdev event %lu\n",
+                    invalidated, dev->name, dev->ifindex, event);
+
+    return NOTIFY_DONE;
+}
+
+static int phantun_inetaddr_event(struct notifier_block *nb, unsigned long event, void *ptr) {
+    struct in_ifaddr *ifa = ptr;
+    struct net_device *dev;
+    struct pht_flow_table *flows;
+    unsigned int invalidated;
+
+    if (event != NETDEV_DOWN || !ifa || !ifa->ifa_dev || !ifa->ifa_dev->dev)
+        return NOTIFY_DONE;
+
+    dev = ifa->ifa_dev->dev;
+    flows = phantun_net_flows(dev_net(dev));
+    if (!flows)
+        return NOTIFY_DONE;
+
+    invalidated = pht_flow_invalidate_local_addr(flows, ifa->ifa_local);
+    if (invalidated)
+        pht_pr_info("invalidated %u flow(s) after removing local IPv4 %pI4 on %s\n", invalidated,
+                    &ifa->ifa_local, dev->name);
+
+    return NOTIFY_DONE;
 }
 
 static int phantun_parse_managed_remote_peer(const char *peer,
@@ -350,6 +405,7 @@ static int phantun_send_flow_rst(struct pht_flow *flow, struct net *net) {
     struct pht_ipv4_endpoint_pair ep;
     u32 seq;
     u32 ack;
+    int ifindex;
     int ret;
 
     spin_lock_bh(&flow->lock);
@@ -358,9 +414,11 @@ static int phantun_send_flow_rst(struct pht_flow *flow, struct net *net) {
     ack = flow->ack;
     spin_unlock_bh(&flow->lock);
 
-    ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_RST, NULL, 0);
-    if (!ret)
+    ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_RST, NULL, 0, &ifindex);
+    if (!ret) {
+        pht_flow_set_egress_ifindex(flow, ifindex);
         pht_stats_inc(PHT_STAT_RST_SENT);
+    }
     return ret;
 }
 
@@ -371,6 +429,7 @@ static int phantun_send_established_udp(struct pht_flow *flow,
     u32 seq;
     u32 ack;
     void *payload = NULL;
+    int ifindex;
     int ret;
 
     if (view->payload_len) {
@@ -402,11 +461,14 @@ static int phantun_send_established_udp(struct pht_flow *flow,
     flow->seq += view->payload_len;
     spin_unlock_bh(&flow->lock);
 
-    ret = pht_emit_fake_tcp_v4(net, ep, seq, ack, PHT_TCP_FLAG_ACK, payload, view->payload_len);
+    ret = pht_emit_fake_tcp_v4(net, ep, seq, ack, PHT_TCP_FLAG_ACK, payload, view->payload_len,
+                               &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
-        if (flow->state == PHT_FLOW_STATE_ESTABLISHED)
+        if (flow->state == PHT_FLOW_STATE_ESTABLISHED) {
             flow->last_activity_jiffies = jiffies;
+            flow->egress_ifindex = ifindex;
+        }
         spin_unlock_bh(&flow->lock);
     } else {
         spin_lock_bh(&flow->lock);
@@ -427,6 +489,8 @@ static int phantun_send_synack(struct pht_flow *flow, struct net *net) {
     struct pht_ipv4_endpoint_pair ep;
     u32 seq;
     u32 ack;
+    int ifindex;
+    int ret;
 
     spin_lock_bh(&flow->lock);
     ep = flow->oriented;
@@ -434,7 +498,11 @@ static int phantun_send_synack(struct pht_flow *flow, struct net *net) {
     ack = flow->peer_syn_next;
     spin_unlock_bh(&flow->lock);
 
-    return pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_SYN | PHT_TCP_FLAG_ACK, NULL, 0);
+    ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_SYN | PHT_TCP_FLAG_ACK, NULL, 0,
+                               &ifindex);
+    if (!ret)
+        pht_flow_set_egress_ifindex(flow, ifindex);
+    return ret;
 }
 
 static int phantun_send_rstack(struct net *net, const struct pht_ipv4_endpoint_pair *ep,
@@ -443,7 +511,8 @@ static int phantun_send_rstack(struct net *net, const struct pht_ipv4_endpoint_p
     u32 ack = ntohl(view->tcp->seq) + phantun_tcp_seq_advance(view->tcp, view->payload_len);
     int ret;
 
-    ret = pht_emit_fake_tcp_v4(net, ep, seq, ack, PHT_TCP_FLAG_RST | PHT_TCP_FLAG_ACK, NULL, 0);
+    ret =
+        pht_emit_fake_tcp_v4(net, ep, seq, ack, PHT_TCP_FLAG_RST | PHT_TCP_FLAG_ACK, NULL, 0, NULL);
     if (!ret)
         pht_stats_inc(PHT_STAT_RST_SENT);
     return ret;
@@ -454,6 +523,7 @@ static int phantun_send_handshake_request(struct pht_flow *flow, struct net *net
     u32 seq;
     u32 ack;
     size_t req_len = phantun_cfg.handshake_request_len;
+    int ifindex;
     int ret;
 
     spin_lock_bh(&flow->lock);
@@ -463,12 +533,13 @@ static int phantun_send_handshake_request(struct pht_flow *flow, struct net *net
     spin_unlock_bh(&flow->lock);
 
     ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, phantun_cfg.handshake_request,
-                               req_len);
+                               req_len, &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
         flow->seq = seq + req_len;
         flow->last_ack = ack;
         flow->last_activity_jiffies = jiffies;
+        flow->egress_ifindex = ifindex;
         spin_unlock_bh(&flow->lock);
         pht_stats_inc(PHT_STAT_REQUEST_PAYLOADS_INJECTED);
     }
@@ -480,6 +551,7 @@ static int phantun_send_handshake_response(struct pht_flow *flow, struct net *ne
     u32 seq;
     u32 ack;
     size_t resp_len = phantun_cfg.handshake_response_len;
+    int ifindex;
     int ret;
 
     spin_lock_bh(&flow->lock);
@@ -489,12 +561,13 @@ static int phantun_send_handshake_response(struct pht_flow *flow, struct net *ne
     spin_unlock_bh(&flow->lock);
 
     ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, phantun_cfg.handshake_response,
-                               resp_len);
+                               resp_len, &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
         flow->seq = seq + resp_len;
         flow->last_ack = ack;
         flow->last_activity_jiffies = jiffies;
+        flow->egress_ifindex = ifindex;
         spin_unlock_bh(&flow->lock);
         pht_stats_inc(PHT_STAT_RESPONSE_PAYLOADS_INJECTED);
     }
@@ -505,6 +578,7 @@ static int phantun_send_idle_ack(struct pht_flow *flow, struct net *net) {
     struct pht_ipv4_endpoint_pair ep;
     u32 seq;
     u32 ack;
+    int ifindex;
     int ret;
 
     spin_lock_bh(&flow->lock);
@@ -513,11 +587,12 @@ static int phantun_send_idle_ack(struct pht_flow *flow, struct net *net) {
     ack = flow->ack;
     spin_unlock_bh(&flow->lock);
 
-    ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, NULL, 0);
+    ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, NULL, 0, &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
         flow->last_ack = ack;
         flow->last_activity_jiffies = jiffies;
+        flow->egress_ifindex = ifindex;
         spin_unlock_bh(&flow->lock);
     }
     return ret;
@@ -790,7 +865,14 @@ retry_lookup:
     }
     pht_stats_inc(PHT_STAT_UDP_PACKETS_QUEUED);
 
-    ret = pht_emit_fake_tcp_v4(state->net, &ep, init_seq, 0, PHT_TCP_FLAG_SYN, NULL, 0);
+    {
+        int ifindex;
+
+        ret =
+            pht_emit_fake_tcp_v4(state->net, &ep, init_seq, 0, PHT_TCP_FLAG_SYN, NULL, 0, &ifindex);
+        if (!ret)
+            pht_flow_set_egress_ifindex(new_flow, ifindex);
+    }
     if (ret) {
         pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
         pht_pr_warn("failed to emit fake-TCP SYN: %d\n", ret);
@@ -1381,40 +1463,52 @@ static struct nf_hook_ops phantun_nf_ops[] = {
 };
 
 static int __net_init phantun_net_init(struct net *net) {
+    struct phantun_net *pnet = net_generic(net, phantun_net_id);
     struct pht_flow_table *flows;
     int ret;
 
-    flows = phantun_net_flows(net);
-    if (!flows)
+    if (!pnet)
         return -EINVAL;
 
+    flows = &pnet->flows;
     ret = pht_flow_table_init(flows, net, &phantun_cfg);
     if (ret) {
         pht_pr_err("failed to initialize flow table: %d\n", ret);
         return ret;
     }
 
-    ret = nf_register_net_hooks(net, phantun_nf_ops, ARRAY_SIZE(phantun_nf_ops));
+    pnet->netdev_nb.notifier_call = phantun_netdev_event;
+    ret = register_netdevice_notifier_net(net, &pnet->netdev_nb);
     if (ret) {
-        pht_pr_err("failed to register netfilter hooks: %d\n", ret);
+        pht_pr_err("failed to register netdevice notifier: %d\n", ret);
         pht_flow_table_destroy(flows);
         return ret;
     }
 
-    pht_pr_info("registered IPv4 LOCAL_OUT and PRE_ROUTING hooks\n");
+    ret = nf_register_net_hooks(net, phantun_nf_ops, ARRAY_SIZE(phantun_nf_ops));
+    if (ret) {
+        pht_pr_err("failed to register netfilter hooks: %d\n", ret);
+        unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
+        pht_flow_table_destroy(flows);
+        return ret;
+    }
+
+    pht_pr_info("registered IPv4 LOCAL_OUT/PRE_ROUTING hooks and topology notifiers\n");
     return 0;
 }
 
 static void __net_exit phantun_net_exit(struct net *net) {
+    struct phantun_net *pnet = net_generic(net, phantun_net_id);
     struct pht_flow_table *flows;
 
-    flows = phantun_net_flows(net);
-    if (!flows)
+    if (!pnet)
         return;
 
+    flows = &pnet->flows;
     nf_unregister_net_hooks(net, phantun_nf_ops, ARRAY_SIZE(phantun_nf_ops));
+    unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
     pht_flow_table_destroy(flows);
-    pht_pr_info("unregistered netfilter hooks\n");
+    pht_pr_info("unregistered netfilter hooks and topology notifiers\n");
 }
 
 static struct pernet_operations phantun_pernet_ops = {
@@ -1656,8 +1750,15 @@ static int __init phantun_init(void) {
     if (ret)
         goto err_sysfs;
 
+    phantun_inetaddr_nb.notifier_call = phantun_inetaddr_event;
+    ret = register_inetaddr_notifier(&phantun_inetaddr_nb);
+    if (ret)
+        goto err_pernet;
+
     return 0;
 
+err_pernet:
+    unregister_pernet_subsys(&phantun_pernet_ops);
 err_sysfs:
     pht_stats_exit_sysfs();
 err_alloc:
@@ -1667,6 +1768,7 @@ err_alloc:
 }
 
 static void __exit phantun_exit(void) {
+    unregister_inetaddr_notifier(&phantun_inetaddr_nb);
     unregister_pernet_subsys(&phantun_pernet_ops);
     pht_stats_exit_sysfs();
     kfree(phantun_alloc_req);
