@@ -251,31 +251,8 @@ def project_info():
                 break
 
     # Prepare tarball BEFORE VM starts because of COW filesystem.
-    tar_path = proj_root / ".dkms_copy.tar"
-    tar_path.unlink(missing_ok=True)
-    dkms_files = list(
-        filter(
-            None,
-            subprocess.check_output(
-                ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-                cwd=proj_root,
-                text=True,
-            ).split("\0"),
-        )
-    )
-    extra_files = ["configure", "config.h.in"]
-    for file in extra_files:
-        if not (proj_root / file).exists():
-            pytest.exit("Please run ./autogen.sh first before running tests")
-    dkms_files.extend(extra_files)
-
-    subprocess.run(
-        ["tar", "--null", "-c", "-T", "-", "-f", str(tar_path)],
-        cwd=proj_root,
-        input="\0".join(dkms_files),
-        text=True,
-        check=True,
-    )
+    subprocess.run(["./release-dkms.sh"], cwd=proj_root, check=True)
+    tar_path = proj_root / f"phantun-dkms_{version}.tar.gz"
 
     return {"root": proj_root, "version": version, "tar_path": tar_path}
 
@@ -302,7 +279,7 @@ class PhantunModule:
 
     def install(self):
         dkms_src = f"/usr/src/phantun-{self.version}"
-        self.vm.run(f"mkdir -p {dkms_src} && tar xf {self.tar_path} -C {dkms_src}")
+        self.vm.run(f"mkdir -p {dkms_src} && tar xzf {self.tar_path} -C {dkms_src}")
 
         # Clean up existing entry if present (e.g. from host or failed run)
         self.vm.run(["dkms", "remove", self.dkms_name, "--all"], check=False)

@@ -18,6 +18,7 @@ modules.order
 *.order
 *.markers
 *.unsigned
+*.tar.gz
 
 compile_commands.json
 .cache
@@ -25,7 +26,6 @@ __pycache__
 *.log
 
 /kernels
-/.dkms_copy.tar
 
 # automake artifacts
 *~
