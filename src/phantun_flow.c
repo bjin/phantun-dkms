@@ -7,6 +7,8 @@
 #include <net/ip.h>
 #include <net/route.h>
 
+#include "phantun_compat.h" // IWYU pragma: keep
+
 #include "phantun_flow.h"
 #include "phantun_packet.h"
 #include "phantun_stats.h"

@@ -59,7 +59,9 @@ def prepare_ubuntu_kernel(version):
 
     deb_links = re.findall(r'href="([^"]+\.deb)"', html)
     debs_to_dl = [
-        link for link in deb_links if any(x in link for x in ["linux-headers", "linux-image", "linux-modules"]) and "lowlatency" not in link
+        link
+        for link in deb_links
+        if any(x in link for x in ["linux-headers", "linux-image", "linux-modules"]) and "lowlatency" not in link
     ]
 
     if not debs_to_dl:

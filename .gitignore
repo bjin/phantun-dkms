@@ -1,6 +1,7 @@
 # External kernel module build outputs
 *.o
 *.ko
+*.o.d
 *.mod
 *.mod.c
 *.mod.o

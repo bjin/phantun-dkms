@@ -10,19 +10,28 @@
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/random.h>
-
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_core.h>
+#include <net/netns/generic.h>
+
+#include "phantun_compat.h" // IWYU pragma: keep
+
+#ifdef HAVE_LINUX_HEX_H
+#include <linux/hex.h>
+#endif
+
+#ifdef HAVE_NET_GSO_H
+#include <net/gso.h>
+#endif
 
 #include "phantun.h"
 #include "phantun_flow.h"
 #include "phantun_packet.h"
 #include "phantun_stats.h"
-#include <net/gso.h>
-#include <net/netns/generic.h>
 
 #define PHANTUN_REOPEN_ISN_ATTEMPTS 1024U
 

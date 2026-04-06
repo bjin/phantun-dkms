@@ -15,7 +15,6 @@ def test_module_load_success(phantun_module, dmesg, vm):
     res = vm.run(["lsmod"])
     if "phantun" not in res.stdout:
         pytest.fail("phantun module is not loaded in lsmod")
-
     if not dmesg.wait_for(r"registered IPv4 LOCAL_OUT/PRE_ROUTING hooks", timeout=5):
         pytest.fail("Module did not log successful netfilter hook registration")
 

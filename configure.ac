@@ -84,49 +84,6 @@ AS_IF([test "x$ac_cv_have_timer_container_of" = xyes], [
             [Define to 1 if timer_container_of is available])
 ])
 
-AC_CACHE_CHECK([whether ip_route_input takes DSCP], [ac_cv_have_ip_route_input_dscp], [
-  conftest_dir="$ac_pwd/conftest-kbuild-$$"
-
-  rm -rf "$conftest_dir" ||
-    AC_MSG_FAILURE([failed to remove $conftest_dir])
-  mkdir -p "$conftest_dir" ||
-    AC_MSG_FAILURE([failed to create $conftest_dir])
-
-  trap 'rm -rf "$conftest_dir"' 0 1 2 15
-
-  cat >"$conftest_dir/Makefile" <<'EOF'
-obj-m := conftest.o
-EOF
-
-  cat >"$conftest_dir/conftest.c" <<'EOF'
-#include <linux/module.h>
-#include <linux/skbuff.h>
-#include <linux/ip.h>
-#include <linux/netdevice.h>
-#include <net/ip.h>
-#include <net/route.h>
-
-static int conftest_ip_route_input_dscp(struct sk_buff *skb,
-                                        const struct iphdr *iph,
-                                        struct net_device *dev)
-{
-    return ip_route_input(skb, iph->daddr, iph->saddr, ip4h_dscp(iph), dev);
-}
-
-MODULE_LICENSE("GPL");
-EOF
-
-  if ${MAKE-make} -C "$KDIR" M="$conftest_dir" modules \
-      >"$conftest_dir/build.log" 2>&1; then
-    ac_cv_have_ip_route_input_dscp=yes
-  else
-    ac_cv_have_ip_route_input_dscp=no
-  fi
-
-  rm -rf "$conftest_dir"
-  trap - 0 1 2 15
-])
-
 AS_IF([test "x$ac_cv_have_ip_route_input_dscp" = xyes], [
   AC_DEFINE(
     [HAVE_IP_ROUTE_INPUT_DSCP], [1],
@@ -229,6 +186,98 @@ AS_IF([test "x$ac_cv_have_base64_decode_3args" = xyes], [
 AS_IF([test "x$ac_cv_have_base64_decode_5args" = xno && test "x$ac_cv_have_base64_decode_3args" = xno], [
   AC_MSG_ERROR([kernel does not have a supported base64_decode interface])
 ])
+
+AC_CACHE_CHECK([for linux/hex.h], [ac_cv_have_linux_hex_h], [
+  conftest_dir="$ac_pwd/conftest-kbuild-$$"
+
+  rm -rf "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to remove $conftest_dir])
+  mkdir -p "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to create $conftest_dir])
+
+  trap 'rm -rf "$conftest_dir"' 0 1 2 15
+
+  cat >"$conftest_dir/Makefile" <<'EOF'
+obj-m := conftest.o
+EOF
+
+  cat >"$conftest_dir/conftest.c" <<'EOF'
+#include <linux/module.h>
+#include <linux/hex.h>
+
+static int conftest_linux_hex_h(void)
+{
+    return 0;
+}
+
+module_init(conftest_linux_hex_h);
+MODULE_LICENSE("GPL");
+EOF
+
+  if ${MAKE-make} -C "$KDIR" M="$conftest_dir" modules \
+      >"$conftest_dir/build.log" 2>&1; then
+    ac_cv_have_linux_hex_h=yes
+  else
+    cat "$conftest_dir/build.log" >&5
+    ac_cv_have_linux_hex_h=no
+  fi
+
+  rm -rf "$conftest_dir"
+  trap - 0 1 2 15
+])
+
+AS_IF([test "x$ac_cv_have_linux_hex_h" = xyes], [
+  AC_DEFINE(
+    [HAVE_LINUX_HEX_H], [1],
+    [Define to 1 if <linux/hex.h> is available]
+  )
+])
+AC_CACHE_CHECK([for net/gso.h], [ac_cv_have_net_gso_h], [
+  conftest_dir="$ac_pwd/conftest-kbuild-$$"
+
+  rm -rf "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to remove $conftest_dir])
+  mkdir -p "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to create $conftest_dir])
+
+  trap 'rm -rf "$conftest_dir"' 0 1 2 15
+
+  cat >"$conftest_dir/Makefile" <<'EOF'
+obj-m := conftest.o
+EOF
+
+  cat >"$conftest_dir/conftest.c" <<'EOF'
+#include <linux/module.h>
+#include <net/gso.h>
+
+static int conftest_net_gso_h(void)
+{
+    return 0;
+}
+
+module_init(conftest_net_gso_h);
+MODULE_LICENSE("GPL");
+EOF
+
+  if ${MAKE-make} -C "$KDIR" M="$conftest_dir" modules \
+      >"$conftest_dir/build.log" 2>&1; then
+    ac_cv_have_net_gso_h=yes
+  else
+    cat "$conftest_dir/build.log" >&5
+    ac_cv_have_net_gso_h=no
+  fi
+
+  rm -rf "$conftest_dir"
+  trap - 0 1 2 15
+])
+
+AS_IF([test "x$ac_cv_have_net_gso_h" = xyes], [
+  AC_DEFINE(
+    [HAVE_NET_GSO_H], [1],
+    [Define to 1 if <net/gso.h> is available]
+  )
+])
+
 
 AC_CONFIG_FILES([Makefile])
 

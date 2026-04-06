@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Local Build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool make linux-headers-generic
+      - name: Build
+        run: |
+          ./autogen.sh
+          ./configure
+          make
+
+  format:
+    name: Format Check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          python3 -m venv venv
+          ./venv/bin/pip install black
+          wget -q https://github.com/cpp-linter/clang-tools-static-binaries/releases/latest/download/clang-format-22_linux-amd64 -O clang-format
+          chmod +x clang-format
+          sudo mv clang-format /usr/local/bin/
+      - name: Check Python format
+        run: ./venv/bin/black --check --diff .
+      - name: Check C format
+        run: |
+          clang-format -i src/*.[ch]
+          git diff --exit-code
+
+  test:
+    name: Test Kernel ${{ matrix.kernel }}
+    runs-on: ubuntu-24.04
+    needs:
+      - build
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel:
+          - v6.1.167
+          - v6.8.12
+          - v6.12.80
+          - v6.14.11
+          - v6.17.12
+          - v6.18.21
+          - v6.19.11
+          - v7.0-rc7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dkms build-essential autoconf automake make \
+            qemu-system-x86 virtiofsd python3-pytest linux-headers-generic pipx gcc-14 wireguard-tools
+          pipx install virtme-ng
+      - name: Cache Kernel
+        uses: actions/cache@v4
+        with:
+          path: kernels
+          key: ubuntu-kernel-${{ matrix.kernel }}
+      - name: Prepare Kernel
+        run: |
+          python3 prepare-kernels.py ${{ matrix.kernel }}
+      - name: Run Tests
+        run: |
+          sudo chmod 666 /dev/kvm || true
+          export PATH="$HOME/.local/bin:$PATH"
+          which vng
+          vng --version
+          # Disable tests which requiring strict timing alignment, because github runners are simply too slow
+          pytest -vv -s tests \
+            -k "not test_liveness_timeout_recovers and not test_syn_isn_tie_break and not test_delayed_handshake_request_does_not_regress_ack and not test_device_down_invalidation_recreates_flow" \
+            --kernel ${{ matrix.kernel }}
+
+  release:
+    name: Release
+    runs-on: ubuntu-24.04
+    needs:
+      - build
+      - format
+      - test
+    if: ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool make
+
+      - name: Build Release Tarball
+        run: |
+          ./release-dkms.sh
+
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          STRIPPED_TAG=${TAG_NAME#v}
+
+          shopt -s nullglob
+          files=(phantun-dkms_*.tar.gz)
+
+          if [ "${#files[@]}" -ne 1 ]; then
+            echo "Expected exactly one phantun-dkms_*.tar.gz file, found ${#files[@]}" >&2
+            exit 1
+          fi
+
+          src=${files[0]}
+          dst="phantun-dkms_${STRIPPED_TAG}.tar.gz"
+
+          if [ "$src" != "$dst" ]; then
+            mv -- "$src" "$dst"
+          fi
+
+      - name: Create Pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: phantun-dkms_*.tar.gz

@@ -74,7 +74,6 @@ class VM:
     def start(self):
         cmd = [
             "vng",
-            "--empty-passwords",
             "--ssh",
             "--user",
             "root",
@@ -113,10 +112,12 @@ class VM:
             host_mod_dir = str(self.ubuntu_kernel_dir / "lib" / "modules" / self.kernel_ver)
             cmd.append(f"--overlay-rwdir=/lib/modules/{self.kernel_ver}={host_mod_dir}")
 
+        vng_log_path = self.session_log_dir / "vng.log"
+        self.vng_log = open(vng_log_path, "w")
         self.proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=self.vng_log,
+            stderr=subprocess.STDOUT,
             preexec_fn=os.setsid,
         )
 
@@ -124,7 +125,11 @@ class VM:
         res = subprocess.run(["vng", "--ssh-client", "--dry-run"], capture_output=True, text=True)
         if res.returncode != 0:
             raise Exception(f"Failed to get ssh client command: {res.stderr}")
-        self.base_ssh_cmd = shlex.split(res.stdout.strip())
+        full_ssh_cmd = shlex.split(res.stdout.strip())
+        if "--" in full_ssh_cmd:
+            self.base_ssh_cmd = full_ssh_cmd[: full_ssh_cmd.index("--")]
+        else:
+            self.base_ssh_cmd = full_ssh_cmd
         try:
             l_index = self.base_ssh_cmd.index("-l")
             self.base_ssh_cmd[l_index + 1] = "root"
@@ -143,7 +148,8 @@ class VM:
             except Exception:
                 pass
             if self.proc.poll() is not None:
-                raise Exception("vng process died prematurely.")
+                self.vng_log.close()
+                raise Exception(f"vng process died prematurely. Log: {vng_log_path.read_text()}")
 
         if not success:
             raise Exception("Timeout waiting for vng SSH to be available")
@@ -151,16 +157,17 @@ class VM:
         if self.ubuntu_kernel_dir:
             self.run(["depmod", "-a", self.kernel_ver])
 
+            gcc_target = "/usr/bin/gcc"
+            for v in [16, 15, 14, 13]:
+                if self.run(f"test -x /usr/bin/gcc-{v}", check=False).returncode == 0:
+                    gcc_target = f"/usr/bin/gcc-{v}"
+                    break
+
             # Symlink compilers that Ubuntu kernel Makefile might explicitly ask for
             for ver in [12, 13, 14, 15, 16]:
-                self.run(["ln", "-sf", "/usr/bin/gcc", f"/usr/bin/gcc-{ver}"], check=False)
+                self.run(f"test -e /usr/bin/gcc-{ver} || ln -sf {gcc_target} /usr/bin/gcc-{ver}", check=False)
                 self.run(
-                    [
-                        "ln",
-                        "-sf",
-                        "/usr/bin/gcc",
-                        f"/usr/bin/x86_64-linux-gnu-gcc-{ver}",
-                    ],
+                    f"test -e /usr/bin/x86_64-linux-gnu-gcc-{ver} || ln -sf {gcc_target} /usr/bin/x86_64-linux-gnu-gcc-{ver}",
                     check=False,
                 )
 
@@ -180,6 +187,8 @@ class VM:
             self.dmesg_proc.wait()
             self.dmesg_file.close()
 
+        if hasattr(self, "vng_log") and not self.vng_log.closed:
+            self.vng_log.close()
         if self.proc and self.proc.poll() is None:
             try:
                 os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
@@ -291,7 +300,12 @@ class PhantunModule:
                 f"cat /var/lib/dkms/{self.dkms_name}/build/make.log || true",
                 check=False,
             )
+            res_config_log = self.vm.run(
+                f"cat /var/lib/dkms/{self.dkms_name}/build/config.log || true",
+                check=False,
+            )
             print("MAKE.LOG:\n", res_log.stdout)
+            print("CONFIG.LOG:\n", res_config_log.stdout)
             raise
         self.vm.run(["dkms", "install", self.dkms_name])
 
@@ -309,7 +323,7 @@ class PhantunModule:
         else:
             self.vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
 
-        self.vm.run(["modprobe", self.mod_name])
+        self.vm.run(["modprobe", "-v", self.mod_name])
 
     def unload(self):
         self.vm.run(["modprobe", "-r", self.mod_name], check=False)

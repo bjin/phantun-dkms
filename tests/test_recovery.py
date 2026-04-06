@@ -1214,6 +1214,7 @@ def assert_flow_recreated_after_local_topology_change(vm, change_steps, label):
                 "target_addr": NS_ADDR_B,
                 "target_port": dst_port,
                 "payloads": ["msg2"],
+                "timeout_sec": 10,
             },
         )
         assert_completed(second, f"{label} second echo")

@@ -8,10 +8,6 @@
     from_timer(var, callback_timer, timer_fieldname)
 #endif
 
-#ifndef HAVE_IP_ROUTE_INPUT_DSCP
-#define ip4h_dscp(ip4h) ((ip4h)->tos)
-#endif
-
 #if defined(HAVE_BASE64_DECODE_5ARGS)
 #define BASE64_DECODE_COMPAT(src, srclen, dst)                                                     \
     base64_decode((src), (srclen), (dst), true, BASE64_STD)

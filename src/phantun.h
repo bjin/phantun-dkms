@@ -4,8 +4,6 @@
 #include <linux/kernel.h>
 #include <linux/types.h>
 
-#include "phantun_compat.h" // IWYU pragma: keep
-
 #define PHANTUN_MODULE_NAME "phantun"
 #define PHANTUN_MAX_MANAGED_PORTS 16
 #define PHANTUN_MAX_MANAGED_PEERS 16
