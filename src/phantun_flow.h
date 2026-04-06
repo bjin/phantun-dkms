@@ -16,18 +16,28 @@
 #define PHT_FLOW_BUCKETS 256U
 #define PHT_FLOW_GC_INTERVAL_SEC 30U
 
+/* Role is per flow generation, not per node. */
 enum pht_flow_role {
+    /* Local outbound UDP created the flow and emitted the opening SYN. */
     PHT_FLOW_ROLE_INITIATOR = 0,
+    /* Inbound bare SYN created the flow and this host answered with SYN|ACK. */
     PHT_FLOW_ROLE_RESPONDER,
 };
 
 enum pht_flow_state {
+    /* Local SYN sent; waiting for a valid SYN|ACK or a tie-break SYN collision. */
     PHT_FLOW_STATE_SYN_SENT = 0,
+    /* Remote bare SYN accepted; SYN|ACK sent; waiting for the final ACK. */
     PHT_FLOW_STATE_SYN_RCVD,
+    /* Three-way handshake complete; UDP <-> fake-TCP translation is live. */
     PHT_FLOW_STATE_ESTABLISHED,
+    /* Local tombstone while detach/GC drops ownership and outstanding refs. */
     PHT_FLOW_STATE_DEAD,
 };
 
+/* Canonical tuple key: endpoints are sorted lexicographically so outbound UDP
+ * creation and inbound bare SYN handling land in the same flow slot.
+ */
 struct pht_flow_key {
     __be32 low_addr;
     __be32 high_addr;
@@ -40,7 +50,18 @@ struct pht_flow_table;
 
 struct pht_flow {
     refcount_t refs;
+    /*
+     * lock protects mutable protocol state: state/seq/ack tracking,
+     * quarantine/drop-next shaping flags, the one-skb queue, retry counters,
+     * timestamps, and retransmit bookkeeping.
+     *
+     * It does not protect refs, hash/list membership, the timer object itself,
+     * or immutable identity/config fields set at create time.
+     */
     spinlock_t lock;
+    /* Serializes established-state transmit so flow->seq reservation and
+     * rollback happen in wire order. This supplements, not replaces, @lock.
+     */
     spinlock_t tx_lock;
     struct hlist_node hnode;
     struct list_head gc_node;
@@ -54,11 +75,19 @@ struct pht_flow {
     u32 ack;
     u32 last_ack;
     u32 local_isn;
+    /* Next remote sequence immediately after the peer's opening SYN. */
     u32 peer_syn_next;
+    /* Sequence window of the immediately previous generation on this tuple.
+     * Used only to absorb delayed packets after ESTABLISHED accepts a
+     * replacement bare SYN.
+     */
     u32 quarantine_prev_local_seq_start;
     u32 quarantine_prev_local_seq_end;
     u32 quarantine_prev_remote_seq_start;
     u32 quarantine_prev_remote_seq_end;
+    /* Bounded one-skb queue used while a flow is half-open or responder data
+     * is waiting for the injected handshake_response to clear.
+     */
     struct sk_buff *queued_skb;
     unsigned int retries_done;
     unsigned int max_retries;
@@ -67,12 +96,19 @@ struct pht_flow {
     unsigned long retransmit_at_jiffies;
     unsigned long quarantine_until_jiffies;
     unsigned int keepalives_sent;
+    /* True when the local endpoint occupies key.low_{addr,port}. */
     bool local_is_low;
+    /* Optional first-payload shaping state. drop_next_rx_* suppresses exactly
+     * one reserved inbound payload sequence; response_pending_ack blocks
+     * responder-owned local UDP until the injected response is ACKed or
+     * bypassed by later initiator traffic.
+     */
     u32 drop_next_rx_seq;
     bool drop_next_rx_payload;
     bool response_pending_ack;
     bool retransmit_armed;
     bool quarantine_prev_active;
+    /* Latched GC reason for the generation that just died. */
     bool hard_expired;
     bool liveness_failed;
 };

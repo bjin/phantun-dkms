@@ -215,6 +215,10 @@ static bool phantun_seq_between(u32 seq, u32 start, u32 end) {
     return phantun_seq_after_eq(seq, start) && phantun_seq_before_eq(seq, end);
 }
 
+/* Remember only the immediately previous generation on a tuple. During the
+ * short quarantine window, packets that still fit that old seq/ack space are
+ * dropped instead of provoking fresh RSTs after a replacement SYN wins.
+ */
 static void phantun_flow_arm_prev_generation_quarantine(struct pht_flow *flow, u32 prev_local_start,
                                                         u32 prev_local_end, u32 prev_remote_start,
                                                         u32 prev_remote_end) {
@@ -308,6 +312,10 @@ static bool phantun_tcp_syn_is_aligned(const struct pht_l4_view *view) {
     return view && ntohl(view->tcp->seq) % 4095U == 0;
 }
 
+/* Local reopen chooses a new aligned ISN outside reopen_guard_bytes of the
+ * previous local sequence space so delayed old-generation packets are less
+ * likely to fit the new flow.
+ */
 static bool phantun_pick_reopen_isn(u32 prev_seq, bool has_prev_seq, u32 *init_seq) {
     unsigned int attempt;
 
@@ -377,6 +385,10 @@ static int phantun_send_established_udp(struct pht_flow *flow,
         }
     }
 
+    /* Reserve sequence space before emitting so concurrent local senders stay
+     * ordered. If emit fails, roll back only when nothing advanced flow->seq
+     * in the meantime.
+     */
     spin_lock_bh(&flow->tx_lock);
     spin_lock_bh(&flow->lock);
     if (flow->state != PHT_FLOW_STATE_ESTABLISHED) {
@@ -628,6 +640,10 @@ static int phantun_confirm_outbound_udp_conntrack(struct sk_buff *skb) {
     return 0;
 }
 
+/* LOCAL_OUT owns selector-matched outbound UDP. ESTABLISHED flows send
+ * immediately, half-open flows keep only one queued skb, and DEAD flows are
+ * reopened from scratch with a guarded ISN.
+ */
 static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
                                       const struct nf_hook_state *state) {
     struct pht_l4_view view;
@@ -682,6 +698,11 @@ retry_lookup:
             hold_responder_data =
                 flow->role == PHT_FLOW_ROLE_RESPONDER && flow->response_pending_ack;
             spin_unlock_bh(&flow->lock);
+            /* Responder-owned UDP must wait while an injected
+             * handshake_response still needs peer acknowledgement or later
+             * initiator data to prove the reserved control slot was
+             * skipped.
+             */
             if (hold_responder_data) {
                 queued = pht_flow_queue_skb_if_empty(flow, skb);
                 if (!queued)
@@ -711,6 +732,10 @@ retry_lookup:
             return NF_STOLEN;
         }
 
+        /* DEAD still occupies the canonical slot until we unhash it. Drop
+         * that generation and retry so a fresh initiator flow can inherit
+         * the reopen guard from the old sequence space.
+         */
         if (state_now == PHT_FLOW_STATE_DEAD) {
             prev_seq = flow->seq;
             has_prev_seq = true;
@@ -749,6 +774,9 @@ retry_lookup:
     pht_flow_set_queued_skb(new_flow, skb);
 
     ret = pht_flow_insert(flows, new_flow);
+    /* Another CPU won the canonical-tuple race. Reuse its flow instead of
+     * creating a parallel generation.
+     */
     if (ret == -EEXIST) {
         skb = pht_flow_take_queued_skb(new_flow);
         pht_flow_put(new_flow);
@@ -813,6 +841,10 @@ static unsigned int phantun_pre_routing_segment_gso(void *priv, struct sk_buff *
     return NF_STOLEN;
 }
 
+/* Selector-matched raw inbound UDP is dropped before local delivery so a
+ * tuple is owned either by fake-TCP translation or by nothing. Reinject-marked
+ * UDP is exempt because it already came out of the translator.
+ */
 static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb,
                                                  const struct nf_hook_state *state) {
     struct pht_l4_view view;
@@ -841,6 +873,10 @@ static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb
     return NF_STOLEN;
 }
 
+/* PRE_ROUTING owns selector-matched fake-TCP before the real TCP stack sees
+ * it. Unknown owned packets are rejected unless they are valid bare SYNs that
+ * create a new responder flow.
+ */
 static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                                         const struct nf_hook_state *state) {
     struct pht_l4_view view;
@@ -918,6 +954,9 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 pht_pr_warn_rl("failed to emit RST|ACK for misaligned SYN: %d\n", ret);
             return NF_DROP;
         }
+        /* Only a bare aligned SYN is allowed to create responder state for an
+         * otherwise unknown owned tuple.
+         */
     process_as_new_syn:
         new_flow = pht_flow_create(flows, &ep, PHT_FLOW_ROLE_RESPONDER, PHT_FLOW_STATE_SYN_RCVD);
         if (IS_ERR(new_flow)) {
@@ -973,6 +1012,9 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         return NF_DROP;
     }
 
+    /* Initiator half-open state: accept only collision SYNs, the matching
+     * SYN|ACK, or RST. Simultaneous initiation collapses by comparing ISNs.
+     */
     if (state_now == PHT_FLOW_STATE_SYN_SENT) {
         if (phantun_tcp_is_bare_syn(&view)) {
             u32 peer_isn;
@@ -1043,6 +1085,11 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
         if (view.tcp->syn && view.tcp->ack && view.payload_len == 0 &&
             ntohl(view.tcp->ack_seq) == expected_ack) {
+            /* Handshake establishment is complete even if the responder later
+             * sends an injected handshake_response. Reserve responder_seq + 1
+             * so that optional control payload is ignored by sequence instead
+             * of being treated as required handshake data.
+             */
             spin_lock_bh(&flow->lock);
             flow->seq = flow->local_isn + 1;
             flow->ack = ntohl(view.tcp->seq) + 1;
@@ -1093,6 +1140,9 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         return NF_DROP;
     }
 
+    /* Responder half-open state: duplicate SYN retransmits SYN|ACK, and only
+     * the exact final ACK can complete the handshake.
+     */
     if (state_now == PHT_FLOW_STATE_SYN_RCVD) {
         if (!view.tcp->ack || ntohl(view.tcp->ack_seq) != expected_ack) {
             if (phantun_flow_should_drop_quarantined_packet(flow, &view)) {
@@ -1107,6 +1157,10 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             return NF_DROP;
         }
 
+        /* request shaping reserves initiator_seq + 1. If the final ACK already
+         * carries payload at that exact sequence, drop it now; otherwise arm
+         * the ignore slot for the later packet with that starting sequence.
+         */
         spin_lock_bh(&flow->lock);
         flow->seq = flow->local_isn + 1;
         flow->ack = flow->peer_syn_next;
@@ -1120,6 +1174,11 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             bool drop_open_payload = view.payload_len && phantun_request_enabled() &&
                                      ntohl(view.tcp->seq) == peer_syn_next;
 
+            /* Injected handshake_response occupies responder_seq + 1.
+             * Keep responder-owned UDP blocked until the peer ACKs that
+             * range or later initiator payload proves the control slot was
+             * skipped.
+             */
             if (phantun_response_enabled()) {
                 if (drop_open_payload) {
                     phantun_note_inbound_payload(flow, &view);
@@ -1187,6 +1246,10 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         }
     }
 
+    /* ESTABLISHED handling still prioritizes flags over payload. Duplicate
+     * open packets are absorbed, bare SYN can replace the generation, any
+     * other SYN is fatal, and plain ACK/data continues the stream.
+     */
     if (state_now == PHT_FLOW_STATE_ESTABLISHED) {
         bool response_unblocked = false;
         bool drop_payload = false;
@@ -1216,6 +1279,10 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                     pht_flow_put(flow);
                     return NF_DROP;
                 }
+                /* Accept bare replacement SYN as a new generation. Preserve
+                 * only the just-replaced seq/ack window so delayed old packets
+                 * are dropped quietly during the quarantine window.
+                 */
                 spin_lock_bh(&flow->lock);
                 quarantine_prev_local_seq_start = flow->local_isn;
                 quarantine_prev_local_seq_end = flow->seq;

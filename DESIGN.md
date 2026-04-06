@@ -456,7 +456,7 @@ Hook:
 
 Priority:
 
-- before conntrack (default design target: `-400`)
+- after initial `LOCAL_OUT` conntrack classification (current code target: `-199`)
 
 Match policy for v1:
 
@@ -470,13 +470,14 @@ Behavior:
 - if established flow exists: consume UDP skb and emit fake-TCP skb
 - if handshaking flow exists: queue one skb or drop
 - if no flow exists: create initiator flow, queue one skb, send `SYN`
+- if the skb already carries conntrack state, confirm that original UDP entry before stealing the packet so translated inbound replies can match ESTABLISHED host-firewall policy
 - original UDP skb is stolen from the stack
 
 Why `LOCAL_OUT`:
 
 - catches both kernel WireGuard and `wireguard-go` traffic without changing application configuration
 - avoids TUN routing and NAT topology
-- allows the module to see locally generated UDP before it becomes a normal UDP transmission
+- lets the module see locally generated UDP after the host classified the original UDP flow, but before the packet leaves as normal UDP
 
 ## 9.2 Inbound fake-TCP interception
 

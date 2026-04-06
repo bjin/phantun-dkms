@@ -15,6 +15,9 @@ static u32 pht_flow_hash_key(const struct pht_flow_key *key) {
     return jhash(key, sizeof(*key), 0) & (PHT_FLOW_BUCKETS - 1);
 }
 
+/* Compare endpoints in host order so the canonical key is stable across both
+ * traffic directions.
+ */
 static int pht_endpoint_cmp(__be32 addr_a, __be16 port_a, __be32 addr_b, __be16 port_b) {
     if (ntohl(addr_a) < ntohl(addr_b))
         return -1;
@@ -78,6 +81,10 @@ static int pht_flow_retransmit_now(struct pht_flow *flow) {
 
 static void pht_flow_gc_worker(struct work_struct *work);
 
+/* Only half-open flows use the retransmit timer. Exhausting the retry budget
+ * is a handshake failure, so we fail locally with RST and leave reopen to the
+ * normal packet path.
+ */
 static void pht_flow_retransmit_timer(struct timer_list *timer) {
     struct pht_flow *flow = timer_container_of(flow, timer, retransmit_timer);
     unsigned long next;
@@ -234,6 +241,11 @@ static void pht_flow_detach_all(struct pht_flow_table *table, struct list_head *
     }
 }
 
+/* GC also drives keepalive/liveness policy. On liveness failure, preserve the
+ * single queued outbound UDP skb by reinjecting it through LOCAL_OUT so the
+ * next pass can reopen the tuple instead of silently dropping the caller's
+ * trigger packet.
+ */
 static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list_head *expired,
                                        struct sk_buff_head *reinject_list) {
     unsigned int i;

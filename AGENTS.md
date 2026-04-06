@@ -39,6 +39,7 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 ## Coding style / safety
 - LLVM styles with 4 space tab width, small static helpers, explicit return-value checks.
 * Trailing whitespaces should by removed in C and Python code.
+- Write comments for an experienced kernel reviewer with little to no `DESIGN.md` context: explain non-obvious invariants, state-machine transitions, lock ownership, and edge cases; do not comment obvious code.
 - Do not sleep in hook/atomic paths; use `GFP_ATOMIC` there.
 - Prefer cached config/state in hot paths instead of reparsing strings.
 - Use clear cleanup paths; keep teardown idempotent and avoid `BUG()` for recoverable failures.
