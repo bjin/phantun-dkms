@@ -1584,6 +1584,7 @@ static int phantun_validate_config(void) {
     }
     return 0;
 }
+
 static int phantun_base64_decode(const char *src, size_t srclen, u8 **out_dst,
                                  unsigned int *out_len) {
     u8 *dst;
