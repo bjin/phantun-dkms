@@ -13,25 +13,6 @@ require_command() {
     fi
 }
 
-require_debian_host() {
-    if [ ! -r /etc/os-release ]; then
-        echo "Error: release-dkms-deb.sh must be run on a Debian-based system" >&2
-        exit 1
-    fi
-
-    # dpkg-deb exists on Debian derivatives and is the tool that actually
-    # emits the package; do not hide this behind Docker.
-    . /etc/os-release
-    case " ${ID:-} ${ID_LIKE:-} " in
-        *" debian "*)
-            ;;
-        *)
-            echo "Error: release-dkms-deb.sh must be run on a Debian-based system" >&2
-            exit 1
-            ;;
-    esac
-}
-
 write_control_file() {
     cat >"$1" <<EOF
 Package: ${PACKAGE_NAME}
@@ -88,7 +69,6 @@ esac
 EOF
 }
 
-require_debian_host
 require_command dpkg-deb
 require_command tar
 require_command readlink
