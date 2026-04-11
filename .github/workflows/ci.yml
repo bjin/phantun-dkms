@@ -81,10 +81,15 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           which vng
           vng --version
-          # Disable tests which requiring strict timing alignment, because github runners are simply too slow
-          pytest -vv -s tests \
-            -k "not test_liveness_timeout_recovers and not test_syn_isn_tie_break and not test_delayed_handshake_request_does_not_regress_ack and not test_device_down_invalidation_recreates_flow" \
-            --kernel ${{ matrix.kernel }}
+          pytest -vv tests --kernel ${{ matrix.kernel }}
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phantun-test-logs-${{ matrix.kernel }}
+          path: /tmp/phantun-test-logs/
+          if-no-files-found: ignore
 
   release:
     name: Release

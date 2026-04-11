@@ -3,7 +3,7 @@ import select
 import socket
 import struct
 import sys
-
+from pathlib import Path
 TIMEOUT_SEC = 5
 
 
@@ -369,68 +369,75 @@ def capture_tcp_packet(config):
     src_port = config["bind_port"]
     dst_port = config["target_port"]
     expected_payload = config.get("payload")
+    ready_file = config.get("ready_file")
     if isinstance(expected_payload, str):
         expected_payload = expected_payload.encode()
 
     with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0800)) as raw_sock:
         raw_sock.settimeout(config.get("timeout_sec", TIMEOUT_SEC))
+        if ready_file:
+            Path(ready_file).write_text("ready\n")
 
-        while True:
-            frame, _ = raw_sock.recvfrom(65535)
-            if len(frame) < 14 + 20 + 20:
-                continue
-            if struct.unpack("!H", frame[12:14])[0] != 0x0800:
-                continue
+        try:
+            while True:
+                frame, _ = raw_sock.recvfrom(65535)
+                if len(frame) < 14 + 20 + 20:
+                    continue
+                if struct.unpack("!H", frame[12:14])[0] != 0x0800:
+                    continue
 
-            ip_offset = 14
-            version_ihl = frame[ip_offset]
-            if version_ihl >> 4 != 4:
-                continue
-            ihl = (version_ihl & 0x0F) * 4
-            if frame[ip_offset + 9] != socket.IPPROTO_TCP:
-                continue
+                ip_offset = 14
+                version_ihl = frame[ip_offset]
+                if version_ihl >> 4 != 4:
+                    continue
+                ihl = (version_ihl & 0x0F) * 4
+                if frame[ip_offset + 9] != socket.IPPROTO_TCP:
+                    continue
 
-            packet_src_addr = socket.inet_ntoa(frame[ip_offset + 12 : ip_offset + 16])
-            packet_dst_addr = socket.inet_ntoa(frame[ip_offset + 16 : ip_offset + 20])
-            if packet_src_addr != src_addr or packet_dst_addr != dst_addr:
-                continue
+                packet_src_addr = socket.inet_ntoa(frame[ip_offset + 12 : ip_offset + 16])
+                packet_dst_addr = socket.inet_ntoa(frame[ip_offset + 16 : ip_offset + 20])
+                if packet_src_addr != src_addr or packet_dst_addr != dst_addr:
+                    continue
 
-            total_len = struct.unpack("!H", frame[ip_offset + 2 : ip_offset + 4])[0]
-            tcp_offset = ip_offset + ihl
-            tcp_header = frame[tcp_offset : tcp_offset + 20]
-            if len(tcp_header) < 20:
-                continue
+                total_len = struct.unpack("!H", frame[ip_offset + 2 : ip_offset + 4])[0]
+                tcp_offset = ip_offset + ihl
+                tcp_header = frame[tcp_offset : tcp_offset + 20]
+                if len(tcp_header) < 20:
+                    continue
 
-            (
-                packet_src_port,
-                packet_dst_port,
-                seq,
-                ack,
-                data_offset,
-                flags,
-                _,
-                _,
-                _,
-            ) = struct.unpack("!HHLLBBHHH", tcp_header)
-            if packet_src_port != src_port or packet_dst_port != dst_port:
-                continue
+                (
+                    packet_src_port,
+                    packet_dst_port,
+                    seq,
+                    ack,
+                    data_offset,
+                    flags,
+                    _,
+                    _,
+                    _,
+                ) = struct.unpack("!HHLLBBHHH", tcp_header)
+                if packet_src_port != src_port or packet_dst_port != dst_port:
+                    continue
 
-            tcp_header_len = (data_offset >> 4) * 4
-            payload_start = tcp_offset + tcp_header_len
-            payload_end = ip_offset + total_len
-            payload = frame[payload_start:payload_end]
-            if expected_payload is not None and payload != expected_payload:
-                continue
+                tcp_header_len = (data_offset >> 4) * 4
+                payload_start = tcp_offset + tcp_header_len
+                payload_end = ip_offset + total_len
+                payload = frame[payload_start:payload_end]
+                if expected_payload is not None and payload != expected_payload:
+                    continue
 
-            _emit(
-                {
-                    "seq": seq,
-                    "ack": ack,
-                    "flags": flags,
-                    "payload": payload.decode(errors="ignore"),
-                }
-            )
-            return
+                _emit(
+                    {
+                        "seq": seq,
+                        "ack": ack,
+                        "flags": flags,
+                        "payload": payload.decode(errors="ignore"),
+                    }
+                )
+                return
+        finally:
+            if ready_file:
+                Path(ready_file).unlink(missing_ok=True)
 
 
 SCENARIOS = {
