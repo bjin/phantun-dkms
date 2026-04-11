@@ -1798,5 +1798,6 @@ module_exit(phantun_exit);
 // SPDX-License-Identifier: GPL-2.0-or-later
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Bin Jin");
-MODULE_DESCRIPTION("Kernel-mode phantun-style fake-tcp tunnel");
+MODULE_DESCRIPTION(
+    "Kernel module re-implementation of phantun, transform UDP streams into fake-TCP streams");
 MODULE_VERSION(PACKAGE_VERSION);
