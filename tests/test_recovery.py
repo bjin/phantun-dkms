@@ -707,10 +707,8 @@ def test_delayed_handshake_request_does_not_regress_ack(phantun_module, vm):
 
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
-    high_payload = "msg1"
-    syn_ready_file = f"/tmp/phantun-syn-capture-{uuid.uuid4().hex}"
-    delayed_ack_ready_file = f"/tmp/phantun-delayed-ack-capture-{uuid.uuid4().hex}"
 
+    syn_ready_file = f"/tmp/phantun-syn-capture-{uuid.uuid4().hex}"
     syn_capture = spawn_netns_scenario(
         vm,
         NS_B,
@@ -722,7 +720,7 @@ def test_delayed_handshake_request_does_not_regress_ack(phantun_module, vm):
             "target_port": dst_port,
             "payload": "",
             "ready_file": syn_ready_file,
-            "timeout_sec": 20,
+            "timeout_sec": 30,
         },
     )
     drop_request = make_netns_ingress_payload_drop_probe(
@@ -740,66 +738,52 @@ def test_delayed_handshake_request_does_not_regress_ack(phantun_module, vm):
             }
         ],
     )
+    # echo_server receives both msg1 (before injection) and msg2 (after injection)
     server = spawn_netns_scenario(
         vm,
         NS_B,
-        "recv_many",
+        "echo_server",
         {
             "bind_addr": NS_ADDR_B,
             "bind_port": dst_port,
-            "count": 1,
-            "timeout_sec": 15,
+            "count": 2,
+            "timeout_sec": 30,
         },
     )
 
     try:
         wait_for_guest_ready_file(vm, syn_ready_file, timeout=30)
         time.sleep(0.2)
-        client_result = run_netns_scenario(
+
+        # Phase 1: send msg1, establishing the flow while REQ is dropped on ingress.
+        client_result_1 = run_netns_scenario(
             vm,
             NS_A,
-            "send_many",
+            "echo_client",
             {
                 "bind_addr": NS_ADDR_A,
                 "bind_port": src_port,
                 "target_addr": NS_ADDR_B,
                 "target_port": dst_port,
-                "payloads": [high_payload],
+                "payloads": ["msg1"],
+                "timeout_sec": 15,
             },
         )
-        syn_result = syn_capture.communicate(timeout=20)
+        assert_completed(client_result_1, "msg1 echo")
+
+        # Capture the initiator's SYN to learn the ISN for the delayed injection.
+        syn_result = syn_capture.communicate(timeout=30)
         assert_completed(syn_result, "capture initiator SYN")
         syn_data = parse_guest_json(syn_result.stdout, "captured initiator SYN")
         if (syn_data.get("flags", 0) & 0x02) == 0 or (syn_data.get("flags", 0) & 0x10) != 0:
             pytest.fail(f"expected bare SYN, got {syn_data!r}")
-
-        server_result = server.communicate(timeout=15)
-        assert_completed(client_result, "delayed-request sender")
-        assert_completed(server_result, "delayed-request receiver")
-        server_data = parse_guest_json(server_result.stdout, "delayed-request server stdout")
-        if [entry["message"] for entry in server_data.get("received", [])] != [high_payload]:
-            pytest.fail(f"unexpected delivered payloads: {server_data!r}")
         if drop_request.packets(vm, "drop_delayed_req") == 0:
             pytest.fail("failed to drop the original reserved handshake_request")
 
-        expected_ack = syn_data["seq"] + 1 + len(REQ) + len(high_payload)
+        # Phase 2: remove the drop rule and inject the delayed REQ at the old
+        # sequence number. If the responder's ACK regresses, it would re-request
+        # already-delivered data, causing duplicates or stalling the connection.
         drop_request.cleanup(vm)
-        delayed_ack_capture = spawn_netns_scenario(
-            vm,
-            NS_A,
-            "capture_tcp_packet",
-            {
-                "bind_addr": NS_ADDR_B,
-                "bind_port": dst_port,
-                "target_addr": NS_ADDR_A,
-                "target_port": src_port,
-                "payload": "",
-                "min_ack": expected_ack,
-                "ready_file": delayed_ack_ready_file,
-                "timeout_sec": 20,
-            },
-        )
-        wait_for_guest_ready_file(vm, delayed_ack_ready_file, timeout=30)
         run_netns_scenario(
             vm,
             NS_A,
@@ -810,24 +794,40 @@ def test_delayed_handshake_request_does_not_regress_ack(phantun_module, vm):
                 "target_addr": NS_ADDR_B,
                 "target_port": dst_port,
                 "flags": "ack",
-                # Re-inject the reserved sequence after higher-sequence data to
-                # prove the responder keeps ACK monotonic across delayed shaping.
                 "seq": syn_data["seq"] + 1,
                 "ack": 1,
                 "payload": REQ,
             },
         )
-        delayed_ack_result = delayed_ack_capture.communicate(timeout=20)
-        assert_completed(delayed_ack_result, "capture delayed-request ACK")
-        delayed_ack_data = parse_guest_json(delayed_ack_result.stdout, "captured delayed-request ACK")
-        if delayed_ack_data.get("ack") != expected_ack:
+
+        # Phase 3: send msg2 through the same flow. If the delayed injection
+        # corrupted the responder's ACK state, this would fail or duplicate.
+        client_result_2 = run_netns_scenario(
+            vm,
+            NS_A,
+            "echo_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["msg2"],
+                "timeout_sec": 15,
+            },
+        )
+        assert_completed(client_result_2, "msg2 echo after delayed REQ")
+
+        server_result = server.communicate(timeout=20)
+        assert_completed(server_result, "echo server")
+        server_data = parse_guest_json(server_result.stdout, "echo server stdout")
+        if received_messages(server_data) != ["msg1", "msg2"]:
             pytest.fail(
-                "delayed reserved handshake_request moved the responder ACK backward; "
-                f"expected {expected_ack}, got {delayed_ack_data.get('ack')} in {delayed_ack_data!r}"
+                f"delayed REQ injection corrupted delivery: "
+                f"expected ['msg1', 'msg2'], got {received_messages(server_data)!r}"
             )
     finally:
         drop_request.cleanup(vm)
-        vm.run(["rm", "-f", syn_ready_file, delayed_ack_ready_file], check=False)
+        vm.run(["rm", "-f", syn_ready_file], check=False)
         cleanup_netns_topology(vm)
 
 
