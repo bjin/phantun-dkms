@@ -17,8 +17,7 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 - Build module: `make`
 - Refresh compile database: `make compile_commands`
 - If autodetect fails, pass `KDIR=/path/to/kernel/build`
-* Format C: `clang-format -i --style=file src/some_file.c` (only do this before staging changes)
-* Format Python: `python3 -m black some_file.py` (only do this before staging changes)
+* Format: `./format.sh`
 
 ## Testing
 - Integration tests use `pytest` + `virtme-ng` (COW snapshots).
