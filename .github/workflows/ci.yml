@@ -107,32 +107,39 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y autoconf automake libtool make
+          sudo apt-get install -y autoconf automake libtool make dkms
 
-      - name: Build Release Tarball
+      - name: Build Release Artifacts
         run: |
-          ./release-dkms.sh
+          ./release-dkms-deb.sh
 
           TAG_NAME=${GITHUB_REF#refs/tags/}
           STRIPPED_TAG=${TAG_NAME#v}
 
+          rename_release_artifact() {
+            local pattern=$1
+            local dst=$2
+            local files=($pattern)
+
+            if [ "${#files[@]}" -ne 1 ]; then
+              echo "Expected exactly one ${pattern} file, found ${#files[@]}" >&2
+              exit 1
+            fi
+
+            local src=${files[0]}
+            if [ "$src" != "$dst" ]; then
+              mv -- "$src" "$dst"
+            fi
+          }
+
           shopt -s nullglob
-          files=(phantun-dkms_*.tar.gz)
-
-          if [ "${#files[@]}" -ne 1 ]; then
-            echo "Expected exactly one phantun-dkms_*.tar.gz file, found ${#files[@]}" >&2
-            exit 1
-          fi
-
-          src=${files[0]}
-          dst="phantun-dkms_${STRIPPED_TAG}.tar.gz"
-
-          if [ "$src" != "$dst" ]; then
-            mv -- "$src" "$dst"
-          fi
+          rename_release_artifact "phantun-dkms_*.tar.gz" "phantun-dkms_${STRIPPED_TAG}.tar.gz"
+          rename_release_artifact "phantun-dkms_*_all.deb" "phantun-dkms_${STRIPPED_TAG}_all.deb"
 
       - name: Create Pre-release
         uses: softprops/action-gh-release@v2
         with:
           prerelease: true
-          files: phantun-dkms_*.tar.gz
+          files: |
+            phantun-dkms_*.tar.gz
+            phantun-dkms_*.deb
