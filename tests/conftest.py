@@ -5,7 +5,6 @@ import os
 import signal
 import shlex
 import shutil
-import re
 from pathlib import Path
 from datetime import datetime
 
@@ -231,16 +230,17 @@ class DmesgMonitor:
             self.offset = f.tell()  # advance offset so we only read new lines each time
             return lines
 
-    def wait_for(self, pattern, timeout=5):
+    def clear(self):
+        self.pending_lines = []
+
+    def wait_for(self, substr, timeout=5):
         start_time = time.time()
         while time.time() - start_time < timeout:
             self.pending_lines.extend(self.get_new_lines())
 
-            # Keep unmatched lines pending so ordered waits can still observe
-            # earlier messages that were read while waiting for a different one.
             for i, line in enumerate(self.pending_lines):
-                if re.search(pattern, line):
-                    del self.pending_lines[i]
+                if substr in line:
+                    del self.pending_lines[0:i]
                     return True
 
             time.sleep(0.5)

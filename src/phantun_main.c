@@ -1747,6 +1747,8 @@ static void phantun_log_config(void) {
 static int __init phantun_init(void) {
     int ret;
 
+    pht_pr_info(PHANTUN_MODULE_NAME " %s loaded\n", PACKAGE_VERSION);
+
     ret = phantun_validate_config();
     if (ret)
         return ret;
@@ -1770,7 +1772,6 @@ static int __init phantun_init(void) {
     if (ret)
         goto err_pernet;
 
-    pr_info(PHANTUN_MODULE_NAME " %s loaded\n", PACKAGE_VERSION);
     return 0;
 
 err_pernet:
@@ -1789,7 +1790,7 @@ static void __exit phantun_exit(void) {
     pht_stats_exit_sysfs();
     kfree(phantun_alloc_req);
     kfree(phantun_alloc_resp);
-    pr_info(PHANTUN_MODULE_NAME " unloaded\n");
+    pht_pr_info(PHANTUN_MODULE_NAME " unloaded\n");
 }
 
 module_init(phantun_init);

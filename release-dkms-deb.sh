@@ -76,12 +76,11 @@ require_command dirname
 require_command mktemp
 
 VERSION=$("${SCRIPT_DIR}/dkms-version.sh")
-TARBALL="${SCRIPT_DIR}/${PACKAGE_NAME}_${VERSION}.tar.gz"
 PACKAGE_FILE="${SCRIPT_DIR}/${PACKAGE_NAME}_${VERSION}_${PACKAGE_ARCH}.deb"
 WORK_DIR=$(mktemp -d "${SCRIPT_DIR}/.release-dkms-deb.XXXXXX")
 trap 'rm -rf "$WORK_DIR"' EXIT HUP INT TERM
 
-"${SCRIPT_DIR}/release-dkms.sh"
+TARBALL=$("${SCRIPT_DIR}/release-dkms.sh")
 
 if [ ! -f "$TARBALL" ]; then
     echo "Error: Expected tarball not found: $TARBALL" >&2

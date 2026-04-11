@@ -1,11 +1,11 @@
 #!/bin/sh
-set -e
-
-if [ ! -f "configure" ] || [ ! -f "config.h.in" ]; then
-    ./autogen.sh
-fi
+set -eu
 
 VERSION=$(./dkms-version.sh)
+
+if [ ! -f "configure" ] || [ ! -f "config.h.in" ] || ! grep -F "PACKAGE_VERSION='$VERSION'" -q -m1 configure; then
+    ./autogen.sh
+fi
 
 TARBALL="phantun-dkms_${VERSION}.tar.gz"
 
@@ -18,3 +18,5 @@ tar czf "${TARBALL}" \
     Kbuild \
     Makefile.in \
     LICENSE
+
+printf "%s\n" "${TARBALL}"
