@@ -1,3 +1,4 @@
+import re
 import pytest
 
 
@@ -26,6 +27,8 @@ def test_module_load_success(phantun_module, dmesg, vm):
     res = vm.run(["lsmod"])
     if "phantun" not in res.stdout:
         pytest.fail("phantun module is not loaded in lsmod")
+    if not dmesg.wait_for(rf"phantun {re.escape(phantun_module.version)} loaded", timeout=5):
+        pytest.fail("Module did not log successful module initialization")
     if not dmesg.wait_for(r"registered IPv4 LOCAL_OUT/PRE_ROUTING hooks", timeout=5):
         pytest.fail("Module did not log successful netfilter hook registration")
 
@@ -46,6 +49,8 @@ def test_module_unload_success(phantun_module, dmesg, vm):
 
     if not dmesg.wait_for(r"unregistered netfilter hooks", timeout=5):
         pytest.fail("Module did not log successful netfilter hook unregistration")
+    if not dmesg.wait_for(r"phantun unloaded", timeout=5):
+        pytest.fail("Module did not log successful module unload")
 
 
 def test_module_reload_new_params(phantun_module, dmesg):

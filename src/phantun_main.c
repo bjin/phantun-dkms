@@ -88,6 +88,8 @@ struct phantun_net {
     struct notifier_block netdev_nb;
 };
 
+static unsigned int phantun_netns_id(const struct net *net) { return net ? net->ns.inum : 0; }
+
 static struct pht_flow_table *phantun_net_flows(const struct net *net) {
     struct phantun_net *pnet;
 
@@ -1502,7 +1504,8 @@ static int __net_init phantun_net_init(struct net *net) {
         return ret;
     }
 
-    pht_pr_info("registered IPv4 LOCAL_OUT/PRE_ROUTING hooks and topology notifiers\n");
+    pht_pr_info("registered IPv4 LOCAL_OUT/PRE_ROUTING hooks and topology notifiers: netns %u\n",
+                phantun_netns_id(net));
     return 0;
 }
 
@@ -1517,7 +1520,8 @@ static void __net_exit phantun_net_exit(struct net *net) {
     nf_unregister_net_hooks(net, phantun_nf_ops, ARRAY_SIZE(phantun_nf_ops));
     unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
     pht_flow_table_destroy(flows);
-    pht_pr_info("unregistered netfilter hooks and topology notifiers\n");
+    pht_pr_info("unregistered netfilter hooks and topology notifiers: netns %u\n",
+                phantun_netns_id(net));
 }
 
 static struct pernet_operations phantun_pernet_ops = {
@@ -1765,6 +1769,7 @@ static int __init phantun_init(void) {
     if (ret)
         goto err_pernet;
 
+    pr_info(PHANTUN_MODULE_NAME " %s loaded\n", PACKAGE_VERSION);
     return 0;
 
 err_pernet:
@@ -1783,6 +1788,7 @@ static void __exit phantun_exit(void) {
     pht_stats_exit_sysfs();
     kfree(phantun_alloc_req);
     kfree(phantun_alloc_resp);
+    pr_info(PHANTUN_MODULE_NAME " unloaded\n");
 }
 
 module_init(phantun_init);

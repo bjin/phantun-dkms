@@ -220,6 +220,7 @@ class DmesgMonitor:
                 self.offset = f.tell()
         else:
             self.offset = 0
+        self.pending_lines = []
 
     def get_new_lines(self):
         if not self.dmesg_file_path.exists():
@@ -233,10 +234,15 @@ class DmesgMonitor:
     def wait_for(self, pattern, timeout=5):
         start_time = time.time()
         while time.time() - start_time < timeout:
-            lines = self.get_new_lines()
-            for line in lines:
+            self.pending_lines.extend(self.get_new_lines())
+
+            # Keep unmatched lines pending so ordered waits can still observe
+            # earlier messages that were read while waiting for a different one.
+            for i, line in enumerate(self.pending_lines):
                 if re.search(pattern, line):
+                    del self.pending_lines[i]
                     return True
+
             time.sleep(0.5)
         return False
 
