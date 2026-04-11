@@ -1,6 +1,17 @@
 import pytest
 
 
+def assert_modprobe_rejected(result, context):
+    if result.returncode == 0:
+        pytest.fail(f"modprobe unexpectedly accepted {context}")
+
+    # These tests run through virtme-ng's interactive guest shell; depending on
+    # how that shell is attached, modprobe diagnostics may surface on either stream.
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    if "Invalid argument" not in output:
+        pytest.fail(f"unexpected modprobe output for {context}: stdout={result.stdout!r}, stderr={result.stderr!r}")
+
+
 def test_kernel_version(vm):
     """Sanity check that we are running the expected kernel."""
     res = vm.run(["uname", "-r"])
@@ -58,10 +69,7 @@ def test_module_rejects_too_large_reopen_guard(phantun_module, vm):
     )
     try:
         res = vm.run(["modprobe", "phantun"], check=False)
-        if res.returncode == 0:
-            pytest.fail("modprobe unexpectedly accepted oversized reopen_guard_bytes")
-        if "Invalid argument" not in res.stderr:
-            pytest.fail(f"unexpected modprobe stderr for oversized reopen_guard_bytes: {res.stderr!r}")
+        assert_modprobe_rejected(res, "oversized reopen_guard_bytes")
 
         lsmod = vm.run(["lsmod"])
         if "phantun" in lsmod.stdout:
@@ -75,10 +83,7 @@ def test_module_rejects_missing_selectors(phantun_module, vm):
     vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
     try:
         res = vm.run(["modprobe", "phantun"], check=False)
-        if res.returncode == 0:
-            pytest.fail("modprobe unexpectedly accepted missing selectors")
-        if "Invalid argument" not in res.stderr:
-            pytest.fail(f"unexpected modprobe stderr for missing selectors: {res.stderr!r}")
+        assert_modprobe_rejected(res, "missing selectors")
     finally:
         vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
 
@@ -88,9 +93,6 @@ def test_module_rejects_malformed_managed_remote_peer(phantun_module, vm):
     vm.run("echo 'options phantun managed_remote_peers=not-a-peer' > /etc/modprobe.d/phantun.conf")
     try:
         res = vm.run(["modprobe", "phantun"], check=False)
-        if res.returncode == 0:
-            pytest.fail("modprobe unexpectedly accepted malformed managed_remote_peers entry")
-        if "Invalid argument" not in res.stderr:
-            pytest.fail(f"unexpected modprobe stderr for malformed managed_remote_peers: {res.stderr!r}")
+        assert_modprobe_rejected(res, "malformed managed_remote_peers entry")
     finally:
         vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
