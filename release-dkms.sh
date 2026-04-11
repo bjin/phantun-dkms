@@ -9,7 +9,7 @@ fi
 
 TARBALL="phantun-dkms_${VERSION}.tar.gz"
 
-tar czf "${TARBALL}" \
+tar czf "${TARBALL}" --owner=0 --group=0 \
     src/*.c \
     src/*.h \
     configure \
