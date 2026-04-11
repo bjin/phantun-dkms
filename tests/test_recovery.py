@@ -868,7 +868,7 @@ def test_established_invalid_syn_destroys_flow(phantun_module, vm):
         vm,
         NS_B,
         "echo_server",
-        {"bind_addr": NS_ADDR_B, "bind_port": dst_port, "count": 2},
+        {"bind_addr": NS_ADDR_B, "bind_port": dst_port, "count": 2, "timeout_sec": 20},
     )
 
     try:
@@ -921,6 +921,7 @@ def test_established_invalid_syn_destroys_flow(phantun_module, vm):
                 "target_addr": NS_ADDR_B,
                 "target_port": dst_port,
                 "payloads": ["msg2"],
+                "timeout_sec": 15,
             },
         )
         assert_completed(res2, "echo client after invalid SYN")
