@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include <linux/base64.h>
 #include <linux/inet.h>
 #include <linux/inetdevice.h>
@@ -1794,6 +1795,7 @@ static void __exit phantun_exit(void) {
 module_init(phantun_init);
 module_exit(phantun_exit);
 
+// SPDX-License-Identifier: GPL-2.0-or-later
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Bin Jin");
 MODULE_DESCRIPTION("Kernel-mode phantun-style fake-tcp tunnel");

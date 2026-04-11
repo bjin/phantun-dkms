@@ -1,7 +1,8 @@
 # phantun-dkms
 
 [![Latest release](https://img.shields.io/github/v/release/bjin/phantun-dkms?display_name=tag)](https://github.com/bjin/phantun-dkms/releases)
-[![License](https://img.shields.io/github/license/bjin/phantun-dkms)](https://github.com/bjin/phantun-dkms)
+[![License](https://img.shields.io/github/license/bjin/phantun-dkms)](https://github.com/bjin/phantun-dkms/blob/master/LICENSE)
+[![GitHub branch status](https://img.shields.io/github/checks-status/bjin/phantun-dkms/master)](https://github.com/bjin/phantun-dkms/actions?query=branch%3Amaster)
 
 If you already know [**Phantun**](https://github.com/dndx/phantun/): this is a **Linux kernel module implementation of Phantun's fake-TCP idea**.
 
@@ -285,4 +286,4 @@ For protocol internals and state-machine details, see [**`DESIGN.md`**](./DESIGN
 
 ## License
 
-Project license: **GPL-3.0-or-later**, see `LICENSE` file
+Project license: **GPL-2.0-or-later**, see `LICENSE` file

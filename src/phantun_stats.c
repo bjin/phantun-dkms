@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include <linux/atomic.h>
 #include <linux/kernel.h>
 #include <linux/kobject.h>
