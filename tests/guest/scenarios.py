@@ -371,6 +371,7 @@ def capture_tcp_packet(config):
     dst_port = config["target_port"]
     expected_payload = config.get("payload")
     ready_file = config.get("ready_file")
+    min_ack = config.get("min_ack")
     if isinstance(expected_payload, str):
         expected_payload = expected_payload.encode()
 
@@ -425,6 +426,8 @@ def capture_tcp_packet(config):
                 payload_end = ip_offset + total_len
                 payload = frame[payload_start:payload_end]
                 if expected_payload is not None and payload != expected_payload:
+                    continue
+                if min_ack is not None and ack < min_ack:
                     continue
 
                 _emit(

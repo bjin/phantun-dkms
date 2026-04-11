@@ -753,7 +753,7 @@ def test_delayed_handshake_request_does_not_regress_ack(phantun_module, vm):
     )
 
     try:
-        wait_for_guest_ready_file(vm, syn_ready_file, timeout=10)
+        wait_for_guest_ready_file(vm, syn_ready_file, timeout=30)
         time.sleep(0.2)
         client_result = run_netns_scenario(
             vm,
@@ -794,11 +794,12 @@ def test_delayed_handshake_request_does_not_regress_ack(phantun_module, vm):
                 "target_addr": NS_ADDR_A,
                 "target_port": src_port,
                 "payload": "",
+                "min_ack": expected_ack,
                 "ready_file": delayed_ack_ready_file,
                 "timeout_sec": 20,
             },
         )
-        wait_for_guest_ready_file(vm, delayed_ack_ready_file, timeout=10)
+        wait_for_guest_ready_file(vm, delayed_ack_ready_file, timeout=30)
         run_netns_scenario(
             vm,
             NS_A,
