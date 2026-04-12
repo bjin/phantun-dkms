@@ -111,6 +111,28 @@ int pht_parse_ipv4_tcp(struct sk_buff *skb, struct pht_l4_view *view) {
     return 0;
 }
 
+static int pht_validate_ipv4_header_checksum(const struct pht_l4_view *view) {
+    if (!view || !view->iph)
+        return -EINVAL;
+
+    return csum_fold(csum_partial(view->iph, view->ip_hdr_len, 0)) ? -EBADMSG : 0;
+}
+
+int pht_validate_ipv4_tcp_checksums(const struct sk_buff *skb, const struct pht_l4_view *view) {
+    unsigned int tcp_len;
+    __wsum csum;
+
+    if (!skb || !view || !view->iph || !view->tcp)
+        return -EINVAL;
+
+    if (pht_validate_ipv4_header_checksum(view))
+        return -EBADMSG;
+
+    tcp_len = ntohs(view->iph->tot_len) - view->ip_hdr_len;
+    csum = skb_checksum(skb, view->ip_hdr_len, tcp_len, 0);
+    return tcp_v4_check(tcp_len, view->iph->saddr, view->iph->daddr, csum) ? -EBADMSG : 0;
+}
+
 int pht_copy_l4_payload(const struct sk_buff *skb, const struct pht_l4_view *view, void *dst,
                         size_t dst_len) {
     if (!skb || !view)

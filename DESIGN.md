@@ -340,6 +340,7 @@ Peer-only mode keeps this rule: if a packet from a managed remote peer does not 
 
 - stray inbound `RST` for unknown tuple
 - inbound `RST` for known tuple: destroy local state, no reply
+- inbound packets failing IPv4 or TCP checksum validation
 - packets from immediately previous generation while quarantine is active
 - shaping-payload loss, duplication, delay, or reordering
 

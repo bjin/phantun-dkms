@@ -22,6 +22,7 @@ from helpers import (
     make_netns_output_flag_probe,
     make_netns_prerouting_flag_drop_probe,
     read_module_stats,
+    read_netns_iface_mac,
 )
 
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
@@ -1262,6 +1263,236 @@ def test_fragmented_syn_is_rejected_without_creating_flow(phantun_module, vm):
             pytest.fail(f"fragmented SYN must not create flow state: before={baseline_stats!r} after={stats_after!r}")
     finally:
         synack_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_bad_tcp_checksum_syn_is_silently_dropped(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    ingress_probe = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "src_port": src_port,
+                "dst_addr": NS_ADDR_B,
+                "dst_port": dst_port,
+                "flags_expr": "syn",
+                "comment": "bad_tcp_syn_ingress",
+                "action": "accept",
+            }
+        ],
+    )
+    synack_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "bad_tcp_syn_synack",
+            }
+        ],
+    )
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn",
+                "seq": 4095,
+                "corrupt_tcp_checksum": True,
+            },
+        )
+        time.sleep(0.2)
+
+        if ingress_probe.packets(vm, "bad_tcp_syn_ingress") == 0:
+            pytest.fail("bad-checksum SYN did not reach the remote ingress path in this test environment")
+        if synack_probe.packets(vm, "bad_tcp_syn_synack") != 0:
+            pytest.fail("bad TCP checksum SYN must be silently dropped without SYN|ACK")
+
+        stats_after = read_module_stats(vm)
+        if stats_after["flows_created"] != baseline_stats["flows_created"]:
+            pytest.fail(
+                f"bad TCP checksum SYN must not create flow state: before={baseline_stats!r} after={stats_after!r}"
+            )
+    finally:
+        ingress_probe.cleanup(vm)
+        synack_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_bad_ip_checksum_syn_is_silently_dropped(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    ingress_probe = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "src_port": src_port,
+                "dst_addr": NS_ADDR_B,
+                "dst_port": dst_port,
+                "flags_expr": "syn",
+                "comment": "bad_ip_syn_ingress",
+                "action": "accept",
+            }
+        ],
+    )
+    synack_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "bad_ip_syn_synack",
+            }
+        ],
+    )
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        dst_mac = read_netns_iface_mac(vm, NS_B, VETH_B)
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_l2_tcp_packet",
+            {
+                "device": VETH_A,
+                "dst_mac": dst_mac,
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn",
+                "seq": 4095,
+                "corrupt_ip_checksum": True,
+            },
+        )
+        time.sleep(0.2)
+
+        if ingress_probe.packets(vm, "bad_ip_syn_ingress") == 0:
+            pytest.fail("bad-IP-checksum SYN did not reach the remote ingress path in this test environment")
+        if synack_probe.packets(vm, "bad_ip_syn_synack") != 0:
+            pytest.fail("bad IP checksum SYN must be silently dropped without SYN|ACK")
+
+        stats_after = read_module_stats(vm)
+        if stats_after["flows_created"] != baseline_stats["flows_created"]:
+            pytest.fail(
+                f"bad IP checksum SYN must not create flow state: before={baseline_stats!r} after={stats_after!r}"
+            )
+    finally:
+        ingress_probe.cleanup(vm)
+        synack_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_bad_tcp_checksum_unknown_ack_is_silently_dropped(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    ingress_probe = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "src_port": src_port,
+                "dst_addr": NS_ADDR_B,
+                "dst_port": dst_port,
+                "flags_expr": "ack",
+                "comment": "bad_tcp_ack_ingress",
+                "action": "accept",
+            }
+        ],
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "bad_tcp_ack_rst",
+            }
+        ],
+    )
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack",
+                "seq": 12345,
+                "ack": 67890,
+                "payload": "junk",
+                "corrupt_tcp_checksum": True,
+            },
+        )
+        time.sleep(0.2)
+
+        if ingress_probe.packets(vm, "bad_tcp_ack_ingress") == 0:
+            pytest.fail("bad-checksum ACK did not reach the remote ingress path in this test environment")
+        if rst_probe.packets(vm, "bad_tcp_ack_rst") != 0:
+            pytest.fail("bad TCP checksum unknown ACK must be silently dropped without RST|ACK")
+
+        stats_after = read_module_stats(vm)
+        if stats_after["rst_sent"] != baseline_stats["rst_sent"]:
+            pytest.fail(
+                f"bad TCP checksum unknown ACK must not increment rst_sent: before={baseline_stats!r} after={stats_after!r}"
+            )
+    finally:
+        ingress_probe.cleanup(vm)
+        rst_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 

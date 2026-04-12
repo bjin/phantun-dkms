@@ -186,6 +186,11 @@ def read_module_stats(vm):
     return stats
 
 
+def read_netns_iface_mac(vm, namespace, iface):
+    res = run_in_netns(vm, namespace, ["cat", f"/sys/class/net/{iface}/address"])
+    return res.stdout.strip()
+
+
 def cleanup_netns_topology(vm, namespaces=(NS_A, NS_B)):
     for namespace in namespaces:
         vm.run(["ip", "netns", "del", namespace], check=False)
