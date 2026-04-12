@@ -44,6 +44,7 @@ struct pht_l4_view {
 
 int pht_parse_ipv4_udp(struct sk_buff *skb, struct pht_l4_view *view);
 int pht_parse_ipv4_tcp(struct sk_buff *skb, struct pht_l4_view *view);
+int pht_validate_ipv4_tcp_checksums(const struct sk_buff *skb, const struct pht_l4_view *view);
 int pht_copy_l4_payload(const struct sk_buff *skb, const struct pht_l4_view *view, void *dst,
                         size_t dst_len);
 

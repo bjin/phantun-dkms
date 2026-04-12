@@ -1046,6 +1046,10 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     if (ret != NF_ACCEPT)
         return ret;
 
+    ret = pht_validate_ipv4_tcp_checksums(skb, &view);
+    if (ret)
+        return NF_DROP;
+
     phantun_fill_tcp_endpoint_pair(&view, &ep);
     in_dev = state->in ? state->in : skb->dev;
 

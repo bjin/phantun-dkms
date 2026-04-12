@@ -28,6 +28,7 @@ PHT_STAT_ATTR(rst_sent, PHT_STAT_RST_SENT);
 PHT_STAT_ATTR(udp_packets_queued, PHT_STAT_UDP_PACKETS_QUEUED);
 PHT_STAT_ATTR(udp_packets_dropped, PHT_STAT_UDP_PACKETS_DROPPED);
 PHT_STAT_ATTR(shaping_payloads_dropped, PHT_STAT_SHAPING_PAYLOADS_DROPPED);
+PHT_STAT_ATTR(bad_checksum_dropped, PHT_STAT_BAD_CHECKSUM_DROPPED);
 PHT_STAT_ATTR(oversized_payloads_dropped, PHT_STAT_OVERSIZED_PAYLOADS_DROPPED);
 
 static struct attribute *pht_stats_attrs[] = {
@@ -42,6 +43,7 @@ static struct attribute *pht_stats_attrs[] = {
     &udp_packets_queued_attr.attr,
     &udp_packets_dropped_attr.attr,
     &shaping_payloads_dropped_attr.attr,
+    &bad_checksum_dropped_attr.attr,
     &oversized_payloads_dropped_attr.attr,
     NULL,
 };

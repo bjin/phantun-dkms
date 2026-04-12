@@ -315,6 +315,10 @@ def send_tcp_packet(config):
         len(tcp_header) + len(payload),
     )
     tcp_check = _checksum(pseudo_header + tcp_header + payload)
+    if config.get("corrupt_tcp_checksum"):
+        tcp_check ^= 0xFFFF
+        if tcp_check == 0:
+            tcp_check = 1
     tcp_header = struct.pack(
         "!HHLLBBHHH",
         src_port,
@@ -344,6 +348,10 @@ def send_tcp_packet(config):
         socket.inet_aton(dst_addr),
     )
     ip_check = _checksum(ip_header)
+    if config.get("corrupt_ip_checksum"):
+        ip_check ^= 0xFFFF
+        if ip_check == 0:
+            ip_check = 1
     ip_header = struct.pack(
         "!BBHHHBBH4s4s",
         (4 << 4) | 5,
@@ -361,6 +369,109 @@ def send_tcp_packet(config):
     with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW) as raw_sock:
         raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
         raw_sock.sendto(ip_header + tcp_header + payload, (dst_addr, 0))
+
+    _emit({"done": True})
+
+
+def send_l2_tcp_packet(config):
+    iface = config["device"]
+    dst_mac = bytes.fromhex(config["dst_mac"].replace(":", ""))
+    src_mac = config.get("src_mac")
+    if src_mac is None:
+        src_mac = Path(f"/sys/class/net/{iface}/address").read_text().strip()
+    src_mac = bytes.fromhex(src_mac.replace(":", ""))
+
+    src_addr = config["bind_addr"]
+    dst_addr = config["target_addr"]
+    src_port = config["bind_port"]
+    dst_port = config["target_port"]
+    seq = config.get("seq", 12345)
+    ack = config.get("ack", 0)
+    payload = config.get("payload", b"")
+    if isinstance(payload, str):
+        payload = payload.encode()
+
+    flags = _tcp_flags_expr(config["flags"])
+    window = socket.htons(config.get("window", 5840))
+    doff = 5
+
+    tcp_header = struct.pack(
+        "!HHLLBBHHH",
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        doff << 4,
+        flags,
+        window,
+        0,
+        0,
+    )
+    pseudo_header = struct.pack(
+        "!4s4sBBH",
+        socket.inet_aton(src_addr),
+        socket.inet_aton(dst_addr),
+        0,
+        socket.IPPROTO_TCP,
+        len(tcp_header) + len(payload),
+    )
+    tcp_check = _checksum(pseudo_header + tcp_header + payload)
+    if config.get("corrupt_tcp_checksum"):
+        tcp_check ^= 0xFFFF
+        if tcp_check == 0:
+            tcp_check = 1
+    tcp_header = struct.pack(
+        "!HHLLBBHHH",
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        doff << 4,
+        flags,
+        window,
+        tcp_check,
+        0,
+    )
+
+    total_len = 20 + len(tcp_header) + len(payload)
+    ip_frag_off = config.get("ip_frag_off", 0)
+    ip_header = struct.pack(
+        "!BBHHHBBH4s4s",
+        (4 << 4) | 5,
+        0,
+        total_len,
+        config.get("ip_id", 0),
+        ip_frag_off,
+        64,
+        socket.IPPROTO_TCP,
+        0,
+        socket.inet_aton(src_addr),
+        socket.inet_aton(dst_addr),
+    )
+    ip_check = _checksum(ip_header)
+    if config.get("corrupt_ip_checksum"):
+        ip_check ^= 0xFFFF
+        if ip_check == 0:
+            ip_check = 1
+    ip_header = struct.pack(
+        "!BBHHHBBH4s4s",
+        (4 << 4) | 5,
+        0,
+        total_len,
+        config.get("ip_id", 0),
+        ip_frag_off,
+        64,
+        socket.IPPROTO_TCP,
+        ip_check,
+        socket.inet_aton(src_addr),
+        socket.inet_aton(dst_addr),
+    )
+
+    eth_header = dst_mac + src_mac + struct.pack("!H", 0x0800)
+
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800)) as raw_sock:
+        raw_sock.bind((iface, 0))
+        raw_sock.send(eth_header + ip_header + tcp_header + payload)
 
     _emit({"done": True})
 
@@ -452,6 +563,7 @@ SCENARIOS = {
     "delayed_send": delayed_send,
     "simultaneous_exchange": simultaneous_exchange,
     "send_tcp_packet": send_tcp_packet,
+    "send_l2_tcp_packet": send_l2_tcp_packet,
     "capture_tcp_packet": capture_tcp_packet,
     "recv_many_reply": recv_many_reply,
     "send_many_recv": send_many_recv,
