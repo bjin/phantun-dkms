@@ -329,13 +329,14 @@ def send_tcp_packet(config):
     )
 
     total_len = 20 + len(tcp_header) + len(payload)
+    ip_frag_off = config.get("ip_frag_off", 0)
     ip_header = struct.pack(
         "!BBHHHBBH4s4s",
         (4 << 4) | 5,
         0,
         total_len,
         config.get("ip_id", 0),
-        0,
+        ip_frag_off,
         64,
         socket.IPPROTO_TCP,
         0,
@@ -349,7 +350,7 @@ def send_tcp_packet(config):
         0,
         total_len,
         config.get("ip_id", 0),
-        0,
+        ip_frag_off,
         64,
         socket.IPPROTO_TCP,
         ip_check,
