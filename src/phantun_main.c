@@ -472,7 +472,16 @@ phantun_classify_established_rx_locked(const struct pht_flow *flow,
         return decision;
 
     if (view->payload_len == 0) {
-        decision.rx_class = phantun_seq_before(decision.ack_seq, flow->last_ack)
+        /* Pure ACK still belongs to the peer's receive stream. With no payload
+         * to justify a jump, any ACK whose sequence is ahead of our current
+         * receive frontier is a protocol error rather than a harmless
+         * liveness signal.
+         */
+        if (phantun_seq_after(decision.seq, flow->ack))
+            return decision;
+
+        decision.rx_class = (phantun_seq_before(decision.seq, flow->ack) ||
+                             phantun_seq_before(decision.ack_seq, flow->last_ack))
                                 ? PHANTUN_EST_RX_DUPLICATE_OLD
                                 : PHANTUN_EST_RX_ACK_ONLY;
         goto done;
