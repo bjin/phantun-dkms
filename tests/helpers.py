@@ -1,9 +1,11 @@
+import time
 import json
 import shlex
 import subprocess
 import textwrap
 import uuid
 from pathlib import Path
+import pytest
 
 NS_A = "pht-a"
 NS_B = "pht-b"
@@ -161,6 +163,36 @@ def parse_guest_json(stdout, context):
         return json.loads(body)
     except json.JSONDecodeError as exc:
         raise AssertionError(f"{context}: invalid guest JSON: {exc}: {body}") from exc
+
+
+def received_plain_messages(payload):
+    return payload.get("received", [])
+
+
+def received_entry_messages(payload):
+    return [entry["message"] for entry in payload.get("received", [])]
+
+
+def reply_entry_messages(payload):
+    return [entry["message"] for entry in payload.get("replies", [])]
+
+
+def assert_completed(result, label):
+    if result.returncode != 0:
+        pytest.fail(f"{label} failed: {result.stderr!r}")
+
+
+def wait_for_guest_condition(vm, cmd, timeout, description, interval=0.1):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if vm.run(cmd, check=False).returncode == 0:
+            return
+        time.sleep(interval)
+    pytest.fail(f"{description} was not observed within {timeout}s")
+
+
+def wait_for_guest_ready_file(vm, path, timeout=5):
+    wait_for_guest_condition(vm, ["test", "-e", path], timeout, f"guest readiness file {path!r}")
 
 
 def require_guest_command(vm, command):

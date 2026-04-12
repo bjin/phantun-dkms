@@ -11,6 +11,7 @@ from helpers import (
     PORTS_B,
     VETH_A,
     VETH_B,
+    assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
     make_netns_ingress_flag_drop_probe,
@@ -19,6 +20,8 @@ from helpers import (
     make_netns_tcp_payload_probe,
     parse_guest_json,
     read_module_stats,
+    received_entry_messages,
+    reply_entry_messages,
     require_guest_command,
     run_netns_scenario,
     spawn_netns_scenario,
@@ -31,19 +34,6 @@ RESP = "HSRESP42"
 
 def load_loss_module(phantun_module, **kwargs):
     phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, **kwargs)
-
-
-def assert_completed(result, label):
-    if result.returncode != 0:
-        pytest.fail(f"{label} failed: {result.stderr!r}")
-
-
-def received_messages(payload):
-    return [entry["message"] for entry in payload.get("received", [])]
-
-
-def reply_messages(payload):
-    return [entry["message"] for entry in payload.get("replies", [])]
 
 
 def test_syn_loss_is_retried(phantun_module, vm):
@@ -272,6 +262,7 @@ def test_half_open_retry_exhaustion_releases_flow_slot(phantun_module, vm):
         # exhausted between host-side polls. Assert on cumulative counters and
         # the emitted SYN|ACK instead of a transient flows_current spike.
         deadline = time.time() + 15
+        stats = baseline_stats
         while time.time() < deadline:
             stats = read_module_stats(vm)
             if (
@@ -359,10 +350,10 @@ def test_handshake_request_loss_does_not_drop_later_payloads(phantun_module, vm)
         assert_completed(server_result, "request-loss receiver")
 
         server_data = parse_guest_json(server_result.stdout, "request-loss server stdout")
-        if received_messages(server_data) != ["client-0", "client-1", "client-2"]:
+        if received_entry_messages(server_data) != ["client-0", "client-1", "client-2"]:
             pytest.fail(
                 "lost handshake_request must not cause later higher-sequence payloads to be dropped; "
-                f"got {received_messages(server_data)!r}"
+                f"got {received_entry_messages(server_data)!r}"
             )
     finally:
         probe.cleanup(vm)
@@ -432,12 +423,14 @@ def test_handshake_response_loss_does_not_drop_later_replies(phantun_module, vm)
 
         client_data = parse_guest_json(client_result.stdout, "response-loss client stdout")
         server_data = parse_guest_json(server_result.stdout, "response-loss server stdout")
-        if received_messages(server_data) != ["client-0", "client-1", "client-2"]:
-            pytest.fail(f"unexpected responder receive set after response loss: {received_messages(server_data)!r}")
-        if reply_messages(client_data) != ["reply-0", "reply-1", "reply-2"]:
+        if received_entry_messages(server_data) != ["client-0", "client-1", "client-2"]:
+            pytest.fail(
+                f"unexpected responder receive set after response loss: {received_entry_messages(server_data)!r}"
+            )
+        if reply_entry_messages(client_data) != ["reply-0", "reply-1", "reply-2"]:
             pytest.fail(
                 "lost handshake_response must not cause later higher-sequence replies to be dropped; "
-                f"got {reply_messages(client_data)!r}"
+                f"got {reply_entry_messages(client_data)!r}"
             )
     finally:
         probe.cleanup(vm)
@@ -570,8 +563,10 @@ def test_duplicate_outbound_udp_while_half_open_queues_only_one_skb(phantun_modu
         assert_completed(server_result, "duplicate-half-open receiver")
 
         server_data = parse_guest_json(server_result.stdout, "duplicate-half-open server stdout")
-        if received_messages(server_data) != ["client-0"]:
-            pytest.fail(f"expected only the first half-open payload to survive, got {received_messages(server_data)!r}")
+        if received_entry_messages(server_data) != ["client-0"]:
+            pytest.fail(
+                f"expected only the first half-open payload to survive, got {received_entry_messages(server_data)!r}"
+            )
 
         final_stats = read_module_stats(vm)
         if final_stats["flows_created"] - initial_stats["flows_created"] != 2:

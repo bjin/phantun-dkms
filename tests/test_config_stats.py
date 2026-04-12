@@ -13,6 +13,7 @@ from helpers import (
     NS_B,
     PORTS_A,
     PORTS_B,
+    assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
     make_netns_output_probe,
@@ -27,11 +28,6 @@ from helpers import (
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
 REQ = "HSREQ42"
 RESP = "HSRESP42"
-
-
-def assert_completed(result, label):
-    if result.returncode != 0:
-        pytest.fail(f"{label} failed: {result.stderr!r}")
 
 
 def run_guest_scenario(vm, scenario, config, check=True, **kwargs):
