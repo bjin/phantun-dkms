@@ -1,7 +1,6 @@
 # phantun-dkms
 
-[![Latest Release](https://img.shields.io/github/v/release/bjin/phantun-dkms.svg?display_name=release)](https://github.com/bjin/phantun-dkms/releases)
-[![License](https://img.shields.io/github/license/bjin/phantun-dkms.svg)](https://github.com/bjin/phantun-dkms/blob/master/LICENSE)
+[![Latest Release](https://img.shields.io/github/v/release/bjin/phantun-dkms.svg?display_name=release)](https://github.com/bjin/phantun-dkms/releases/latest)
 [![GitHub branch status](https://github.com/bjin/phantun-dkms/actions/workflows/ci.yml/badge.svg)](https://github.com/bjin/phantun-dkms/actions/workflows/ci.yml)
 
 If you already know [**Phantun**](https://github.com/dndx/phantun/): this is a **Linux kernel module implementation of Phantun's fake-TCP idea**.
@@ -86,15 +85,22 @@ Typical target: **WireGuard** or **`wireguard-go`**.
 
 ## Quick start
 
-### Build
+### Build & Install from source code
 
 ```bash
 ./autogen.sh
 ./configure
 make
+sudo make modules_install
 ```
 
 If kernel autodetection fails, pass `KDIR=/path/to/kernel/build` to `make`.
+
+### Install from DKMS package (latest release)
+
+* Arch Linux: Install AUR package [phantun-dkms](https://aur.archlinux.org/packages/phantun-dkms)
+* Debian/Ubuntu: Download and install `.deb` file from [latest release](https://github.com/bjin/phantun-dkms/releases/latest)
+* Other Distributions: Extract `.tar.gz` dkms tarball from [latest release](https://github.com/bjin/phantun-dkms/releases/latest) to `/usr/src/phantun-0.x.y`, and run `dkms add` manually
 
 ### Simplest load: own one local UDP port
 
