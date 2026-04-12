@@ -93,6 +93,8 @@ static int pht_flow_retransmit_now(struct pht_flow *flow) {
     }
 }
 
+static bool pht_flow_unhash(struct pht_flow *flow);
+
 static void pht_flow_gc_worker(struct work_struct *work);
 
 /* Only half-open flows use the retransmit timer. Exhausting the retry budget
@@ -113,10 +115,16 @@ static void pht_flow_retransmit_timer(struct timer_list *timer) {
     }
 
     if (flow->retries_done >= flow->max_retries) {
+        bool removed;
+
         flow->state = PHT_FLOW_STATE_DEAD;
         flow->retransmit_armed = false;
         spin_unlock_bh(&flow->lock);
+
+        removed = pht_flow_unhash(flow);
         pht_flow_send_local_rst(flow);
+        if (removed)
+            pht_flow_put(flow);
         pht_flow_put(flow);
         return;
     }
@@ -246,6 +254,7 @@ static void pht_flow_detach_all(struct pht_flow_table *table, struct list_head *
         spin_lock_bh(&bucket->lock);
         hlist_for_each_entry_safe(flow, tmp, &bucket->head, hnode) {
             hlist_del_init(&flow->hnode);
+            pht_stats_dec(PHT_STAT_FLOWS_CURRENT);
             spin_lock(&flow->lock);
             flow->state = PHT_FLOW_STATE_DEAD;
             spin_unlock(&flow->lock);
@@ -337,6 +346,7 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
                 continue;
 
             hlist_del_init(&flow->hnode);
+            pht_stats_dec(PHT_STAT_FLOWS_CURRENT);
             list_add_tail(&flow->gc_node, expired);
             found = true;
         }
@@ -466,6 +476,29 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table,
     return flow;
 }
 
+static bool pht_flow_unhash(struct pht_flow *flow) {
+    struct pht_flow_bucket *bucket;
+    u32 idx;
+    bool removed = false;
+
+    if (!flow || !flow->table)
+        return false;
+
+    idx = pht_flow_hash_key(&flow->key);
+    bucket = &flow->table->buckets[idx];
+    spin_lock_bh(&bucket->lock);
+    if (!hlist_unhashed(&flow->hnode)) {
+        hlist_del_init(&flow->hnode);
+        removed = true;
+    }
+    spin_unlock_bh(&bucket->lock);
+
+    if (removed)
+        pht_stats_dec(PHT_STAT_FLOWS_CURRENT);
+
+    return removed;
+}
+
 int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow) {
     struct pht_flow_bucket *bucket;
     struct pht_flow *iter;
@@ -487,6 +520,7 @@ int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow) {
     spin_unlock_bh(&bucket->lock);
 
     pht_stats_inc(PHT_STAT_FLOWS_CREATED);
+    pht_stats_inc(PHT_STAT_FLOWS_CURRENT);
     if (pht_flow_state_is_half_open(flow->state))
         pht_flow_arm_retransmit(flow);
 
@@ -498,22 +532,12 @@ int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow) {
  * to drop it.
  */
 void pht_flow_detach(struct pht_flow *flow) {
-    struct pht_flow_bucket *bucket;
-    u32 idx;
-    bool removed = false;
+    bool removed;
 
     if (!flow || !flow->table)
         return;
 
-    idx = pht_flow_hash_key(&flow->key);
-    bucket = &flow->table->buckets[idx];
-    spin_lock_bh(&bucket->lock);
-    if (!hlist_unhashed(&flow->hnode)) {
-        hlist_del_init(&flow->hnode);
-        removed = true;
-    }
-    spin_unlock_bh(&bucket->lock);
-
+    removed = pht_flow_unhash(flow);
     if (!removed)
         return;
 
@@ -735,6 +759,7 @@ pht_flow_invalidate_matching(struct pht_flow_table *table,
                 continue;
 
             hlist_del_init(&flow->hnode);
+            pht_stats_dec(PHT_STAT_FLOWS_CURRENT);
             list_add_tail(&flow->gc_node, &expired);
             count++;
         }

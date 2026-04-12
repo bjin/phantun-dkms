@@ -19,6 +19,7 @@ GUEST_SCENARIOS = str(PROJECT_ROOT / "tests/guest/scenarios.py")
 MODULE_STAT_NAMES = (
     "flows_created",
     "flows_established",
+    "flows_current",
     "request_payloads_injected",
     "response_payloads_injected",
     "collisions_won",

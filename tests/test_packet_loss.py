@@ -207,6 +207,82 @@ def test_synack_loss_is_retried(phantun_module, vm):
         cleanup_netns_topology(vm)
 
 
+def test_half_open_retry_exhaustion_releases_flow_slot(phantun_module, vm):
+    phantun_module.load(
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        handshake_timeout_ms=200,
+        handshake_retries=1,
+    )
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    drop_synack = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "drop_exhausted_synack",
+            }
+        ],
+    )
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn",
+                "seq": 4095,
+            },
+        )
+
+        deadline = time.time() + 5
+        saw_half_open = False
+        while time.time() < deadline:
+            stats = read_module_stats(vm)
+            if stats["flows_current"] > baseline_stats["flows_current"]:
+                saw_half_open = True
+                break
+            time.sleep(0.1)
+        if not saw_half_open:
+            pytest.fail(f"expected responder half-open flow creation, got {stats!r}")
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            stats = read_module_stats(vm)
+            if (
+                stats["rst_sent"] > baseline_stats["rst_sent"]
+                and stats["flows_current"] == baseline_stats["flows_current"]
+            ):
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(
+                "half-open flow should be unhashed promptly after retry exhaustion: "
+                f"baseline={baseline_stats!r} current={stats!r}"
+            )
+    finally:
+        drop_synack.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
 def test_handshake_request_loss_does_not_drop_later_payloads(phantun_module, vm):
     load_loss_module(phantun_module, handshake_request=REQ)
     ensure_netns_topology(vm)
