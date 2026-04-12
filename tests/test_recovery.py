@@ -1211,6 +1211,60 @@ def test_bad_final_ack_flags_are_rejected_with_rstack(phantun_module, vm):
         cleanup_netns_topology(vm)
 
 
+def test_fragmented_syn_is_rejected_without_creating_flow(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    synack_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "fragmented_syn_synack",
+            }
+        ],
+    )
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn",
+                "seq": 4095,
+                "ip_frag_off": 0x2000,
+            },
+        )
+        time.sleep(0.2)
+
+        if synack_probe.packets(vm, "fragmented_syn_synack") != 0:
+            pytest.fail("fragmented SYN must not elicit SYN|ACK")
+
+        stats_after = read_module_stats(vm)
+        if stats_after["flows_created"] != baseline_stats["flows_created"]:
+            pytest.fail(f"fragmented SYN must not create flow state: before={baseline_stats!r} after={stats_after!r}")
+    finally:
+        synack_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
 def test_unknown_synack_is_rejected_without_creating_flow(phantun_module, vm):
     phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)

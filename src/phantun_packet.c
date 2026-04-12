@@ -43,6 +43,8 @@ static int pht_parse_ipv4_l4(struct sk_buff *skb, u8 protocol, unsigned int min_
     total_len = ntohs(iph->tot_len);
     if (iph->protocol != protocol)
         return -EPROTO;
+    if (iph->frag_off & htons(IP_MF | IP_OFFSET))
+        return -EINVAL;
     if (skb->len < total_len || total_len < ip_hdr_len + min_l4_len)
         return -EINVAL;
 
