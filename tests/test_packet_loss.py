@@ -236,7 +236,22 @@ def test_half_open_retry_exhaustion_releases_flow_slot(phantun_module, vm):
             }
         ],
     )
+    synack_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "sent_exhausted_synack",
+            }
+        ],
+    )
     baseline_stats = read_module_stats(vm)
+    baseline_synack = synack_probe.packets(vm, "sent_exhausted_synack")
 
     try:
         run_netns_scenario(
@@ -253,18 +268,10 @@ def test_half_open_retry_exhaustion_releases_flow_slot(phantun_module, vm):
             },
         )
 
-        deadline = time.time() + 5
-        saw_half_open = False
-        while time.time() < deadline:
-            stats = read_module_stats(vm)
-            if stats["flows_current"] > baseline_stats["flows_current"]:
-                saw_half_open = True
-                break
-            time.sleep(0.1)
-        if not saw_half_open:
-            pytest.fail(f"expected responder half-open flow creation, got {stats!r}")
-
-        deadline = time.time() + 5
+        # On slow nested-QEMU CI the responder half-open may be created and
+        # exhausted between host-side polls. Assert on cumulative counters and
+        # the emitted SYN|ACK instead of a transient flows_current spike.
+        deadline = time.time() + 15
         while time.time() < deadline:
             stats = read_module_stats(vm)
             if (
@@ -278,8 +285,18 @@ def test_half_open_retry_exhaustion_releases_flow_slot(phantun_module, vm):
                 "half-open flow should be unhashed promptly after retry exhaustion: "
                 f"baseline={baseline_stats!r} current={stats!r}"
             )
+
+        if synack_probe.packets(vm, "sent_exhausted_synack") <= baseline_synack:
+            pytest.fail("expected responder to emit SYN|ACK before retry exhaustion")
+
+        if stats["flows_created"] <= baseline_stats["flows_created"]:
+            pytest.fail(
+                "expected responder half-open flow creation before retry exhaustion: "
+                f"baseline={baseline_stats!r} current={stats!r}"
+            )
     finally:
         drop_synack.cleanup(vm)
+        synack_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 

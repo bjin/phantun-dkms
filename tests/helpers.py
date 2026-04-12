@@ -180,10 +180,24 @@ print(Path('/sys/module/phantun/stats/{name}').read_text().strip())
 
 
 def read_module_stats(vm):
-    stats = {}
-    for name in MODULE_STAT_NAMES:
-        stats[name] = read_module_stat(vm, name)
-    return stats
+    # Packet-loss and recovery tests poll stats in tight loops. Read all stat files
+    # in one guest process/SSH round-trip so slow nested-QEMU runners do not miss
+    # short-lived state transitions between per-stat polls.
+    res = run_guest_python(
+        vm,
+        """
+import json
+from pathlib import Path
+
+stats_root = Path('/sys/module/phantun/stats')
+stats = {
+    name: int((stats_root / name).read_text().strip())
+    for name in %r
+}
+print(json.dumps(stats))
+""" % (MODULE_STAT_NAMES,),
+    )
+    return parse_guest_json(res.stdout, "module stats stdout")
 
 
 def read_netns_iface_mac(vm, namespace, iface):
