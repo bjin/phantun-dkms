@@ -19,6 +19,7 @@ static struct kobject *pht_stats_kobj;
 
 PHT_STAT_ATTR(flows_created, PHT_STAT_FLOWS_CREATED);
 PHT_STAT_ATTR(flows_established, PHT_STAT_FLOWS_ESTABLISHED);
+PHT_STAT_ATTR(flows_current, PHT_STAT_FLOWS_CURRENT);
 PHT_STAT_ATTR(request_payloads_injected, PHT_STAT_REQUEST_PAYLOADS_INJECTED);
 PHT_STAT_ATTR(response_payloads_injected, PHT_STAT_RESPONSE_PAYLOADS_INJECTED);
 PHT_STAT_ATTR(collisions_won, PHT_STAT_COLLISIONS_WON);
@@ -31,6 +32,7 @@ PHT_STAT_ATTR(shaping_payloads_dropped, PHT_STAT_SHAPING_PAYLOADS_DROPPED);
 static struct attribute *pht_stats_attrs[] = {
     &flows_created_attr.attr,
     &flows_established_attr.attr,
+    &flows_current_attr.attr,
     &request_payloads_injected_attr.attr,
     &response_payloads_injected_attr.attr,
     &collisions_won_attr.attr,
@@ -59,6 +61,13 @@ void pht_stats_inc(enum pht_stat_id id) {
         return;
 
     atomic64_inc(&pht_stats[id]);
+}
+
+void pht_stats_dec(enum pht_stat_id id) {
+    if (id >= PHT_STAT_COUNT)
+        return;
+
+    atomic64_dec(&pht_stats[id]);
 }
 
 void pht_stats_add(enum pht_stat_id id, u64 delta) {

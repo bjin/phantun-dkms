@@ -131,3 +131,14 @@ Logs are automatically saved to `~/.cache/logs/phantun_tests/YYYYMMDD_HHMMSS/`.
      vm.run(["ip", "netns", "exec", NS_A, "tc", "qdisc", "add", "dev", VETH_A, "root", "netem", "delay", "150ms"])
      ```
    - This ensures packets sit in the queue long enough for the test scenario to trigger the necessary overlapping state transitions. Remember to clean up the `qdisc` in a `finally` block or when tearing down the topology.
+
+## GitHub Actions slowness warning
+
+> **Important:** GitHub's hosted runners are already virtualized. Our test framework then boots another QEMU guest through `virtme-ng`, so CI is effectively nested QEMU. Tests that finish quickly on a local machine can run much slower on GitHub Actions, and short-lived states may come and go between host-side polls.
+
+When adding or debugging tests, assume GitHub CI is the worst-case scheduler and timing environment:
+
+- Prefer observables that persist long enough to survive slow polling: nft counters, cumulative module stats, guest-visible outcomes, or dmesg lines. Do not make a test depend only on catching a brief intermediate value such as a momentary `flows_current` spike.
+- If a test must poll guest state, read it in as few guest round-trips as possible. Extend shared helpers when needed instead of open-coding many small SSH commands inside a loop.
+- Use `tc netem` or another data-plane control to force ordering/overlap. Do not rely on tiny `time.sleep()` gaps to create races that only happen on a fast laptop.
+- Before merging a timing-sensitive test, ask whether the assertion still holds if the runner is 5-10x slower and host/guest time are both noisy. If not, the test is probably checking the wrong thing.

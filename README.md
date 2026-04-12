@@ -268,6 +268,7 @@ cat /sys/module/phantun/stats/rst_sent
 |---|---|
 | `flows_created` | Flow objects inserted into the flow table. |
 | `flows_established` | Flows that reached `ESTABLISHED`. |
+| `flows_current` | Flow objects currently present in the flow table. |
 | `request_payloads_injected` | `handshake_request` payloads injected by the module. |
 | `response_payloads_injected` | `handshake_response` payloads injected by the module. |
 | `collisions_won` | Simultaneous-initiation collisions where local side kept initiator role. |

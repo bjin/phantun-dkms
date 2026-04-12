@@ -203,6 +203,99 @@ def test_synack_loss_is_retried(phantun_module, vm):
         cleanup_netns_topology(vm)
 
 
+def test_half_open_retry_exhaustion_releases_flow_slot(phantun_module, vm):
+    phantun_module.load(
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        handshake_timeout_ms=200,
+        handshake_retries=1,
+    )
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    drop_synack = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "drop_exhausted_synack",
+            }
+        ],
+    )
+    synack_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "sent_exhausted_synack",
+            }
+        ],
+    )
+    baseline_stats = read_module_stats(vm)
+    baseline_synack = synack_probe.packets(vm, "sent_exhausted_synack")
+
+    try:
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn",
+                "seq": 4095,
+            },
+        )
+
+        # On slow nested-QEMU CI the responder half-open may be created and
+        # exhausted between host-side polls. Assert on cumulative counters and
+        # the emitted SYN|ACK instead of a transient flows_current spike.
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            stats = read_module_stats(vm)
+            if (
+                stats["rst_sent"] > baseline_stats["rst_sent"]
+                and stats["flows_current"] == baseline_stats["flows_current"]
+            ):
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(
+                "half-open flow should be unhashed promptly after retry exhaustion: "
+                f"baseline={baseline_stats!r} current={stats!r}"
+            )
+
+        if synack_probe.packets(vm, "sent_exhausted_synack") <= baseline_synack:
+            pytest.fail("expected responder to emit SYN|ACK before retry exhaustion")
+
+        if stats["flows_created"] <= baseline_stats["flows_created"]:
+            pytest.fail(
+                "expected responder half-open flow creation before retry exhaustion: "
+                f"baseline={baseline_stats!r} current={stats!r}"
+            )
+    finally:
+        drop_synack.cleanup(vm)
+        synack_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
 def test_handshake_request_loss_does_not_drop_later_payloads(phantun_module, vm):
     load_loss_module(phantun_module, handshake_request=REQ)
     ensure_netns_topology(vm)

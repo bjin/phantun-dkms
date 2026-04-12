@@ -7,6 +7,7 @@
 enum pht_stat_id {
     PHT_STAT_FLOWS_CREATED = 0,
     PHT_STAT_FLOWS_ESTABLISHED,
+    PHT_STAT_FLOWS_CURRENT,
     PHT_STAT_REQUEST_PAYLOADS_INJECTED,
     PHT_STAT_RESPONSE_PAYLOADS_INJECTED,
     PHT_STAT_COLLISIONS_WON,
@@ -20,6 +21,7 @@ enum pht_stat_id {
 
 void pht_stats_reset(void);
 void pht_stats_inc(enum pht_stat_id id);
+void pht_stats_dec(enum pht_stat_id id);
 void pht_stats_add(enum pht_stat_id id, u64 delta);
 u64 pht_stats_read(enum pht_stat_id id);
 int pht_stats_init_sysfs(void);
