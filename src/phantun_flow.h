@@ -74,6 +74,7 @@ struct pht_flow {
     enum pht_flow_state state;
     u32 seq;
     u32 ack;
+    /* Highest peer ACK accepted for this generation's local send stream. */
     u32 last_ack;
     u32 local_isn;
     /* Next remote sequence immediately after the peer's opening SYN. */

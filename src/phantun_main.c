@@ -276,7 +276,11 @@ static bool phantun_tcp_is_bare_syn(const struct pht_l4_view *view);
 
 static bool phantun_seq_after_eq(u32 seq1, u32 seq2) { return (s32)(seq1 - seq2) >= 0; }
 
+static bool phantun_seq_after(u32 seq1, u32 seq2) { return (s32)(seq1 - seq2) > 0; }
+
 static bool phantun_seq_before_eq(u32 seq1, u32 seq2) { return (s32)(seq1 - seq2) <= 0; }
+
+static bool phantun_seq_before(u32 seq1, u32 seq2) { return (s32)(seq1 - seq2) < 0; }
 
 static bool phantun_seq_between(u32 seq, u32 start, u32 end) {
     return phantun_seq_after_eq(seq, start) && phantun_seq_before_eq(seq, end);
@@ -402,6 +406,105 @@ static bool phantun_tcp_is_valid_final_ack(const struct pht_l4_view *view, u32 p
      */
     return phantun_request_enabled() && view->payload_len > 0 &&
            phantun_seq_after_eq(seq, peer_syn_next);
+}
+
+/* Established-state classifier for current-generation inbound packets. The
+ * fake-TCP data path intentionally has no out-of-order queue, overlap trim,
+ * or reassembly support, so each class maps directly to the only truthful
+ * thing the module can do with that packet.
+ */
+enum phantun_established_rx_class {
+    PHANTUN_EST_RX_INVALID = 0,
+    PHANTUN_EST_RX_ACK_ONLY,
+    PHANTUN_EST_RX_IN_ORDER_PAYLOAD,
+    PHANTUN_EST_RX_RESERVED_SHAPING_DROP,
+    PHANTUN_EST_RX_DUPLICATE_OLD,
+};
+
+/* Snapshot returned by the established classifier. ack_seq is the peer's
+ * acknowledgement of locally sent bytes; seq/seq_end describe the inbound
+ * payload span, if any. response_unblocked means this packet validly proves
+ * the injected responder handshake_response was acknowledged or skipped, so
+ * queued responder UDP may be released.
+ */
+struct phantun_established_rx_decision {
+    enum phantun_established_rx_class rx_class;
+    u32 ack_seq;
+    u32 seq;
+    u32 seq_end;
+    bool response_unblocked;
+};
+
+static bool phantun_tcp_is_established_ack(const struct pht_l4_view *view) {
+    return view && view->tcp->ack && !view->tcp->syn && !view->tcp->rst && !view->tcp->fin &&
+           !view->tcp->psh && !view->tcp->urg;
+}
+
+/* The fake-TCP data path has no out-of-order queue. For a current generation,
+ * new payload is accepted only at the exact next expected peer sequence. Old
+ * fully-duplicate packets may be silently absorbed, and the reserved shaping
+ * slot remains a narrow exception addressed by exact sequence number.
+ */
+static struct phantun_established_rx_decision
+phantun_classify_established_rx_locked(const struct pht_flow *flow,
+                                       const struct pht_l4_view *view) {
+    struct phantun_established_rx_decision decision = {
+        .rx_class = PHANTUN_EST_RX_INVALID,
+    };
+
+    if (!flow || !view || !phantun_tcp_is_established_ack(view))
+        return decision;
+
+    decision.ack_seq = ntohl(view->tcp->ack_seq);
+    decision.seq = ntohl(view->tcp->seq);
+    decision.seq_end = decision.seq + view->payload_len;
+
+    if (!phantun_seq_between(decision.ack_seq, flow->local_isn + 1, flow->seq))
+        return decision;
+
+    if (view->payload_len == 0) {
+        decision.rx_class = phantun_seq_before(decision.ack_seq, flow->last_ack)
+                                ? PHANTUN_EST_RX_DUPLICATE_OLD
+                                : PHANTUN_EST_RX_ACK_ONLY;
+        goto done;
+    }
+
+    if (flow->drop_next_rx_payload) {
+        if (decision.seq == flow->drop_next_rx_seq) {
+            decision.rx_class = PHANTUN_EST_RX_RESERVED_SHAPING_DROP;
+            goto done;
+        }
+
+        /* If the reserved shaping slot was skipped or lost, the first later
+         * payload becomes the new receive frontier for this generation.
+         */
+        if (phantun_seq_after(decision.seq, flow->drop_next_rx_seq)) {
+            decision.rx_class = PHANTUN_EST_RX_IN_ORDER_PAYLOAD;
+            goto done;
+        }
+    }
+
+    if (decision.seq == flow->ack) {
+        decision.rx_class = PHANTUN_EST_RX_IN_ORDER_PAYLOAD;
+        goto done;
+    }
+
+    if (phantun_seq_before_eq(decision.seq_end, flow->ack)) {
+        decision.rx_class = PHANTUN_EST_RX_DUPLICATE_OLD;
+        goto done;
+    }
+
+done:
+    if (decision.rx_class == PHANTUN_EST_RX_ACK_ONLY ||
+        decision.rx_class == PHANTUN_EST_RX_IN_ORDER_PAYLOAD ||
+        decision.rx_class == PHANTUN_EST_RX_RESERVED_SHAPING_DROP) {
+        decision.response_unblocked =
+            flow->response_pending_ack &&
+            (decision.ack_seq >= flow->local_isn + 1 + phantun_cfg.handshake_response_len ||
+             view->payload_len > 0);
+    }
+
+    return decision;
 }
 
 static bool phantun_tcp_syn_is_aligned(const struct pht_l4_view *view) {
@@ -572,7 +675,6 @@ static int phantun_send_handshake_request(struct pht_flow *flow, struct net *net
     if (!ret) {
         spin_lock_bh(&flow->lock);
         flow->seq = seq + req_len;
-        flow->last_ack = ack;
         flow->last_activity_jiffies = jiffies;
         flow->egress_ifindex = ifindex;
         spin_unlock_bh(&flow->lock);
@@ -600,7 +702,6 @@ static int phantun_send_handshake_response(struct pht_flow *flow, struct net *ne
     if (!ret) {
         spin_lock_bh(&flow->lock);
         flow->seq = seq + resp_len;
-        flow->last_ack = ack;
         flow->last_activity_jiffies = jiffies;
         flow->egress_ifindex = ifindex;
         spin_unlock_bh(&flow->lock);
@@ -625,7 +726,6 @@ static int phantun_send_idle_ack(struct pht_flow *flow, struct net *net) {
     ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, NULL, 0, &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
-        flow->last_ack = ack;
         flow->last_activity_jiffies = jiffies;
         flow->egress_ifindex = ifindex;
         spin_unlock_bh(&flow->lock);
@@ -690,7 +790,6 @@ static void phantun_refresh_inbound_progress(struct pht_flow *flow, const struct
      */
     if (phantun_seq_after_eq(seq_end, flow->ack))
         flow->ack = seq_end;
-    flow->last_ack = flow->ack;
     flow->last_activity_jiffies = jiffies;
     flow->last_inbound_jiffies = jiffies;
     flow->keepalives_sent = 0;
@@ -703,16 +802,63 @@ static void phantun_note_inbound_payload(struct pht_flow *flow, const struct pht
     phantun_refresh_inbound_progress(flow, view, NULL);
 }
 
-static int phantun_finalize_established_rx(struct pht_flow *flow,
-                                           const struct pht_ipv4_endpoint_pair *ep,
-                                           const struct sk_buff *skb,
-                                           const struct pht_l4_view *view, struct net *net,
-                                           struct net_device *dev, bool reinject_payload,
-                                           bool send_idle_ack) {
-    bool allow_flush;
+/* Apply the state-machine side effects of one established classifier result.
+ * Payload reinjection is kept outside the lock so each call site shows
+ * exactly when bytes are delivered to UDP versus when we only absorb wire
+ * state changes.
+ */
+static void phantun_apply_established_rx(struct pht_flow *flow,
+                                         const struct phantun_established_rx_decision *decision,
+                                         bool *allow_flush) {
+    bool refresh_liveness;
+
+    if (!flow || !decision)
+        return;
+
+    refresh_liveness = decision->rx_class == PHANTUN_EST_RX_ACK_ONLY ||
+                       decision->rx_class == PHANTUN_EST_RX_IN_ORDER_PAYLOAD ||
+                       decision->rx_class == PHANTUN_EST_RX_RESERVED_SHAPING_DROP;
+
+    spin_lock_bh(&flow->lock);
+    if (decision->response_unblocked) {
+        flow->response_pending_ack = false;
+        if (allow_flush)
+            *allow_flush = true;
+    } else if (allow_flush) {
+        *allow_flush = !flow->response_pending_ack;
+    }
+
+    if (phantun_seq_after(decision->ack_seq, flow->last_ack))
+        flow->last_ack = decision->ack_seq;
+
+    switch (decision->rx_class) {
+    case PHANTUN_EST_RX_IN_ORDER_PAYLOAD:
+        flow->ack = decision->seq_end;
+        break;
+    case PHANTUN_EST_RX_RESERVED_SHAPING_DROP:
+        if (phantun_seq_after_eq(decision->seq_end, flow->ack))
+            flow->ack = decision->seq_end;
+        break;
+    default:
+        break;
+    }
+
+    if (refresh_liveness) {
+        flow->last_activity_jiffies = jiffies;
+        flow->last_inbound_jiffies = jiffies;
+        flow->keepalives_sent = 0;
+    }
+    spin_unlock_bh(&flow->lock);
+}
+
+static int phantun_finalize_established_rx(
+    struct pht_flow *flow, const struct pht_ipv4_endpoint_pair *ep, const struct sk_buff *skb,
+    const struct pht_l4_view *view, const struct phantun_established_rx_decision *decision,
+    struct net *net, struct net_device *dev, bool reinject_payload, bool send_idle_ack) {
+    bool allow_flush = false;
     int ret = 0;
 
-    phantun_refresh_inbound_progress(flow, view, &allow_flush);
+    phantun_apply_established_rx(flow, decision, &allow_flush);
 
     if (reinject_payload) {
         ret = phantun_reinject_inbound_payload(ep, skb, view, dev);
@@ -1215,7 +1361,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             flow->seq = flow->local_isn + 1;
             flow->ack = ntohl(view.tcp->seq) + 1;
             flow->peer_syn_next = flow->ack;
-            flow->last_ack = flow->ack;
+            flow->last_ack = flow->local_isn + 1;
             flow->drop_next_rx_seq = flow->ack;
             flow->drop_next_rx_payload = phantun_response_enabled();
             flow->response_pending_ack = false;
@@ -1286,7 +1432,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         spin_lock_bh(&flow->lock);
         flow->seq = flow->local_isn + 1;
         flow->ack = flow->peer_syn_next;
-        flow->last_ack = flow->ack;
+        flow->last_ack = flow->local_isn + 1;
         flow->drop_next_rx_seq = flow->ack;
         flow->drop_next_rx_payload = phantun_request_enabled();
         flow->response_pending_ack = false;
@@ -1326,15 +1472,22 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                     pht_flow_put(flow);
                     return NF_DROP;
                 }
+                {
+                    struct phantun_established_rx_decision open_decision;
 
-                ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
-                                                      true, true);
-                if (ret) {
-                    pht_pr_warn("failed to process responder open payload: %d\n", ret);
-                    pht_flow_remove(flow);
+                    spin_lock_bh(&flow->lock);
+                    open_decision = phantun_classify_established_rx_locked(flow, &view);
+                    spin_unlock_bh(&flow->lock);
+
+                    ret = phantun_finalize_established_rx(flow, &ep, skb, &view, &open_decision,
+                                                          state->net, in_dev, true, true);
+                    if (ret) {
+                        pht_pr_warn("failed to process responder open payload: %d\n", ret);
+                        pht_flow_remove(flow);
+                    }
+                    pht_flow_put(flow);
+                    return NF_DROP;
                 }
-                pht_flow_put(flow);
-                return NF_DROP;
             }
 
             pht_flow_touch_inbound(flow);
@@ -1354,27 +1507,37 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 pht_flow_put(flow);
                 return NF_DROP;
             }
+            {
+                struct phantun_established_rx_decision open_decision;
 
-            if (drop_open_payload)
-                pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
-            ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
-                                                  !drop_open_payload, true);
-            if (ret) {
-                pht_pr_warn("failed to process responder open payload: %d\n", ret);
-                pht_flow_remove(flow);
+                if (drop_open_payload)
+                    pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
+
+                spin_lock_bh(&flow->lock);
+                open_decision = phantun_classify_established_rx_locked(flow, &view);
+                spin_unlock_bh(&flow->lock);
+
+                ret = phantun_finalize_established_rx(flow, &ep, skb, &view, &open_decision,
+                                                      state->net, in_dev, !drop_open_payload, true);
+                if (ret) {
+                    pht_pr_warn("failed to process responder open payload: %d\n", ret);
+                    pht_flow_remove(flow);
+                }
+                pht_flow_put(flow);
+                return NF_DROP;
             }
-            pht_flow_put(flow);
-            return NF_DROP;
         }
     }
 
-    /* ESTABLISHED handling still prioritizes flags over payload. Duplicate
-     * open packets are absorbed, bare SYN can replace the generation, any
-     * other SYN is fatal, and plain ACK/data continues the stream.
+    /* ESTABLISHED handling still prioritizes flags over payload. Once RST/SYN
+     * cases are handled, the remaining traffic is classified against the
+     * current generation's exact receive frontier. This fake-TCP translator
+     * has no out-of-order queue, so arbitrary future-sequence payload is a
+     * protocol error rather than something we can buffer and repair later.
      */
     if (state_now == PHT_FLOW_STATE_ESTABLISHED) {
-        bool response_unblocked = false;
-        bool drop_payload = false;
+        struct phantun_established_rx_decision decision;
+        bool reinject_payload;
 
         if (phantun_flow_should_drop_quarantined_packet(flow, &view)) {
             pht_flow_put(flow);
@@ -1428,44 +1591,38 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         }
 
         spin_lock_bh(&flow->lock);
-        if (flow->response_pending_ack) {
-            if (view.tcp->ack && ntohl(view.tcp->ack_seq) >=
-                                     flow->local_isn + 1 + phantun_cfg.handshake_response_len) {
-                flow->response_pending_ack = false;
-                response_unblocked = true;
-            } else if (view.payload_len > 0) {
-                /* A lost handshake_response leaves the reserved control
-                 * sequence range unseen. Once later initiator traffic
-                 * arrives, release queued responder data anyway and keep
-                 * the ignore slot pinned to responder_seq + 1 so a delayed
-                 * handshake_response is still suppressed by sequence.
-                 */
-                flow->response_pending_ack = false;
-                response_unblocked = true;
-            }
-        }
-        if (view.payload_len && flow->drop_next_rx_payload &&
-            ntohl(view.tcp->seq) == flow->drop_next_rx_seq) {
-            drop_payload = true;
-            pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
-        }
+        decision = phantun_classify_established_rx_locked(flow, &view);
         spin_unlock_bh(&flow->lock);
 
-        if (view.payload_len == 0) {
-            pht_flow_touch_inbound(flow);
-            if (response_unblocked) {
-                ret = phantun_flush_queued_udp(flow, state->net);
-                if (ret) {
-                    pht_pr_warn("failed to flush responder queue: %d\n", ret);
-                    pht_flow_remove(flow);
-                }
-            }
+        /* The classifier only returns INVALID once RST/SYN handling is out of
+         * the way, so this packet has no truthful interpretation within the
+         * current generation. Fail hard instead of letting it refresh or skew
+         * state.
+         */
+        if (decision.rx_class == PHANTUN_EST_RX_INVALID) {
+            ret = phantun_send_rstack(state->net, &ep, &view, false);
+            if (ret)
+                pht_pr_warn_rl("failed to emit RST|ACK for invalid established packet: %d\n", ret);
+            pht_flow_remove(flow);
             pht_flow_put(flow);
             return NF_DROP;
         }
 
-        ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
-                                              !drop_payload, true);
+        /* Entirely old duplicate traffic is below the current receive
+         * frontier. Absorb it silently: there is no new UDP data to deliver
+         * and no honest reason to refresh liveness.
+         */
+        if (decision.rx_class == PHANTUN_EST_RX_DUPLICATE_OLD) {
+            pht_flow_put(flow);
+            return NF_DROP;
+        }
+
+        if (decision.rx_class == PHANTUN_EST_RX_RESERVED_SHAPING_DROP)
+            pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
+
+        reinject_payload = decision.rx_class == PHANTUN_EST_RX_IN_ORDER_PAYLOAD;
+        ret = phantun_finalize_established_rx(flow, &ep, skb, &view, &decision, state->net, in_dev,
+                                              reinject_payload, true);
         if (ret) {
             pht_pr_warn("failed to process established inbound payload: %d\n", ret);
             pht_flow_remove(flow);
