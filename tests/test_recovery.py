@@ -1127,6 +1127,123 @@ def test_established_ack_beyond_local_seq_is_rejected_with_rstack(phantun_module
         cleanup_netns_topology(vm)
 
 
+def test_skipped_handshake_request_does_not_accept_future_sequence_gap(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, handshake_request=REQ)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    syn_ready_file = f"/tmp/phantun-gap-syn-{uuid.uuid4().hex}"
+    capture = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payload": "",
+            "ready_file": syn_ready_file,
+            "timeout_sec": 30,
+        },
+    )
+    drop_request = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "src_port": src_port,
+                "dst_addr": NS_ADDR_B,
+                "dst_port": dst_port,
+                "payload": REQ,
+                "comment": "drop_gap_req",
+            }
+        ],
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "gap_rst",
+            }
+        ],
+    )
+    receiver = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "timeout_sec": 15,
+        },
+    )
+
+    try:
+        wait_for_guest_ready_file(vm, syn_ready_file, timeout=30)
+        time.sleep(0.2)
+        sender_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["client-0"],
+            },
+        )
+        receiver_result = receiver.communicate(timeout=15)
+        capture_result = capture.communicate(timeout=30)
+
+        assert_completed(sender_result, "gap sender")
+        assert_completed(receiver_result, "gap receiver")
+        assert_completed(capture_result, "gap capture")
+
+        captured = parse_guest_json(capture_result.stdout, "gap capture stdout")
+        baseline_rst = rst_probe.packets(vm, "gap_rst")
+
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack",
+                "seq": captured["seq"] + 1 + len(REQ) + len("client-0") + 1000,
+                "ack": 1 + len(REQ),
+                "payload": "future",
+            },
+        )
+        time.sleep(0.2)
+
+        if rst_probe.packets(vm, "gap_rst") <= baseline_rst:
+            pytest.fail("skipped handshake_request must not leave a permanent future-sequence bypass")
+    finally:
+        drop_request.cleanup(vm)
+        rst_probe.cleanup(vm)
+        vm.run(["rm", "-f", syn_ready_file], check=False)
+        cleanup_netns_topology(vm)
+
+
 def test_invalid_pure_ack_does_not_refresh_liveness(phantun_module, vm):
     load_recovery_module(phantun_module)
     ensure_netns_topology(vm)

@@ -411,7 +411,15 @@ static bool phantun_tcp_is_valid_final_ack(const struct pht_l4_view *view, u32 p
 /* Established-state classifier for current-generation inbound packets. The
  * fake-TCP data path intentionally has no out-of-order queue, overlap trim,
  * or reassembly support, so each class maps directly to the only truthful
- * thing the module can do with that packet.
+ * thing the module can do with that packet:
+ * - INVALID: impossible packet for this generation; reset and tear down
+ * - ACK_ONLY: current-generation pure ACK that may refresh liveness
+ * - IN_ORDER_PAYLOAD: payload that advances the receive frontier and may reach UDP
+ * - RESERVED_SHAPING_DROP: reserved control slot payload; consume silently
+ * - DUPLICATE_OLD: traffic entirely below the current frontier; absorb silently
+ * - RESPONSE_SKIP_PROOF: later initiator payload that proves a responder
+ *   handshake-response slot was skipped; release queued responder data without
+ *   pretending the payload itself was in-order UDP data
  */
 enum phantun_established_rx_class {
     PHANTUN_EST_RX_INVALID = 0,
@@ -419,6 +427,7 @@ enum phantun_established_rx_class {
     PHANTUN_EST_RX_IN_ORDER_PAYLOAD,
     PHANTUN_EST_RX_RESERVED_SHAPING_DROP,
     PHANTUN_EST_RX_DUPLICATE_OLD,
+    PHANTUN_EST_RX_RESPONSE_SKIP_PROOF,
 };
 
 /* Snapshot returned by the established classifier. ack_seq is the peer's
@@ -475,10 +484,12 @@ phantun_classify_established_rx_locked(const struct pht_flow *flow,
             goto done;
         }
 
-        /* If the reserved shaping slot was skipped or lost, the first later
-         * payload becomes the new receive frontier for this generation.
+        /* The reserved shaping slot may be skipped exactly once. After the
+         * receive frontier moves past that slot, later payload must once again
+         * match the current frontier instead of riding a permanent exception.
          */
-        if (phantun_seq_after(decision.seq, flow->drop_next_rx_seq)) {
+        if (flow->ack == flow->drop_next_rx_seq &&
+            phantun_seq_after(decision.seq, flow->drop_next_rx_seq)) {
             decision.rx_class = PHANTUN_EST_RX_IN_ORDER_PAYLOAD;
             goto done;
         }
@@ -486,6 +497,12 @@ phantun_classify_established_rx_locked(const struct pht_flow *flow,
 
     if (decision.seq == flow->ack) {
         decision.rx_class = PHANTUN_EST_RX_IN_ORDER_PAYLOAD;
+        goto done;
+    }
+
+    if (flow->response_pending_ack && view->payload_len > 0 &&
+        phantun_seq_after(decision.seq, flow->ack)) {
+        decision.rx_class = PHANTUN_EST_RX_RESPONSE_SKIP_PROOF;
         goto done;
     }
 
@@ -497,7 +514,7 @@ phantun_classify_established_rx_locked(const struct pht_flow *flow,
 done:
     if (decision.rx_class == PHANTUN_EST_RX_ACK_ONLY ||
         decision.rx_class == PHANTUN_EST_RX_IN_ORDER_PAYLOAD ||
-        decision.rx_class == PHANTUN_EST_RX_RESERVED_SHAPING_DROP) {
+        decision.rx_class == PHANTUN_EST_RX_RESPONSE_SKIP_PROOF) {
         decision.response_unblocked =
             flow->response_pending_ack &&
             (decision.ack_seq >= flow->local_isn + 1 + phantun_cfg.handshake_response_len ||
@@ -817,7 +834,8 @@ static void phantun_apply_established_rx(struct pht_flow *flow,
 
     refresh_liveness = decision->rx_class == PHANTUN_EST_RX_ACK_ONLY ||
                        decision->rx_class == PHANTUN_EST_RX_IN_ORDER_PAYLOAD ||
-                       decision->rx_class == PHANTUN_EST_RX_RESERVED_SHAPING_DROP;
+                       decision->rx_class == PHANTUN_EST_RX_RESERVED_SHAPING_DROP ||
+                       decision->rx_class == PHANTUN_EST_RX_RESPONSE_SKIP_PROOF;
 
     spin_lock_bh(&flow->lock);
     if (decision->response_unblocked) {
@@ -833,6 +851,7 @@ static void phantun_apply_established_rx(struct pht_flow *flow,
 
     switch (decision->rx_class) {
     case PHANTUN_EST_RX_IN_ORDER_PAYLOAD:
+    case PHANTUN_EST_RX_RESPONSE_SKIP_PROOF:
         flow->ack = decision->seq_end;
         break;
     case PHANTUN_EST_RX_RESERVED_SHAPING_DROP:
