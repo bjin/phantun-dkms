@@ -371,8 +371,37 @@ out:
     return drop;
 }
 
+static bool phantun_request_enabled(void) { return phantun_cfg.handshake_request_len > 0; }
+
+static bool phantun_response_enabled(void) {
+    return phantun_request_enabled() && phantun_cfg.handshake_response_len > 0;
+}
+
 static bool phantun_tcp_is_bare_syn(const struct pht_l4_view *view) {
     return view && view->tcp->syn && !view->tcp->ack && view->payload_len == 0;
+}
+
+static bool phantun_tcp_is_plain_ack(const struct pht_l4_view *view) {
+    return view && view->tcp->ack && !view->tcp->syn && !view->tcp->rst && !view->tcp->fin &&
+           !view->tcp->psh && !view->tcp->urg;
+}
+
+static bool phantun_tcp_is_valid_final_ack(const struct pht_l4_view *view, u32 peer_syn_next) {
+    u32 seq;
+
+    if (!phantun_tcp_is_plain_ack(view))
+        return false;
+
+    seq = ntohl(view->tcp->seq);
+    if (seq == peer_syn_next)
+        return true;
+
+    /* If the initiator's reserved handshake_request slot was lost, the next
+     * payload can arrive at a higher sequence while we are still in
+     * SYN_RCVD. Accept only that payload-bearing skip case.
+     */
+    return phantun_request_enabled() && view->payload_len > 0 &&
+           phantun_seq_after_eq(seq, peer_syn_next);
 }
 
 static bool phantun_tcp_syn_is_aligned(const struct pht_l4_view *view) {
@@ -405,12 +434,6 @@ static bool phantun_pick_reopen_isn(u32 prev_seq, bool has_prev_seq, u32 *init_s
     }
 
     return false;
-}
-
-static bool phantun_request_enabled(void) { return phantun_cfg.handshake_request_len > 0; }
-
-static bool phantun_response_enabled(void) {
-    return phantun_request_enabled() && phantun_cfg.handshake_response_len > 0;
 }
 
 static int phantun_send_flow_rst(struct pht_flow *flow, struct net *net) {
@@ -1238,7 +1261,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
      * the exact final ACK can complete the handshake.
      */
     if (state_now == PHT_FLOW_STATE_SYN_RCVD) {
-        if (!view.tcp->ack || ntohl(view.tcp->ack_seq) != expected_ack) {
+        if (!phantun_tcp_is_valid_final_ack(&view, peer_syn_next) ||
+            ntohl(view.tcp->ack_seq) != expected_ack) {
             if (phantun_flow_should_drop_quarantined_packet(flow, &view)) {
                 pht_flow_put(flow);
                 return NF_DROP;

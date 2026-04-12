@@ -20,6 +20,7 @@ from helpers import (
     make_netns_ingress_flag_drop_probe,
     make_netns_ingress_payload_drop_probe,
     make_netns_output_flag_probe,
+    make_netns_prerouting_flag_drop_probe,
     read_module_stats,
 )
 
@@ -1008,6 +1009,202 @@ def test_bad_final_ack_payload_is_rejected_with_rstack(phantun_module, vm):
 
         if invalid_probe.packets(vm, "bad_final_rst") <= baseline_bad_final_rst:
             pytest.fail("expected RST|ACK for payload-bearing final ACK with wrong ack number")
+    finally:
+        drop_synack.cleanup(vm)
+        invalid_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_bad_final_ack_wrong_seq_is_rejected_with_rstack(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    drop_synack = make_netns_prerouting_flag_drop_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "drop_half_open_synack_wrong_seq",
+            }
+        ],
+    )
+    synack_capture = spawn_netns_scenario(
+        vm,
+        NS_A,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "payload": "",
+            "timeout_sec": 10,
+        },
+    )
+    invalid_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "bad_final_wrong_seq_rst",
+            }
+        ],
+    )
+
+    try:
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn",
+                "seq": 4095,
+            },
+        )
+        synack_result = synack_capture.communicate(timeout=10)
+        assert_completed(synack_result, "capture responder SYN|ACK")
+        synack_data = parse_guest_json(synack_result.stdout, "captured responder SYN|ACK")
+        if (synack_data.get("flags", 0) & 0x12) != 0x12:
+            pytest.fail(f"expected SYN|ACK from responder, got {synack_data!r}")
+
+        baseline_bad_final_rst = invalid_probe.packets(vm, "bad_final_wrong_seq_rst")
+
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack",
+                "seq": 5000,
+                "ack": synack_data["seq"] + 1,
+            },
+        )
+        time.sleep(0.2)
+
+        if invalid_probe.packets(vm, "bad_final_wrong_seq_rst") <= baseline_bad_final_rst:
+            pytest.fail("expected RST|ACK for final ACK with wrong sequence number")
+    finally:
+        drop_synack.cleanup(vm)
+        invalid_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_bad_final_ack_flags_are_rejected_with_rstack(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    drop_synack = make_netns_prerouting_flag_drop_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "drop_half_open_synack_flags",
+            }
+        ],
+    )
+    synack_capture = spawn_netns_scenario(
+        vm,
+        NS_A,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "payload": "",
+            "timeout_sec": 10,
+        },
+    )
+    invalid_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "bad_final_flag_rst",
+            }
+        ],
+    )
+
+    try:
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn",
+                "seq": 4095,
+            },
+        )
+        synack_result = synack_capture.communicate(timeout=10)
+        assert_completed(synack_result, "capture responder SYN|ACK")
+        synack_data = parse_guest_json(synack_result.stdout, "captured responder SYN|ACK")
+        if (synack_data.get("flags", 0) & 0x12) != 0x12:
+            pytest.fail(f"expected SYN|ACK from responder, got {synack_data!r}")
+
+        baseline_bad_final_rst = invalid_probe.packets(vm, "bad_final_flag_rst")
+
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack|fin",
+                "seq": 4096,
+                "ack": synack_data["seq"] + 1,
+            },
+        )
+        time.sleep(0.2)
+
+        if invalid_probe.packets(vm, "bad_final_flag_rst") <= baseline_bad_final_rst:
+            pytest.fail("expected RST|ACK for final ACK carrying unexpected control flags")
     finally:
         drop_synack.cleanup(vm)
         invalid_probe.cleanup(vm)
