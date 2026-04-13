@@ -141,7 +141,106 @@ def test_established_invalid_syn_destroys_flow(phantun_module, vm):
         invalid_probe.cleanup(vm)
 
 
-def test_established_future_seq_payload_is_rejected_with_rstack(phantun_module, vm):
+def test_established_later_sequence_payload_is_delivered_without_reset(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    capture = spawn_netns_scenario(
+        vm,
+        NS_A,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "payload": "msg1",
+            "timeout_sec": 15,
+        },
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "flags_expr": "rst | ack",
+                "comment": "later_payload_rst",
+            }
+        ],
+    )
+    receiver = spawn_netns_scenario(
+        vm,
+        NS_A,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "count": 2,
+            "timeout_sec": 15,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        sender_result = run_netns_scenario(
+            vm,
+            NS_B,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "payloads": ["msg1"],
+            },
+        )
+        capture_result = capture.communicate(timeout=15)
+        assert_completed(sender_result, "later-payload sender")
+        assert_completed(capture_result, "later-payload capture")
+
+        captured = parse_guest_json(capture_result.stdout, "later-payload capture stdout")
+        baseline_rst = rst_probe.packets(vm, "later_payload_rst")
+
+        run_netns_scenario(
+            vm,
+            NS_B,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "flags": "ack",
+                "seq": captured["seq"] + len("msg1") + len("gap"),
+                "ack": captured["ack"],
+                "payload": "later",
+            },
+        )
+        receiver_result = receiver.communicate(timeout=15)
+        assert_completed(receiver_result, "later-payload receiver")
+
+        receiver_data = parse_guest_json(receiver_result.stdout, "later-payload receiver stdout")
+        receiver_messages = [entry["message"] for entry in receiver_data.get("received", [])]
+        if sorted(receiver_messages) != ["later", "msg1"]:
+            pytest.fail(f"later-sequence payload should still reach UDP without reset: {receiver_messages!r}")
+        if rst_probe.packets(vm, "later_payload_rst") != baseline_rst:
+            pytest.fail("later-sequence payload should not trigger RST|ACK")
+    finally:
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_established_overlapping_payload_is_rejected_with_rstack(phantun_module, vm):
     phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
@@ -174,7 +273,7 @@ def test_established_future_seq_payload_is_rejected_with_rstack(phantun_module, 
                 "src_port": local_port,
                 "dst_port": remote_port,
                 "flags_expr": "rst | ack",
-                "comment": "future_seq_rst",
+                "comment": "overlap_rst",
             }
         ],
     )
@@ -207,12 +306,12 @@ def test_established_future_seq_payload_is_rejected_with_rstack(phantun_module, 
         receiver_result = receiver.communicate(timeout=15)
         capture_result = capture.communicate(timeout=15)
 
-        assert_completed(sender_result, "future-seq sender")
-        assert_completed(receiver_result, "future-seq receiver")
-        assert_completed(capture_result, "future-seq capture")
+        assert_completed(sender_result, "overlap sender")
+        assert_completed(receiver_result, "overlap receiver")
+        assert_completed(capture_result, "overlap capture")
 
-        captured = parse_guest_json(capture_result.stdout, "future-seq capture stdout")
-        baseline_rst = rst_probe.packets(vm, "future_seq_rst")
+        captured = parse_guest_json(capture_result.stdout, "overlap capture stdout")
+        baseline_rst = rst_probe.packets(vm, "overlap_rst")
 
         run_netns_scenario(
             vm,
@@ -224,15 +323,15 @@ def test_established_future_seq_payload_is_rejected_with_rstack(phantun_module, 
                 "target_addr": NS_ADDR_A,
                 "target_port": local_port,
                 "flags": "ack",
-                "seq": captured["seq"] + 1000,
+                "seq": captured["seq"] + len("msg1") - 2,
                 "ack": captured["ack"],
-                "payload": "future",
+                "payload": "overlap",
             },
         )
         time.sleep(0.2)
 
-        if rst_probe.packets(vm, "future_seq_rst") <= baseline_rst:
-            pytest.fail("future-sequence established payload should trigger RST|ACK")
+        if rst_probe.packets(vm, "overlap_rst") <= baseline_rst:
+            pytest.fail("payload overlapping the current receive frontier should trigger RST|ACK")
     finally:
         rst_probe.cleanup(vm)
         cleanup_netns_topology(vm)
@@ -334,7 +433,7 @@ def test_established_ack_beyond_local_seq_is_rejected_with_rstack(phantun_module
         cleanup_netns_topology(vm)
 
 
-def test_future_seq_pure_ack_is_rejected_with_rstack(phantun_module, vm):
+def test_future_sequence_pure_ack_is_silently_absorbed(phantun_module, vm):
     phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
@@ -342,17 +441,17 @@ def test_future_seq_pure_ack_is_rejected_with_rstack(phantun_module, vm):
         cleanup_netns_topology(vm)
         pytest.skip("nft is not available in the guest")
 
-    local_port = PORTS_A[0]
-    remote_port = PORTS_B[0]
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
     capture = spawn_netns_scenario(
         vm,
         NS_A,
         "capture_tcp_packet",
         {
             "bind_addr": NS_ADDR_B,
-            "bind_port": remote_port,
+            "bind_port": dst_port,
             "target_addr": NS_ADDR_A,
-            "target_port": local_port,
+            "target_port": src_port,
             "payload": "msg1",
             "timeout_sec": 15,
         },
@@ -364,8 +463,8 @@ def test_future_seq_pure_ack_is_rejected_with_rstack(phantun_module, vm):
             {
                 "src_addr": NS_ADDR_A,
                 "dst_addr": NS_ADDR_B,
-                "src_port": local_port,
-                "dst_port": remote_port,
+                "src_port": src_port,
+                "dst_port": dst_port,
                 "flags_expr": "rst | ack",
                 "comment": "future_pure_ack_rst",
             }
@@ -377,7 +476,7 @@ def test_future_seq_pure_ack_is_rejected_with_rstack(phantun_module, vm):
         "recv_many",
         {
             "bind_addr": NS_ADDR_A,
-            "bind_port": local_port,
+            "bind_port": src_port,
             "count": 1,
             "timeout_sec": 15,
         },
@@ -391,9 +490,9 @@ def test_future_seq_pure_ack_is_rejected_with_rstack(phantun_module, vm):
             "send_many",
             {
                 "bind_addr": NS_ADDR_B,
-                "bind_port": remote_port,
+                "bind_port": dst_port,
                 "target_addr": NS_ADDR_A,
-                "target_port": local_port,
+                "target_port": src_port,
                 "payloads": ["msg1"],
             },
         )
@@ -413,9 +512,9 @@ def test_future_seq_pure_ack_is_rejected_with_rstack(phantun_module, vm):
             "send_tcp_packet",
             {
                 "bind_addr": NS_ADDR_B,
-                "bind_port": remote_port,
+                "bind_port": dst_port,
                 "target_addr": NS_ADDR_A,
-                "target_port": local_port,
+                "target_port": src_port,
                 "flags": "ack",
                 "seq": captured["seq"] + len("msg1") + 1000,
                 "ack": captured["ack"],
@@ -423,14 +522,14 @@ def test_future_seq_pure_ack_is_rejected_with_rstack(phantun_module, vm):
         )
         time.sleep(0.2)
 
-        if rst_probe.packets(vm, "future_pure_ack_rst") <= baseline_rst:
-            pytest.fail("future-sequence pure ACK should trigger RST|ACK")
+        if rst_probe.packets(vm, "future_pure_ack_rst") != baseline_rst:
+            pytest.fail("future-sequence pure ACK should be absorbed without RST|ACK")
     finally:
         rst_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 
-def test_future_seq_pure_ack_does_not_refresh_liveness(phantun_module, vm):
+def test_future_sequence_pure_ack_still_does_not_refresh_liveness(phantun_module, vm):
     load_recovery_module(phantun_module)
     ensure_netns_topology(vm)
 
@@ -438,32 +537,32 @@ def test_future_seq_pure_ack_does_not_refresh_liveness(phantun_module, vm):
         cleanup_netns_topology(vm)
         pytest.skip("nft is not available in the guest")
 
-    local_port = PORTS_A[0]
-    remote_port = PORTS_B[0]
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
     capture = spawn_netns_scenario(
         vm,
         NS_A,
         "capture_tcp_packet",
         {
             "bind_addr": NS_ADDR_B,
-            "bind_port": remote_port,
+            "bind_port": dst_port,
             "target_addr": NS_ADDR_A,
-            "target_port": local_port,
+            "target_port": src_port,
             "payload": "msg1",
             "timeout_sec": 15,
         },
     )
-    syn_probe = make_netns_output_flag_probe(
+    reconnect_probe = make_netns_output_flag_probe(
         vm,
         NS_A,
         [
             {
                 "src_addr": NS_ADDR_A,
                 "dst_addr": NS_ADDR_B,
-                "src_port": local_port,
-                "dst_port": remote_port,
+                "src_port": src_port,
+                "dst_port": dst_port,
                 "flags_expr": "syn",
-                "comment": "future_pure_ack_keepalive_syn",
+                "comment": "future_pure_ack_syn",
             }
         ],
     )
@@ -473,7 +572,7 @@ def test_future_seq_pure_ack_does_not_refresh_liveness(phantun_module, vm):
         "echo_server",
         {
             "bind_addr": NS_ADDR_B,
-            "bind_port": remote_port,
+            "bind_port": dst_port,
             "count": 2,
             "timeout_sec": 20,
         },
@@ -487,18 +586,18 @@ def test_future_seq_pure_ack_does_not_refresh_liveness(phantun_module, vm):
             "echo_client",
             {
                 "bind_addr": NS_ADDR_A,
-                "bind_port": local_port,
+                "bind_port": src_port,
                 "target_addr": NS_ADDR_B,
-                "target_port": remote_port,
+                "target_port": dst_port,
                 "payloads": ["msg1"],
                 "timeout_sec": 15,
             },
         )
         capture_result = capture.communicate(timeout=15)
-        assert_completed(first_result, "future-pure-ack first echo")
-        assert_completed(capture_result, "future-pure-ack capture")
-        captured = parse_guest_json(capture_result.stdout, "future-pure-ack capture stdout")
-        baseline_syn = syn_probe.packets(vm, "future_pure_ack_keepalive_syn")
+        assert_completed(first_result, "future pure ack first echo")
+        assert_completed(capture_result, "future pure ack capture")
+        captured = parse_guest_json(capture_result.stdout, "future pure ack capture stdout")
+        baseline_syn = reconnect_probe.packets(vm, "future_pure_ack_syn")
 
         for _ in range(5):
             run_netns_scenario(
@@ -507,9 +606,9 @@ def test_future_seq_pure_ack_does_not_refresh_liveness(phantun_module, vm):
                 "send_tcp_packet",
                 {
                     "bind_addr": NS_ADDR_B,
-                    "bind_port": remote_port,
+                    "bind_port": dst_port,
                     "target_addr": NS_ADDR_A,
-                    "target_port": local_port,
+                    "target_port": src_port,
                     "flags": "ack",
                     "seq": captured["seq"] + len("msg1") + 1000,
                     "ack": captured["ack"],
@@ -523,27 +622,27 @@ def test_future_seq_pure_ack_does_not_refresh_liveness(phantun_module, vm):
             "echo_client",
             {
                 "bind_addr": NS_ADDR_A,
-                "bind_port": local_port,
+                "bind_port": src_port,
                 "target_addr": NS_ADDR_B,
-                "target_port": remote_port,
+                "target_port": dst_port,
                 "payloads": ["msg2"],
                 "timeout_sec": 15,
             },
         )
-        assert_completed(second_result, "future-pure-ack second echo")
+        assert_completed(second_result, "future pure ack second echo")
 
-        if syn_probe.packets(vm, "future_pure_ack_keepalive_syn") <= baseline_syn:
-            pytest.fail("future-sequence pure ACKs should not keep the established flow alive")
+        if reconnect_probe.packets(vm, "future_pure_ack_syn") <= baseline_syn:
+            pytest.fail("future-sequence pure ACK should not keep the flow alive")
 
         server_result = server.communicate(timeout=20)
-        assert_completed(server_result, "future-pure-ack server")
-        server_data = parse_guest_json(server_result.stdout, "future-pure-ack server stdout")
+        assert_completed(server_result, "future pure ack server")
+        server_data = parse_guest_json(server_result.stdout, "future pure ack server stdout")
         if received_plain_messages(server_data) != ["msg1", "msg2"]:
             pytest.fail(
-                f"unexpected server delivery after future pure ACK liveness test: {received_plain_messages(server_data)!r}"
+                f"unexpected server messages after future pure ACK liveness test: {received_plain_messages(server_data)!r}"
             )
     finally:
-        syn_probe.cleanup(vm)
+        reconnect_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 

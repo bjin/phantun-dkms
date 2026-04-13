@@ -414,12 +414,13 @@ static bool phantun_tcp_is_valid_final_ack(const struct pht_l4_view *view, u32 p
  * thing the module can do with that packet:
  * - INVALID: impossible packet for this generation; reset and tear down
  * - ACK_ONLY: current-generation pure ACK that may refresh liveness
- * - IN_ORDER_PAYLOAD: payload that advances the receive frontier and may reach UDP
+ * - IN_ORDER_PAYLOAD: payload at or beyond the current frontier that we can
+ *   deliver immediately as best-effort UDP
  * - RESERVED_SHAPING_DROP: reserved control slot payload; consume silently
  * - DUPLICATE_OLD: traffic entirely below the current frontier; absorb silently
  * - RESPONSE_SKIP_PROOF: later initiator payload that proves a responder
- *   handshake-response slot was skipped; release queued responder data without
- *   pretending the payload itself was in-order UDP data
+ *   handshake-response slot was skipped; it is still delivered to UDP, but it
+ *   also has the side effect of releasing queued responder data
  */
 enum phantun_established_rx_class {
     PHANTUN_EST_RX_INVALID = 0,
@@ -449,10 +450,11 @@ static bool phantun_tcp_is_established_ack(const struct pht_l4_view *view) {
            !view->tcp->psh && !view->tcp->urg;
 }
 
-/* The fake-TCP data path has no out-of-order queue. For a current generation,
- * new payload is accepted only at the exact next expected peer sequence. Old
- * fully-duplicate packets may be silently absorbed, and the reserved shaping
- * slot remains a narrow exception addressed by exact sequence number.
+/* The fake-TCP data path has no out-of-order queue. Whole later datagrams may
+ * still be delivered best-effort to UDP so benign reordering does not reset or
+ * black-hole the flow. What we still reject is overlap: once a packet starts
+ * below the current frontier but extends past it, we have no safe way to trim
+ * and partly redeliver that payload.
  */
 static struct phantun_established_rx_decision
 phantun_classify_established_rx_locked(const struct pht_flow *flow,
@@ -472,46 +474,22 @@ phantun_classify_established_rx_locked(const struct pht_flow *flow,
         return decision;
 
     if (view->payload_len == 0) {
-        /* Pure ACK still belongs to the peer's receive stream. With no payload
-         * to justify a jump, any ACK whose sequence is ahead of our current
-         * receive frontier is a protocol error rather than a harmless
-         * liveness signal.
+        /* Pure ACK can legitimately arrive after the peer has advanced its own
+         * send sequence with payload we have not seen yet. With no payload in
+         * this skb there is nothing to deliver, so absorb any non-overlapping
+         * pure ACK as bookkeeping only; only the exact-frontier form may
+         * refresh liveness.
          */
-        if (phantun_seq_after(decision.seq, flow->ack))
-            return decision;
-
-        decision.rx_class = (phantun_seq_before(decision.seq, flow->ack) ||
+        decision.rx_class = (phantun_seq_after(decision.seq, flow->ack) ||
+                             phantun_seq_before(decision.seq, flow->ack) ||
                              phantun_seq_before(decision.ack_seq, flow->last_ack))
                                 ? PHANTUN_EST_RX_DUPLICATE_OLD
                                 : PHANTUN_EST_RX_ACK_ONLY;
         goto done;
     }
 
-    if (flow->drop_next_rx_payload) {
-        if (decision.seq == flow->drop_next_rx_seq) {
-            decision.rx_class = PHANTUN_EST_RX_RESERVED_SHAPING_DROP;
-            goto done;
-        }
-
-        /* The reserved shaping slot may be skipped exactly once. After the
-         * receive frontier moves past that slot, later payload must once again
-         * match the current frontier instead of riding a permanent exception.
-         */
-        if (flow->ack == flow->drop_next_rx_seq &&
-            phantun_seq_after(decision.seq, flow->drop_next_rx_seq)) {
-            decision.rx_class = PHANTUN_EST_RX_IN_ORDER_PAYLOAD;
-            goto done;
-        }
-    }
-
-    if (decision.seq == flow->ack) {
-        decision.rx_class = PHANTUN_EST_RX_IN_ORDER_PAYLOAD;
-        goto done;
-    }
-
-    if (flow->response_pending_ack && view->payload_len > 0 &&
-        phantun_seq_after(decision.seq, flow->ack)) {
-        decision.rx_class = PHANTUN_EST_RX_RESPONSE_SKIP_PROOF;
+    if (flow->drop_next_rx_payload && decision.seq == flow->drop_next_rx_seq) {
+        decision.rx_class = PHANTUN_EST_RX_RESERVED_SHAPING_DROP;
         goto done;
     }
 
@@ -519,6 +497,24 @@ phantun_classify_established_rx_locked(const struct pht_flow *flow,
         decision.rx_class = PHANTUN_EST_RX_DUPLICATE_OLD;
         goto done;
     }
+
+    /* There is no out-of-order queue for fake-TCP data. Once a payload starts
+     * above the current frontier, the only honest choices are to drop it or to
+     * deliver it immediately as a later UDP datagram. We choose best-effort
+     * delivery for whole later datagrams so benign reordering does not reset or
+     * black-hole the flow under load. Overlap remains invalid because we cannot
+     * trim and partly redeliver safely.
+     */
+    if (phantun_seq_before(decision.seq, flow->ack))
+        return decision;
+
+    if (flow->response_pending_ack && phantun_seq_after(decision.seq, flow->ack)) {
+        decision.rx_class = PHANTUN_EST_RX_RESPONSE_SKIP_PROOF;
+        goto done;
+    }
+
+    decision.rx_class = PHANTUN_EST_RX_IN_ORDER_PAYLOAD;
+    goto done;
 
 done:
     if (decision.rx_class == PHANTUN_EST_RX_ACK_ONLY ||
@@ -1648,7 +1644,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         if (decision.rx_class == PHANTUN_EST_RX_RESERVED_SHAPING_DROP)
             pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
 
-        reinject_payload = decision.rx_class == PHANTUN_EST_RX_IN_ORDER_PAYLOAD;
+        reinject_payload = decision.rx_class == PHANTUN_EST_RX_IN_ORDER_PAYLOAD ||
+                           decision.rx_class == PHANTUN_EST_RX_RESPONSE_SKIP_PROOF;
         ret = phantun_finalize_established_rx(flow, &ep, skb, &view, &decision, state->net, in_dev,
                                               reinject_payload, true);
         if (ret) {

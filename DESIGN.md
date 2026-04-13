@@ -254,7 +254,7 @@ Behavior:
 
 - if `handshake_request` was injected, flush initiator-owned queued UDP after that injected request
 - if responder first-payload ignore slot is armed, suppress only payload whose starting sequence matches reserved responder control sequence
-- later responder payloads deliver normally only once earlier sequence space has been accounted for; arbitrary future-sequence payload is invalid
+- later responder payload may be delivered best-effort once it is wholly above the current receive frontier; payload that overlaps the frontier is invalid
 - normal UDP ↔ fake-TCP translation follows
 - only inbound packets valid for the current generation refresh liveness suspicion, including pure `ACK` and handshake-response acknowledgement traffic
 - after `keepalive_interval_sec` without valid inbound traffic: send pure `ACK` keepalive
@@ -313,7 +313,7 @@ Behavior:
 - outbound UDP becomes `ACK + payload`
 - inbound fake-TCP payload becomes local UDP unless payload start sequence matches an armed ignore slot
 - `seq` grows by outbound payload length
-- `ack` tracks the next expected peer sequence and never regresses
+- `ack` tracks the next receive frontier monotonically and never regresses
 - if injected responder `handshake_response` still awaits acknowledgement, responder UDP follows the one-skb queue/drop rule until release
 - only inbound packets valid for the current generation refresh liveness suspicion
 - keepalive and silent idle teardown use the same policy as initiator-established flows
@@ -331,35 +331,35 @@ Established-state inbound processing uses a classifier over the current flow gen
 
 Classifier classes:
 - `VALID_ACK_ONLY`: packet carries `ACK`, no payload, no illegal control flags, and its `ack_seq` is valid for the current generation
-- `VALID_IN_ORDER_PAYLOAD`: packet carries `ACK` and payload whose starting sequence exactly matches the next expected peer sequence
+- `VALID_IN_ORDER_PAYLOAD`: packet carries `ACK` and payload that starts at or beyond the current receive frontier and can be delivered immediately as best-effort UDP
 - `VALID_RESERVED_SHAPING_DROP`: packet matches an armed reserved shaping sequence slot and is silently suppressed without UDP delivery
 - `VALID_DUPLICATE_OLD`: packet is entirely below the current receive frontier and may be silently absorbed without changing externally visible state
-- `VALID_RESPONSE_SKIP_PROOF`: while responder `handshake_response` is still pending acknowledgement, later initiator payload may prove that the reserved responder-control slot was skipped; this releases queued responder UDP and may advance the receive frontier, but the proving payload is not itself treated as in-order UDP delivery
-- `INVALID`: impossible ACK progression, overlapping old/new payload, arbitrary future-sequence payload, missing required `ACK`, or any packet that does not fit the current generation's rules
+- `VALID_RESPONSE_SKIP_PROOF`: while responder `handshake_response` is still pending acknowledgement, later initiator payload may prove that the reserved responder-control slot was skipped; this both releases queued responder UDP and still delivers the proving payload to UDP
+- `INVALID`: impossible ACK progression, overlapping old/new payload, missing required `ACK`, or any packet that does not fit the current generation's rules
 
 Receive-window definition for this protocol:
 - There is no general out-of-order receive queue in v1
-- The next expected peer sequence is the flow's current `ack` value
-- New payload is accepted only when `seq == ack`, except for explicitly documented shaping-loss exceptions
-- Duplicate old payload is tolerated only when the entire payload lies below the current `ack` frontier; duplicates must not be reinjected to UDP and must not regress ACK state
-- Payload that starts below `ack` but extends past `ack` is invalid because there is no overlap trimming or partial reassembly path
-- Payload that starts above `ack` is invalid unless it is one of the narrow shaping-loss cases already documented for the reserved first-payload slot or the responder pending-response proof path
+- The current receive frontier is the flow's `ack` value
+- Pure ACK may be silently absorbed when its `seq` is below or above the current receive frontier, but only the exact-frontier form is allowed to refresh liveness or release responder-side state
+- Whole payload datagrams that start at or above the current receive frontier may still be delivered best-effort, even when they arrive later than an unseen lower-sequence datagram
+- Duplicate old payload is tolerated only when the entire payload lies below the current receive frontier; duplicates must not be reinjected to UDP and must not regress ACK state
+- Payload that starts below the current receive frontier but extends past it is invalid because there is no overlap trimming or partial reassembly path
 
 ACK validation rules in `ESTABLISHED`:
 - Normal established traffic must carry `ACK`
 - `ack_seq` must stay within the local send frontier of the current generation
 - `ack_seq` greater than locally sent bytes is invalid
-- Stale ACKs below the last accepted ACK may be silently absorbed only as harmless duplicates; they must not refresh liveness, release `response_pending_ack`, or advance any sequence state
+- Pure ACK outside the current receive frontier may be silently absorbed as harmless bookkeeping, but it must not refresh liveness, release `response_pending_ack`, or advance any sequence state
 
 State-machine consequences:
 - `VALID_ACK_ONLY` refreshes liveness and may release queued responder UDP only when it validly acknowledges the injected responder handshake-response range
-- `VALID_IN_ORDER_PAYLOAD` refreshes liveness, advances the receive frontier, may release responder queued UDP when it proves a reserved response slot was skipped, and reinjects payload to local UDP
+- `VALID_IN_ORDER_PAYLOAD` refreshes liveness, advances the receive frontier monotonically, may release responder queued UDP when it proves a reserved response slot was skipped, and reinjects payload to local UDP
 - `VALID_RESERVED_SHAPING_DROP` refreshes liveness only for the current generation, never delivers to UDP, and must not regress ACK state
 - `VALID_DUPLICATE_OLD` is silently absorbed; it does not refresh liveness, does not deliver to UDP, and does not alter ACK state
-- `VALID_RESPONSE_SKIP_PROOF` refreshes liveness and may release queued responder UDP, but exists only while responder `handshake_response` is still pending; it must not become a permanent future-sequence bypass once normal in-order reception resumes
+- `VALID_RESPONSE_SKIP_PROOF` refreshes liveness, advances the receive frontier monotonically, releases queued responder UDP, and still delivers the proving payload to UDP
 - `INVALID` is a protocol error and triggers `RST|ACK` plus local teardown, except where the failure policy explicitly lists a silent-drop case
 
-These rules intentionally preserve handshake shaping loss-tolerance while preventing invalid established traffic from keeping flows alive or steering state transitions.
+These rules intentionally preserve handshake shaping loss-tolerance and tolerate benign datagram reordering while still rejecting impossible ACK progression and overlapping payload shapes.
 ## 7. Failure policy
 
 ### 7.1 Immediate `RST` + flow destruction
