@@ -16,7 +16,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential autoconf automake libtool make linux-headers-generic
+          sudo apt-get install --no-install-recommends -y build-essential autoconf automake libtool make linux-headers-generic
       - name: Build
         run: make
 
@@ -61,7 +61,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y dkms build-essential autoconf automake make \
+          sudo apt-get install --no-install-recommends -y dkms build-essential autoconf automake make \
             qemu-system-x86 virtiofsd python3-pytest linux-headers-generic pipx gcc-14 wireguard-tools
           pipx install virtme-ng
       - name: Cache Kernel
@@ -104,7 +104,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y autoconf automake libtool make dkms
+          sudo apt-get install --no-install-recommends -y autoconf automake libtool make dkms
 
       - name: Build Release Artifacts
         run: |
