@@ -266,7 +266,7 @@ def project_info():
                 break
 
     # Prepare tarball BEFORE VM starts because of COW filesystem.
-    subprocess.run(["./release-dkms.sh"], cwd=proj_root, check=True)
+    subprocess.run(["make", "dkms"], cwd=proj_root, check=True)
     tar_path = proj_root / f"phantun-dkms_{version}.tar.gz"
 
     return {"root": proj_root, "version": version, "tar_path": tar_path}

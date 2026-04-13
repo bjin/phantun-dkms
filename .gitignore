@@ -33,10 +33,10 @@ __pycache__
 /autom4te.cache/
 /config.status
 /confdefs.h
-/Makefile
 /config.h.in
 /configure
 /config.h
 
+/.build/
 *.deb
 .release-dkms-deb.*/

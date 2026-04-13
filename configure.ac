@@ -32,7 +32,6 @@ AS_IF([test ! -d "$KDIR"], [
   AC_MSG_ERROR([kernel build directory does not exist: $KDIR])
 ])
 
-AC_SUBST([KDIR])
 
 AC_CONFIG_SRCDIR([src/phantun_main.c])
 
@@ -279,6 +278,5 @@ AS_IF([test "x$ac_cv_have_net_gso_h" = xyes], [
 ])
 
 
-AC_CONFIG_FILES([Makefile])
 
 AC_OUTPUT

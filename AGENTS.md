@@ -12,10 +12,9 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 - `TESTING.md`: detailed integration testing instructions
 
 ## Build
-- Bootstrap: `./autogen.sh`
-- Configure: `./configure`
 - Build module: `make`
 - Refresh compile database: `make compile_commands`
+- `make` bootstraps `./autogen.sh` and `./configure` only when generated files are missing or stale.
 - If autodetect fails, pass `KDIR=/path/to/kernel/build`
 * Format: `./format.sh`
 

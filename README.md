@@ -88,13 +88,20 @@ Typical target: **WireGuard** or **`wireguard-go`**.
 ### Build & Install from source code
 
 ```bash
-./autogen.sh
-./configure
 make
 sudo make modules_install
 ```
 
+The static `Makefile` bootstraps `./autogen.sh` and `./configure` only when their generated files are missing or stale.
+
 If kernel autodetection fails, pass `KDIR=/path/to/kernel/build` to `make`.
+
+### Build release artifacts locally
+
+```bash
+make dkms
+make dkms-deb
+```
 
 ### Install from DKMS package (latest release)
 
@@ -274,8 +281,9 @@ cat /sys/module/phantun/stats/rst_sent
 
 | Task | Command |
 |---|---|
-| Build | `./autogen.sh && ./configure && make` |
+| Build | `make` |
 | Refresh compile database | `make compile_commands` |
+| Install module | `sudo make modules_install` |
 | Load module | `sudo modprobe phantun ...` |
 | Unload module | `sudo rmmod phantun` |
 
