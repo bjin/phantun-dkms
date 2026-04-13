@@ -314,6 +314,7 @@ Behavior:
 
 - outbound UDP becomes `ACK + payload`
 - inbound fake-TCP payload becomes local UDP unless payload start sequence matches an armed ignore slot
+- payload larger than the translator's maximum supported UDP reinjection size is invalid and rejected with `RST|ACK`
 - `seq` grows by outbound payload length
 - `ack` tracks peer `seq + payload_len`
 - if injected responder `handshake_response` still awaits acknowledgement, responder UDP follows the one-skb queue/drop rule until release
@@ -334,6 +335,7 @@ Inbound flag priority matches initiator-established handling:
 - bad `SYN` alignment
 - wrong final `ACK` during handshake
 - impossible flag/state combination
+- oversized inbound payload beyond the translator's supported UDP reinjection size
 - non-`RST` packet for unknown tuple
 
 Peer-only mode keeps this rule: if a packet from a managed remote peer does not match local flow state and is not a valid new bare `SYN`, reject with `RST` instead of silently dropping it.

@@ -31,6 +31,7 @@ MODULE_STAT_NAMES = (
     "udp_packets_queued",
     "udp_packets_dropped",
     "shaping_payloads_dropped",
+    "oversized_payloads_dropped",
 )
 
 
@@ -174,6 +175,18 @@ def wait_for_guest_condition(vm, cmd, timeout, description, interval=0.1):
 
 def wait_for_guest_ready_file(vm, path, timeout=5):
     wait_for_guest_condition(vm, ["test", "-e", path], timeout, f"guest readiness file {path!r}")
+
+
+def spawn_ready_capture(vm, namespace, config):
+    ready_file = f"/tmp/phantun-capture-{uuid.uuid4().hex}"
+    capture = spawn_netns_scenario(
+        vm,
+        namespace,
+        "capture_tcp_packet",
+        {**config, "ready_file": ready_file},
+    )
+    wait_for_guest_ready_file(vm, ready_file, timeout=config.get("timeout_sec", 10))
+    return capture
 
 
 def parse_guest_json(stdout, context):

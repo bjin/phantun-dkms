@@ -10,6 +10,7 @@ from helpers import (
     PORTS_A,
     PORTS_B,
     VETH_A,
+    VETH_B,
     assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
@@ -22,6 +23,7 @@ from helpers import (
     run_in_netns,
     run_netns_scenario,
     spawn_netns_scenario,
+    spawn_ready_capture,
 )
 
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
@@ -577,3 +579,212 @@ def test_unknown_ack_payload_is_rejected_with_rstack(phantun_module, vm):
     server_data = parse_guest_json(server_result.stdout, "echo server stdout")
     if received_messages(server_data) != ["msg1"]:
         pytest.fail(f"unexpected server messages after unknown ack payload: {received_messages(server_data)!r}")
+
+
+def test_oversized_established_payload_is_rejected_and_counted(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    run_in_netns(vm, NS_A, ["ip", "link", "set", VETH_A, "mtu", "3000"])
+    run_in_netns(vm, NS_B, ["ip", "link", "set", VETH_B, "mtu", "3000"])
+    oversize_payload = "X" * 2000
+    capture = spawn_ready_capture(
+        vm,
+        NS_A,
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "payload": "msg1",
+            "timeout_sec": 15,
+        },
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "flags_expr": "rst | ack",
+                "comment": "oversized_est_rst",
+            }
+        ],
+    )
+    receiver = spawn_netns_scenario(
+        vm,
+        NS_A,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "count": 1,
+            "timeout_sec": 15,
+        },
+    )
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        time.sleep(0.2)
+        sender_result = run_netns_scenario(
+            vm,
+            NS_B,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "payloads": ["msg1"],
+            },
+        )
+        receiver_result = receiver.communicate(timeout=15)
+        capture_result = capture.communicate(timeout=15)
+
+        assert_completed(sender_result, "oversized established sender")
+        assert_completed(receiver_result, "oversized established receiver")
+        assert_completed(capture_result, "oversized established capture")
+
+        captured = parse_guest_json(capture_result.stdout, "oversized established capture stdout")
+        baseline_rst = rst_probe.packets(vm, "oversized_est_rst")
+
+        run_netns_scenario(
+            vm,
+            NS_B,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "flags": "ack",
+                "seq": captured["seq"] + len("msg1"),
+                "ack": captured["ack"],
+                "payload": oversize_payload,
+            },
+        )
+        time.sleep(0.2)
+
+        stats_after = read_module_stats(vm)
+        if rst_probe.packets(vm, "oversized_est_rst") <= baseline_rst:
+            pytest.fail("oversized established payload should trigger RST|ACK")
+        if stats_after["oversized_payloads_dropped"] <= baseline_stats["oversized_payloads_dropped"]:
+            pytest.fail(
+                f"oversized established payload should increment oversized drop stats: before={baseline_stats!r} after={stats_after!r}"
+            )
+    finally:
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_oversized_final_ack_payload_is_rejected_and_counted(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    oversize_payload = "X" * 2000
+    drop_synack = make_netns_prerouting_flag_drop_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "drop_oversized_synack",
+            }
+        ],
+    )
+    run_in_netns(vm, NS_A, ["ip", "link", "set", VETH_A, "mtu", "3000"])
+    run_in_netns(vm, NS_B, ["ip", "link", "set", VETH_B, "mtu", "3000"])
+    synack_capture = spawn_ready_capture(
+        vm,
+        NS_A,
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "payload": "",
+            "timeout_sec": 10,
+        },
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "oversized_final_rst",
+            }
+        ],
+    )
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn",
+                "seq": 4095,
+            },
+        )
+        synack_result = synack_capture.communicate(timeout=10)
+        assert_completed(synack_result, "oversized final synack capture")
+        synack_data = parse_guest_json(synack_result.stdout, "oversized final synack stdout")
+        baseline_rst = rst_probe.packets(vm, "oversized_final_rst")
+
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack",
+                "seq": 4096,
+                "ack": synack_data["seq"] + 1,
+                "payload": oversize_payload,
+            },
+        )
+        time.sleep(0.2)
+
+        stats_after = read_module_stats(vm)
+        if rst_probe.packets(vm, "oversized_final_rst") <= baseline_rst:
+            pytest.fail("oversized final ACK payload should trigger RST|ACK")
+        if stats_after["oversized_payloads_dropped"] <= baseline_stats["oversized_payloads_dropped"]:
+            pytest.fail(
+                f"oversized final ACK payload should increment oversized drop stats: before={baseline_stats!r} after={stats_after!r}"
+            )
+    finally:
+        drop_synack.cleanup(vm)
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
