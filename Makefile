@@ -29,11 +29,7 @@ KDIR_STAMP := $(KDIR_STAMP_DIR)/config$(subst /,_,$(KDIR)).stamp
 
 all: modules
 
-$(KDIR_STAMP): dkms.conf $(wildcard configure.ac) $(wildcard configure) $(wildcard config.h.in)
-	@if [ -z "$(strip $(KDIR))" ]; then \
-		echo "Unable to locate a kernel build tree; set KDIR=/path/to/kernel/build" >&2; \
-		exit 1; \
-	fi
+configure config.h.in &: dkms.conf $(wildcard configure.ac)
 	@set -eu; \
 	need_autogen=no; \
 	if [ ! -f configure ] || [ ! -f config.h.in ]; then \
@@ -47,6 +43,12 @@ $(KDIR_STAMP): dkms.conf $(wildcard configure.ac) $(wildcard configure) $(wildca
 			exit 1; \
 		fi; \
 		./autogen.sh; \
+	fi
+
+$(KDIR_STAMP): configure config.h.in
+	@if [ -z "$(strip $(KDIR))" ]; then \
+		echo "Unable to locate a kernel build tree; set KDIR=/path/to/kernel/build" >&2; \
+		exit 1; \
 	fi
 	@mkdir -p '$(KDIR_STAMP_DIR)'
 	./configure --with-kernel='$(KDIR)'
