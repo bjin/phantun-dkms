@@ -267,7 +267,7 @@ Behavior:
 Inbound flag priority in established state:
 
 1. `RST` → destroy local state silently
-2. bare aligned `SYN` with no payload/ACK → accept as generation replacement, move old generation into quarantine, create new responder `SYN_RCVD`, send `SYN|ACK`
+2. bare aligned `SYN` with no payload, no `ACK`, and no other control flags → accept as generation replacement, move old generation into quarantine, create new responder `SYN_RCVD`, send `SYN|ACK`
 3. any other packet with `SYN` set → send `RST|ACK`, destroy local state
 4. otherwise → normal data processing
 
@@ -279,9 +279,7 @@ Entered when a selector-matched inbound `SYN` arrives and no existing flow owns 
 
 Validation:
 
-- bare `SYN` only
-- no `ACK`
-- no payload
+- bare `SYN` only (`SYN` set, no `ACK`, no payload, no other control flags)
 - `seq % 4095 == 0`
 - tuple passes selector policy
 
@@ -294,7 +292,7 @@ Actions:
 
 Accepts while half-open:
 
-- duplicate inbound `SYN` retransmit → resend `SYN|ACK`
+- duplicate inbound bare `SYN` retransmit → resend `SYN|ACK`
 - valid final `ACK`
 
 On valid final `ACK`:
@@ -324,7 +322,7 @@ Behavior:
 Inbound flag priority matches initiator-established handling:
 
 1. `RST` → destroy flow silently
-2. bare aligned replacement `SYN` → replace generation, quarantine old generation, create new `SYN_RCVD`, send `SYN|ACK`
+2. bare aligned replacement `SYN` with no payload, no `ACK`, and no other control flags → replace generation, quarantine old generation, create new `SYN_RCVD`, send `SYN|ACK`
 3. any other packet with `SYN` set → send `RST|ACK`, destroy flow
 4. otherwise → normal data processing
 

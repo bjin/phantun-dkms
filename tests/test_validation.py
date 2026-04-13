@@ -185,6 +185,150 @@ def test_forwarded_fake_tcp_is_not_owned_in_prerouting(phantun_module, vm):
         cleanup_forwarding_topology(vm)
 
 
+def test_syn_fin_is_rejected_without_creating_flow(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    invalid_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "syn_fin_rst",
+            },
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "syn_fin_synack",
+            },
+        ],
+    )
+
+    try:
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn|fin",
+                "seq": 4095,
+            },
+        )
+        time.sleep(0.2)
+
+        if invalid_probe.packets(vm, "syn_fin_synack") != 0:
+            pytest.fail("SYN|FIN must not be accepted as a new bare SYN opener")
+        if invalid_probe.packets(vm, "syn_fin_rst") == 0:
+            pytest.fail("SYN|FIN opener should be rejected with RST|ACK")
+    finally:
+        invalid_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_established_syn_fin_is_not_accepted_as_replacement(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    invalid_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "est_syn_fin_rst",
+            },
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "est_syn_fin_synack",
+            },
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "echo_server",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+            "timeout_sec": 20,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        first = run_netns_scenario(
+            vm,
+            NS_A,
+            "echo_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["msg1"],
+            },
+        )
+        assert_completed(first, "established baseline echo")
+        baseline_rst = invalid_probe.packets(vm, "est_syn_fin_rst")
+        baseline_synack = invalid_probe.packets(vm, "est_syn_fin_synack")
+
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn|fin",
+                "seq": 4095,
+            },
+        )
+        time.sleep(0.2)
+
+        if invalid_probe.packets(vm, "est_syn_fin_synack") != baseline_synack:
+            pytest.fail("SYN|FIN must not be accepted as an established replacement SYN")
+        if invalid_probe.packets(vm, "est_syn_fin_rst") <= baseline_rst:
+            pytest.fail("SYN|FIN on established flow should be rejected with RST|ACK")
+    finally:
+        invalid_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
 def test_established_invalid_syn_destroys_flow(phantun_module, vm):
     phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)

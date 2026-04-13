@@ -382,8 +382,13 @@ out:
     return drop;
 }
 
+/* A protocol-opening or replacement SYN really must be SYN-only. If other
+ * control flags ride along, later state-machine code cannot safely treat it as
+ * a clean opener and should fall back to the generic invalid-SYN path instead.
+ */
 static bool phantun_tcp_is_bare_syn(const struct pht_l4_view *view) {
-    return view && view->tcp->syn && !view->tcp->ack && view->payload_len == 0;
+    return view && view->tcp->syn && !view->tcp->ack && !view->tcp->rst && !view->tcp->fin &&
+           !view->tcp->psh && !view->tcp->urg && view->payload_len == 0;
 }
 
 static bool phantun_tcp_syn_is_aligned(const struct pht_l4_view *view) {
