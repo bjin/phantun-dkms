@@ -1,4 +1,5 @@
 import time
+import uuid
 
 import pytest
 
@@ -39,6 +40,27 @@ def load_recovery_module(phantun_module, **kwargs):
         handshake_retries=20,
         **kwargs,
     )
+
+
+def wait_for_guest_ready_file(vm, path, timeout=10):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if vm.run(["test", "-e", path], check=False).returncode == 0:
+            return
+        time.sleep(0.1)
+    pytest.fail(f"guest readiness file {path!r} was not observed within {timeout}s")
+
+
+def spawn_ready_capture(vm, namespace, config):
+    ready_file = f"/tmp/phantun-capture-{uuid.uuid4().hex}"
+    capture = spawn_netns_scenario(
+        vm,
+        namespace,
+        "capture_tcp_packet",
+        {**config, "ready_file": ready_file},
+    )
+    wait_for_guest_ready_file(vm, ready_file, timeout=config.get("timeout_sec", 10))
+    return capture
 
 
 ROUTER_NS = "pht-r"
@@ -140,10 +162,9 @@ def test_forwarded_fake_tcp_is_not_owned_in_prerouting(phantun_module, vm):
             }
         ],
     )
-    dst_capture = spawn_netns_scenario(
+    dst_capture = spawn_ready_capture(
         vm,
         NS_B,
-        "capture_tcp_packet",
         {
             "bind_addr": FWD_ADDR_A,
             "bind_port": src_port,
@@ -293,10 +314,9 @@ def test_established_later_sequence_payload_is_delivered_without_reset(phantun_m
 
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
-    capture = spawn_netns_scenario(
+    capture = spawn_ready_capture(
         vm,
         NS_A,
-        "capture_tcp_packet",
         {
             "bind_addr": NS_ADDR_B,
             "bind_port": dst_port,
@@ -392,10 +412,9 @@ def test_established_overlapping_payload_is_rejected_with_rstack(phantun_module,
 
     local_port = PORTS_A[0]
     remote_port = PORTS_B[0]
-    capture = spawn_netns_scenario(
+    capture = spawn_ready_capture(
         vm,
         NS_A,
-        "capture_tcp_packet",
         {
             "bind_addr": NS_ADDR_B,
             "bind_port": remote_port,
@@ -489,10 +508,9 @@ def test_established_ack_beyond_local_seq_is_rejected_with_rstack(phantun_module
 
     local_port = PORTS_A[0]
     remote_port = PORTS_B[0]
-    capture = spawn_netns_scenario(
+    capture = spawn_ready_capture(
         vm,
         NS_A,
-        "capture_tcp_packet",
         {
             "bind_addr": NS_ADDR_B,
             "bind_port": remote_port,
@@ -585,10 +603,9 @@ def test_future_sequence_pure_ack_is_silently_absorbed(phantun_module, vm):
 
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
-    capture = spawn_netns_scenario(
+    capture = spawn_ready_capture(
         vm,
         NS_A,
-        "capture_tcp_packet",
         {
             "bind_addr": NS_ADDR_B,
             "bind_port": dst_port,
@@ -681,10 +698,9 @@ def test_future_sequence_pure_ack_still_does_not_refresh_liveness(phantun_module
 
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
-    capture = spawn_netns_scenario(
+    capture = spawn_ready_capture(
         vm,
         NS_A,
-        "capture_tcp_packet",
         {
             "bind_addr": NS_ADDR_B,
             "bind_port": dst_port,
@@ -994,10 +1010,9 @@ def test_bad_final_ack_wrong_seq_is_rejected_with_rstack(phantun_module, vm):
             }
         ],
     )
-    synack_capture = spawn_netns_scenario(
+    synack_capture = spawn_ready_capture(
         vm,
         NS_A,
-        "capture_tcp_packet",
         {
             "bind_addr": NS_ADDR_B,
             "bind_port": dst_port,
@@ -1092,10 +1107,9 @@ def test_bad_final_ack_flags_are_rejected_with_rstack(phantun_module, vm):
             }
         ],
     )
-    synack_capture = spawn_netns_scenario(
+    synack_capture = spawn_ready_capture(
         vm,
         NS_A,
-        "capture_tcp_packet",
         {
             "bind_addr": NS_ADDR_B,
             "bind_port": dst_port,
