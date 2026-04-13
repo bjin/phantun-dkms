@@ -268,6 +268,7 @@ cat /sys/module/phantun/stats/rst_sent
 |---|---|
 | `flows_created` | Flow objects inserted into the flow table. |
 | `flows_established` | Flows that reached `ESTABLISHED`. |
+| `flows_current` | Flow objects currently present in the flow table. |
 | `request_payloads_injected` | `handshake_request` payloads injected by the module. |
 | `response_payloads_injected` | `handshake_response` payloads injected by the module. |
 | `collisions_won` | Simultaneous-initiation collisions where local side kept initiator role. |
@@ -276,6 +277,7 @@ cat /sys/module/phantun/stats/rst_sent
 | `udp_packets_queued` | UDP packets queued during half-open or restricted flow handling. |
 | `udp_packets_dropped` | UDP packets dropped by policy or queue pressure, including raw inbound UDP dropped by selector policy. |
 | `shaping_payloads_dropped` | Payloads intentionally hidden from the UDP app by shaping logic. |
+| `oversized_payloads_dropped` | Inbound fake-TCP payloads dropped because they exceed the module's UDP reinjection size limit. |
 
 ## Build, reload, unload
 
