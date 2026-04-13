@@ -135,7 +135,10 @@ class VM:
         except ValueError:
             self.base_ssh_cmd.extend(["-l", "root"])
 
-        self.control_socket = self.session_log_dir / f"ssh_control_{self.kernel_ver}_{id(self)}.sock"
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            self.control_socket = Path(f"/dev/shm/ssh_control_{self.kernel_ver}_{id(self)}.sock")
+        else:
+            self.control_socket = self.session_log_dir / f"ssh_control_{self.kernel_ver}_{id(self)}.sock"
         self.base_ssh_cmd[1:1] = [
             "-o",
             "ControlMaster=auto",
