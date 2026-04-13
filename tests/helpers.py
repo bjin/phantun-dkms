@@ -279,6 +279,30 @@ def make_netns_output_flag_probe(vm, namespace, rules):
     return NetnsNftProbe(namespace, "inet", table_name, "output")
 
 
+def make_netns_prerouting_flag_drop_probe(vm, namespace, rules):
+    table_name = f"phantun_prerouting_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
+        f"nft add table inet {table_name}",
+        (
+            f"nft 'add chain inet {table_name} prerouting "
+            "{ type filter hook prerouting priority -500; policy accept; }'"
+        ),
+    ]
+
+    for rule in rules:
+        lines.append(
+            f"nft 'add rule inet {table_name} prerouting "
+            f"ip saddr {rule['src_addr']} ip daddr {rule['dst_addr']} "
+            f"tcp sport {rule['src_port']} tcp dport {rule['dst_port']} "
+            f"tcp flags & (fin|syn|rst|ack) == {rule['flags_expr']} "
+            f"counter {rule.get('action', 'drop')} comment \"{rule['comment']}\"'"
+        )
+
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsNftProbe(namespace, "inet", table_name, "prerouting")
+
+
 def make_netns_ingress_drop_probe(vm, namespace, dev, rules):
     table_name = f"phantun_in_drop_{uuid.uuid4().hex[:8]}"
     lines = [

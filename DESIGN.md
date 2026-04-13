@@ -123,6 +123,7 @@ Constraints:
 
 - at least one selector list must be non-empty
 - selector ownership applies only to **non-loopback** traffic
+- inbound selector ownership applies only after confirming the destination IPv4 is locally delivered to the current host/netns; forwarded traffic is never translator-owned
 - outbound UDP routed to loopback stays UDP
 - inbound fake TCP arriving on loopback is ignored by the module
 - raw inbound UDP arriving on loopback is not subject to selector-owned drop
@@ -134,12 +135,13 @@ Peer-only caveat:
 
 ### 4.3 Default inbound raw-UDP drop
 
-By default, raw inbound UDP that matches configured selectors and arrives from a non-loopback device is dropped in `PRE_ROUTING`.
+By default, raw inbound UDP that matches configured selectors, is destined for local delivery in the current host/netns, and arrives from a non-loopback device is dropped in `PRE_ROUTING`.
 
 Reason:
 
 - selector-matched traffic must have one owner
 - allowing both raw UDP delivery and translated fake-TCP delivery would create ambiguous mixed delivery
+- forwarded UDP is not translator-owned traffic and must continue through the normal routing path
 - reinjected translated UDP enters after `PRE_ROUTING`, so translated traffic is not black-holed by this drop rule
 
 ## 5. Flow identity and conflict handling
@@ -376,13 +378,13 @@ Behavior:
 |---|---|
 | Hook | `NF_INET_PRE_ROUTING` |
 | Target priority | before conntrack and before real TCP processing |
-| Match | IPv4 TCP, selector-matched existing flow or eligible new responder `SYN`, non-loopback ingress |
+| Match | IPv4 TCP, selector-matched existing flow or eligible new responder `SYN`, locally delivered in the current host/netns, non-loopback ingress |
 
 Behavior:
 
 - handle handshake and established data in module state machine
-- in peer-only mode, bare aligned `SYN` from managed remote peer may create responder flow on any local destination port
-- if no flow matches and packet is not valid new bare `SYN`, reject as unknown tuple instead of passing to real TCP stack
+- in peer-only mode, bare aligned `SYN` from a managed remote peer may create responder flow on any local destination port, but only when the packet is locally delivered to this host/netns
+- if no flow matches and packet is not valid new bare `SYN`, reject as unknown tuple instead of passing to the real TCP stack
 - consume packet before real TCP stack can generate its own reset
 
 ### 8.3 Inbound raw-UDP drop
@@ -391,12 +393,12 @@ Behavior:
 |---|---|
 | Hook | `NF_INET_PRE_ROUTING` |
 | Target priority | before conntrack and before local UDP processing (`-400` in current design target) |
-| Match | IPv4 UDP, selector-matched tuple, non-loopback ingress |
+| Match | IPv4 UDP, selector-matched tuple, locally delivered in the current host/netns, non-loopback ingress |
 
 Behavior:
 
 - drop selector-matched raw inbound UDP by default
-- allow unmatched inbound UDP normally
+- allow unmatched or merely forwarded inbound UDP normally
 - do not apply this drop to module-reinjected translated UDP
 
 ### 8.4 Decapsulated UDP reinjection
