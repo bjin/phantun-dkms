@@ -49,7 +49,7 @@ static unsigned int keepalive_interval_sec = PHANTUN_DEFAULT_KEEPALIVE_INTERVAL_
 static unsigned int keepalive_misses = PHANTUN_DEFAULT_KEEPALIVE_MISSES;
 static unsigned int hard_idle_timeout_sec = PHANTUN_DEFAULT_HARD_IDLE_TIMEOUT_SEC;
 static unsigned int reopen_guard_bytes = PHANTUN_DEFAULT_REOPEN_GUARD_BYTES;
-
+static unsigned int established_window_bytes = PHANTUN_DEFAULT_ESTABLISHED_WINDOW_BYTES;
 module_param_array_named(managed_local_ports, managed_local_ports, uint, &managed_local_ports_count,
                          0444);
 MODULE_PARM_DESC(managed_local_ports, "Comma-separated local UDP/TCP ports managed by phantun");
@@ -78,6 +78,9 @@ module_param(hard_idle_timeout_sec, uint, 0444);
 MODULE_PARM_DESC(hard_idle_timeout_sec, "Maximum idle flow timeout in seconds (hard GC limit)");
 module_param(reopen_guard_bytes, uint, 0444);
 MODULE_PARM_DESC(reopen_guard_bytes, "Minimum sequence space separation for new connections");
+module_param(established_window_bytes, uint, 0444);
+MODULE_PARM_DESC(established_window_bytes,
+                 "Established-state receive window in bytes; 0 disables sequence-range checks");
 
 static struct phantun_config phantun_cfg;
 static void *phantun_alloc_req;
@@ -425,26 +428,21 @@ static bool phantun_tcp_is_valid_final_ack(const struct pht_l4_view *view, u32 p
 }
 
 /* Established-state classifier for current-generation inbound packets. The
- * fake-TCP data path intentionally has no out-of-order queue, overlap trim,
- * or reassembly support, so each class maps directly to the only truthful
- * thing the module can do with that packet:
- * - INVALID: impossible packet for this generation; reset and tear down
- * - ACK_ONLY: current-generation pure ACK that may refresh liveness
- * - IN_ORDER_PAYLOAD: payload at or beyond the current frontier that we can
- *   deliver immediately as best-effort UDP
- * - RESERVED_SHAPING_DROP: reserved control slot payload; consume silently
- * - DUPLICATE_OLD: traffic entirely below the current frontier; absorb silently
- * - RESPONSE_SKIP_PROOF: later initiator payload that proves a responder
- *   handshake-response slot was skipped; it is still delivered to UDP, but it
- *   also has the side effect of releasing queued responder data
+ * fake-TCP carrier is intentionally UDP-like here: we do not attempt reliable
+ * reassembly, duplicate suppression, or contiguous-gap tracking. Instead we
+ * accept payload whose starting sequence remains within a bounded sliding
+ * window around the highest remote sequence end we have accepted for this
+ * generation.
  */
 enum phantun_established_rx_class {
     PHANTUN_EST_RX_INVALID = 0,
+    PHANTUN_EST_RX_SILENT_ABSORB,
     PHANTUN_EST_RX_ACK_ONLY,
-    PHANTUN_EST_RX_IN_ORDER_PAYLOAD,
+    PHANTUN_EST_RX_WINDOW_PAYLOAD,
     PHANTUN_EST_RX_RESERVED_SHAPING_DROP,
-    PHANTUN_EST_RX_DUPLICATE_OLD,
     PHANTUN_EST_RX_RESPONSE_SKIP_PROOF,
+    PHANTUN_EST_RX_DROP_TOO_OLD,
+    PHANTUN_EST_RX_DROP_TOO_FAR,
 };
 
 /* Snapshot returned by the established classifier. ack_seq is the peer's
@@ -466,12 +464,19 @@ static bool phantun_tcp_is_established_ack(const struct pht_l4_view *view) {
            !view->tcp->psh && !view->tcp->urg;
 }
 
-/* The fake-TCP data path has no out-of-order queue. Whole later datagrams may
- * still be delivered best-effort to UDP so benign reordering does not reset or
- * black-hole the flow. What we still reject is overlap: once a packet starts
- * below the current frontier but extends past it, we have no safe way to trim
- * and partly redeliver that payload.
- */
+static bool phantun_established_window_disabled(void) {
+    return phantun_cfg.established_window_bytes == 0;
+}
+
+static void phantun_established_window_bounds_locked(const struct pht_flow *flow, u32 *lower,
+                                                     u32 *upper) {
+    if (!flow || !lower || !upper)
+        return;
+
+    *lower = flow->ack - phantun_cfg.established_window_bytes;
+    *upper = flow->ack + phantun_cfg.established_window_bytes;
+}
+
 static struct phantun_established_rx_decision
 phantun_classify_established_rx_locked(const struct pht_flow *flow,
                                        const struct pht_l4_view *view) {
@@ -490,18 +495,31 @@ phantun_classify_established_rx_locked(const struct pht_flow *flow,
         return decision;
 
     if (view->payload_len == 0) {
-        /* Pure ACK can legitimately arrive after the peer has advanced its own
-         * send sequence with payload we have not seen yet. With no payload in
-         * this skb there is nothing to deliver, so absorb any non-overlapping
-         * pure ACK as bookkeeping only; only the exact-frontier form may
-         * refresh liveness.
-         */
-        decision.rx_class = (phantun_seq_after(decision.seq, flow->ack) ||
-                             phantun_seq_before(decision.seq, flow->ack) ||
-                             phantun_seq_before(decision.ack_seq, flow->last_ack))
-                                ? PHANTUN_EST_RX_DUPLICATE_OLD
-                                : PHANTUN_EST_RX_ACK_ONLY;
+        bool ack_advances = phantun_seq_after(decision.ack_seq, flow->last_ack);
+        bool response_ack =
+            flow->response_pending_ack &&
+            phantun_seq_after_eq(decision.ack_seq,
+                                 flow->local_isn + 1 + phantun_cfg.handshake_response_len);
+
+        decision.rx_class = (decision.seq == flow->ack || ack_advances || response_ack)
+                                ? PHANTUN_EST_RX_ACK_ONLY
+                                : PHANTUN_EST_RX_SILENT_ABSORB;
         goto done;
+    }
+
+    if (!phantun_established_window_disabled()) {
+        u32 lower;
+        u32 upper;
+
+        phantun_established_window_bounds_locked(flow, &lower, &upper);
+        if (phantun_seq_before(decision.seq, lower)) {
+            decision.rx_class = PHANTUN_EST_RX_DROP_TOO_OLD;
+            goto done;
+        }
+        if (phantun_seq_after(decision.seq, upper)) {
+            decision.rx_class = PHANTUN_EST_RX_DROP_TOO_FAR;
+            goto done;
+        }
     }
 
     if (flow->drop_next_rx_payload && decision.seq == flow->drop_next_rx_seq) {
@@ -509,37 +527,20 @@ phantun_classify_established_rx_locked(const struct pht_flow *flow,
         goto done;
     }
 
-    if (phantun_seq_before_eq(decision.seq_end, flow->ack)) {
-        decision.rx_class = PHANTUN_EST_RX_DUPLICATE_OLD;
-        goto done;
-    }
-
-    /* There is no out-of-order queue for fake-TCP data. Once a payload starts
-     * above the current frontier, the only honest choices are to drop it or to
-     * deliver it immediately as a later UDP datagram. We choose best-effort
-     * delivery for whole later datagrams so benign reordering does not reset or
-     * black-hole the flow under load. Overlap remains invalid because we cannot
-     * trim and partly redeliver safely.
-     */
-    if (phantun_seq_before(decision.seq, flow->ack))
-        return decision;
-
     if (flow->response_pending_ack && phantun_seq_after(decision.seq, flow->ack)) {
         decision.rx_class = PHANTUN_EST_RX_RESPONSE_SKIP_PROOF;
         goto done;
     }
 
-    decision.rx_class = PHANTUN_EST_RX_IN_ORDER_PAYLOAD;
-    goto done;
+    decision.rx_class = PHANTUN_EST_RX_WINDOW_PAYLOAD;
 
 done:
-    if (decision.rx_class == PHANTUN_EST_RX_ACK_ONLY ||
-        decision.rx_class == PHANTUN_EST_RX_IN_ORDER_PAYLOAD ||
-        decision.rx_class == PHANTUN_EST_RX_RESPONSE_SKIP_PROOF) {
+    if (flow->response_pending_ack) {
         decision.response_unblocked =
-            flow->response_pending_ack &&
-            (decision.ack_seq >= flow->local_isn + 1 + phantun_cfg.handshake_response_len ||
-             view->payload_len > 0);
+            phantun_seq_after_eq(decision.ack_seq,
+                                 flow->local_isn + 1 + phantun_cfg.handshake_response_len) ||
+            decision.rx_class == PHANTUN_EST_RX_RESPONSE_SKIP_PROOF ||
+            decision.rx_class == PHANTUN_EST_RX_WINDOW_PAYLOAD;
     }
 
     return decision;
@@ -858,7 +859,7 @@ static void phantun_apply_established_rx(struct pht_flow *flow,
         return;
 
     refresh_liveness = decision->rx_class == PHANTUN_EST_RX_ACK_ONLY ||
-                       decision->rx_class == PHANTUN_EST_RX_IN_ORDER_PAYLOAD ||
+                       decision->rx_class == PHANTUN_EST_RX_WINDOW_PAYLOAD ||
                        decision->rx_class == PHANTUN_EST_RX_RESERVED_SHAPING_DROP ||
                        decision->rx_class == PHANTUN_EST_RX_RESPONSE_SKIP_PROOF;
 
@@ -875,10 +876,8 @@ static void phantun_apply_established_rx(struct pht_flow *flow,
         flow->last_ack = decision->ack_seq;
 
     switch (decision->rx_class) {
-    case PHANTUN_EST_RX_IN_ORDER_PAYLOAD:
+    case PHANTUN_EST_RX_WINDOW_PAYLOAD:
     case PHANTUN_EST_RX_RESPONSE_SKIP_PROOF:
-        flow->ack = decision->seq_end;
-        break;
     case PHANTUN_EST_RX_RESERVED_SHAPING_DROP:
         if (phantun_seq_after_eq(decision->seq_end, flow->ack))
             flow->ack = decision->seq_end;
@@ -1595,9 +1594,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
     /* ESTABLISHED handling still prioritizes flags over payload. Once RST/SYN
      * cases are handled, the remaining traffic is classified against the
-     * current generation's exact receive frontier. This fake-TCP translator
-     * has no out-of-order queue, so arbitrary future-sequence payload is a
-     * protocol error rather than something we can buffer and repair later.
+     * current generation's sliding receive window and local send frontier.
      */
     if (state_now == PHT_FLOW_STATE_ESTABLISHED) {
         struct phantun_established_rx_decision decision;
@@ -1672,11 +1669,19 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             return NF_DROP;
         }
 
-        /* Entirely old duplicate traffic is below the current receive
-         * frontier. Absorb it silently: there is no new UDP data to deliver
-         * and no honest reason to refresh liveness.
-         */
-        if (decision.rx_class == PHANTUN_EST_RX_DUPLICATE_OLD) {
+        if (decision.rx_class == PHANTUN_EST_RX_SILENT_ABSORB) {
+            pht_flow_put(flow);
+            return NF_DROP;
+        }
+
+        if (decision.rx_class == PHANTUN_EST_RX_DROP_TOO_OLD) {
+            pht_stats_inc(PHT_STAT_RX_WINDOW_TOO_OLD_DROPPED);
+            pht_flow_put(flow);
+            return NF_DROP;
+        }
+
+        if (decision.rx_class == PHANTUN_EST_RX_DROP_TOO_FAR) {
+            pht_stats_inc(PHT_STAT_RX_WINDOW_TOO_FAR_DROPPED);
             pht_flow_put(flow);
             return NF_DROP;
         }
@@ -1684,7 +1689,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         if (decision.rx_class == PHANTUN_EST_RX_RESERVED_SHAPING_DROP)
             pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
 
-        reinject_payload = decision.rx_class == PHANTUN_EST_RX_IN_ORDER_PAYLOAD ||
+        reinject_payload = decision.rx_class == PHANTUN_EST_RX_WINDOW_PAYLOAD ||
                            decision.rx_class == PHANTUN_EST_RX_RESPONSE_SKIP_PROOF;
         ret = phantun_finalize_established_rx(flow, &ep, skb, &view, &decision, state->net, in_dev,
                                               reinject_payload, true);
@@ -1839,6 +1844,10 @@ static int phantun_validate_config(void) {
         pht_pr_err("reopen_guard_bytes must be smaller than 2147483648\n");
         return -EINVAL;
     }
+    if (established_window_bytes >= 0x80000000U) {
+        pht_pr_err("established_window_bytes must be smaller than 2147483648\n");
+        return -EINVAL;
+    }
     return 0;
 }
 
@@ -1972,6 +1981,7 @@ static int phantun_snapshot_config(void) {
     phantun_cfg.keepalive_misses = keepalive_misses;
     phantun_cfg.hard_idle_timeout_sec = hard_idle_timeout_sec;
     phantun_cfg.reopen_guard_bytes = reopen_guard_bytes;
+    phantun_cfg.established_window_bytes = established_window_bytes;
 
     return 0;
 }
@@ -1982,11 +1992,12 @@ static void phantun_log_config(void) {
     pht_pr_info("loading with %u managed local port(s), %u managed remote peer(s), "
                 "handshake_timeout_ms=%u, handshake_retries=%u, "
                 "keepalive_interval_sec=%u, keepalive_misses=%u, "
-                "hard_idle_timeout_sec=%u, reopen_guard_bytes=%u\n",
+                "hard_idle_timeout_sec=%u, reopen_guard_bytes=%u, established_window_bytes=%u\n",
                 phantun_cfg.managed_local_ports_count, phantun_cfg.managed_remote_peers_count,
                 phantun_cfg.handshake_timeout_ms, phantun_cfg.handshake_retries,
                 phantun_cfg.keepalive_interval_sec, phantun_cfg.keepalive_misses,
-                phantun_cfg.hard_idle_timeout_sec, phantun_cfg.reopen_guard_bytes);
+                phantun_cfg.hard_idle_timeout_sec, phantun_cfg.reopen_guard_bytes,
+                phantun_cfg.established_window_bytes);
 
     for (i = 0; i < phantun_cfg.managed_local_ports_count; i++)
         pht_pr_info("managed_local_ports[%u]=%u\n", i, phantun_cfg.managed_local_ports[i]);

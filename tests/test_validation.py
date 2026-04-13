@@ -22,10 +22,12 @@ from helpers import (
     spawn_netns_scenario,
     parse_guest_json,
     make_netns_ingress_flag_drop_probe,
+    make_netns_ingress_payload_drop_probe,
     make_netns_output_flag_probe,
     make_netns_prerouting_flag_drop_probe,
     read_module_stats,
     read_netns_iface_mac,
+    wait_for_guest_condition,
 )
 
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
@@ -546,8 +548,8 @@ def test_established_later_sequence_payload_is_delivered_without_reset(phantun_m
         cleanup_netns_topology(vm)
 
 
-def test_established_overlapping_payload_is_rejected_with_rstack(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+def test_established_in_window_replayed_payload_is_delivered_without_reset(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, established_window_bytes=8)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -556,6 +558,7 @@ def test_established_overlapping_payload_is_rejected_with_rstack(phantun_module,
 
     local_port = PORTS_A[0]
     remote_port = PORTS_B[0]
+    dst_mac = read_netns_iface_mac(vm, NS_A, VETH_A)
     capture = spawn_ready_capture(
         vm,
         NS_A,
@@ -564,7 +567,7 @@ def test_established_overlapping_payload_is_rejected_with_rstack(phantun_module,
             "bind_port": remote_port,
             "target_addr": NS_ADDR_A,
             "target_port": local_port,
-            "payload": "msg1",
+            "payload": "p1",
             "timeout_sec": 15,
         },
     )
@@ -578,7 +581,295 @@ def test_established_overlapping_payload_is_rejected_with_rstack(phantun_module,
                 "src_port": local_port,
                 "dst_port": remote_port,
                 "flags_expr": "rst | ack",
-                "comment": "overlap_rst",
+                "comment": "replay_rst",
+            }
+        ],
+    )
+    receiver = spawn_netns_scenario(
+        vm,
+        NS_A,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": local_port,
+            "count": 4,
+            "timeout_sec": 15,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        sender_result = run_netns_scenario(
+            vm,
+            NS_B,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": remote_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": local_port,
+                "payloads": ["p1", "p2", "p3"],
+            },
+        )
+        capture_result = capture.communicate(timeout=15)
+        assert_completed(sender_result, "replay sender")
+        assert_completed(capture_result, "replay capture")
+
+        captured = parse_guest_json(capture_result.stdout, "replay capture stdout")
+        baseline_rst = rst_probe.packets(vm, "replay_rst")
+        stats_before = read_module_stats(vm)
+
+        run_netns_scenario(
+            vm,
+            NS_B,
+            "send_l2_tcp_packet",
+            {
+                "device": VETH_B,
+                "dst_mac": dst_mac,
+                "bind_addr": NS_ADDR_B,
+                "bind_port": remote_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": local_port,
+                "flags": "ack",
+                "seq": captured["seq"],
+                "ack": captured["ack"],
+                "payload": "p1",
+            },
+        )
+
+        receiver_result = receiver.communicate(timeout=15)
+        assert_completed(receiver_result, "replay receiver")
+
+        receiver_data = parse_guest_json(receiver_result.stdout, "replay receiver stdout")
+        receiver_messages = [entry["message"] for entry in receiver_data.get("received", [])]
+        if receiver_messages != ["p1", "p2", "p3", "p1"]:
+            pytest.fail(f"in-window replay should be redelivered to UDP: {receiver_messages!r}")
+
+        stats_after = read_module_stats(vm)
+        if rst_probe.packets(vm, "replay_rst") != baseline_rst:
+            pytest.fail("in-window replay should not trigger RST|ACK")
+        if stats_after["rx_window_too_old_dropped"] != stats_before["rx_window_too_old_dropped"]:
+            pytest.fail("in-window replay was incorrectly counted as too old")
+        if stats_after["rx_window_too_far_dropped"] != stats_before["rx_window_too_far_dropped"]:
+            pytest.fail("in-window replay was incorrectly counted as too far")
+    finally:
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_established_replayed_too_old_payload_is_silently_dropped(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, established_window_bytes=4)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    local_port = PORTS_A[0]
+    remote_port = PORTS_B[0]
+    dst_mac = read_netns_iface_mac(vm, NS_A, VETH_A)
+    capture = spawn_ready_capture(
+        vm,
+        NS_A,
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": remote_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": local_port,
+            "payload": "p1",
+            "timeout_sec": 15,
+        },
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": local_port,
+                "dst_port": remote_port,
+                "flags_expr": "rst | ack",
+                "comment": "too_old_rst",
+            }
+        ],
+    )
+    ack_probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": local_port,
+                "dst_port": remote_port,
+                "flags_expr": "ack",
+                "comment": "too_old_ack",
+            }
+        ],
+    )
+    receiver = spawn_netns_scenario(
+        vm,
+        NS_A,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": local_port,
+            "count": 5,
+            "timeout_sec": 15,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        sender_result = run_netns_scenario(
+            vm,
+            NS_B,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": remote_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": local_port,
+                "payloads": ["p1", "p2", "p3", "p4", "p5"],
+            },
+        )
+        receiver_result = receiver.communicate(timeout=15)
+        capture_result = capture.communicate(timeout=15)
+        assert_completed(sender_result, "too-old sender")
+        assert_completed(receiver_result, "too-old receiver")
+        assert_completed(capture_result, "too-old capture")
+
+        receiver_data = parse_guest_json(receiver_result.stdout, "too-old receiver stdout")
+        receiver_messages = [entry["message"] for entry in receiver_data.get("received", [])]
+        if receiver_messages != ["p1", "p2", "p3", "p4", "p5"]:
+            pytest.fail(f"unexpected baseline delivery before stale replay: {receiver_messages!r}")
+
+        captured = parse_guest_json(capture_result.stdout, "too-old capture stdout")
+        baseline_rst = rst_probe.packets(vm, "too_old_rst")
+        baseline_ack = ack_probe.packets(vm, "too_old_ack")
+        stats_before = read_module_stats(vm)
+
+        no_delivery = spawn_netns_scenario(
+            vm,
+            NS_A,
+            "recv_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": local_port,
+                "count": 1,
+                "timeout_sec": 2,
+            },
+        )
+        wait_for_guest_condition(
+            vm,
+            ["ip", "netns", "exec", NS_A, "ss", "-lun", "sport", "=", f":{local_port}"],
+            timeout=5,
+            description="too-old receiver bind",
+        )
+
+        run_netns_scenario(
+            vm,
+            NS_B,
+            "send_l2_tcp_packet",
+            {
+                "device": VETH_B,
+                "dst_mac": dst_mac,
+                "bind_addr": NS_ADDR_B,
+                "bind_port": remote_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": local_port,
+                "flags": "ack",
+                "seq": captured["seq"],
+                "ack": captured["ack"],
+                "payload": "p1",
+            },
+        )
+        no_delivery_result = no_delivery.communicate(timeout=5)
+        stats_after = read_module_stats(vm)
+
+        if no_delivery_result.returncode == 0:
+            pytest.fail("too-old replay must not be delivered to UDP")
+        if "TimeoutError" not in no_delivery_result.stderr:
+            pytest.fail(f"too-old replay receiver failed unexpectedly: {no_delivery_result.stderr!r}")
+        if rst_probe.packets(vm, "too_old_rst") != baseline_rst:
+            pytest.fail("too-old replay should be dropped silently without RST|ACK")
+        if ack_probe.packets(vm, "too_old_ack") != baseline_ack:
+            pytest.fail("too-old replay should not provoke a fresh ACK reply")
+        if stats_after["rx_window_too_old_dropped"] <= stats_before["rx_window_too_old_dropped"]:
+            pytest.fail("too-old replay should increment the too-old receive-window drop stat")
+        if stats_after["rx_window_too_far_dropped"] != stats_before["rx_window_too_far_dropped"]:
+            pytest.fail("too-old replay was incorrectly counted as too far")
+    finally:
+        ack_probe.cleanup(vm)
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_established_replayed_too_far_payload_is_silently_dropped(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, established_window_bytes=4)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    local_port = PORTS_A[0]
+    remote_port = PORTS_B[0]
+    dst_mac = read_netns_iface_mac(vm, NS_A, VETH_A)
+    capture = spawn_ready_capture(
+        vm,
+        NS_A,
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": remote_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": local_port,
+            "payload": "p1",
+            "timeout_sec": 15,
+        },
+    )
+    drop_future = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": remote_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": local_port,
+                "payload": payload,
+                "comment": f"drop_too_far_{payload}",
+            }
+            for payload in ("p2", "p3", "p4", "p5")
+        ],
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": local_port,
+                "dst_port": remote_port,
+                "flags_expr": "rst | ack",
+                "comment": "too_far_rst",
+            }
+        ],
+    )
+    ack_probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": local_port,
+                "dst_port": remote_port,
+                "flags_expr": "ack",
+                "comment": "too_far_ack",
             }
         ],
     )
@@ -605,38 +896,318 @@ def test_established_overlapping_payload_is_rejected_with_rstack(phantun_module,
                 "bind_port": remote_port,
                 "target_addr": NS_ADDR_A,
                 "target_port": local_port,
-                "payloads": ["msg1"],
+                "payloads": ["p1", "p2", "p3", "p4", "p5"],
             },
         )
         receiver_result = receiver.communicate(timeout=15)
         capture_result = capture.communicate(timeout=15)
+        assert_completed(sender_result, "too-far sender")
+        assert_completed(receiver_result, "too-far receiver")
+        assert_completed(capture_result, "too-far capture")
 
-        assert_completed(sender_result, "overlap sender")
-        assert_completed(receiver_result, "overlap receiver")
-        assert_completed(capture_result, "overlap capture")
+        receiver_data = parse_guest_json(receiver_result.stdout, "too-far receiver stdout")
+        receiver_messages = [entry["message"] for entry in receiver_data.get("received", [])]
+        if receiver_messages != ["p1"]:
+            pytest.fail(f"unexpected baseline delivery before too-far replay: {receiver_messages!r}")
 
-        captured = parse_guest_json(capture_result.stdout, "overlap capture stdout")
-        baseline_rst = rst_probe.packets(vm, "overlap_rst")
+        captured = parse_guest_json(capture_result.stdout, "too-far capture stdout")
+        replay_seq = captured["seq"] + len("p1") + len("p2") + len("p3") + len("p4")
+        drop_future.cleanup(vm)
+        baseline_rst = rst_probe.packets(vm, "too_far_rst")
+        baseline_ack = ack_probe.packets(vm, "too_far_ack")
+        stats_before = read_module_stats(vm)
+
+        no_delivery = spawn_netns_scenario(
+            vm,
+            NS_A,
+            "recv_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": local_port,
+                "count": 1,
+                "timeout_sec": 2,
+            },
+        )
+        wait_for_guest_condition(
+            vm,
+            ["ip", "netns", "exec", NS_A, "ss", "-lun", "sport", "=", f":{local_port}"],
+            timeout=5,
+            description="too-far receiver bind",
+        )
 
         run_netns_scenario(
             vm,
             NS_B,
-            "send_tcp_packet",
+            "send_l2_tcp_packet",
             {
+                "device": VETH_B,
+                "dst_mac": dst_mac,
                 "bind_addr": NS_ADDR_B,
                 "bind_port": remote_port,
                 "target_addr": NS_ADDR_A,
                 "target_port": local_port,
                 "flags": "ack",
-                "seq": captured["seq"] + len("msg1") - 2,
+                "seq": replay_seq,
                 "ack": captured["ack"],
-                "payload": "overlap",
+                "payload": "p5",
             },
         )
-        time.sleep(0.2)
+        no_delivery_result = no_delivery.communicate(timeout=5)
+        stats_after = read_module_stats(vm)
 
-        if rst_probe.packets(vm, "overlap_rst") <= baseline_rst:
-            pytest.fail("payload overlapping the current receive frontier should trigger RST|ACK")
+        if no_delivery_result.returncode == 0:
+            pytest.fail("too-far replay must not be delivered to UDP")
+        if "TimeoutError" not in no_delivery_result.stderr:
+            pytest.fail(f"too-far replay receiver failed unexpectedly: {no_delivery_result.stderr!r}")
+        if rst_probe.packets(vm, "too_far_rst") != baseline_rst:
+            pytest.fail("too-far replay should be dropped silently without RST|ACK")
+        if ack_probe.packets(vm, "too_far_ack") != baseline_ack:
+            pytest.fail("too-far replay should not provoke a fresh ACK reply")
+        if stats_after["rx_window_too_far_dropped"] <= stats_before["rx_window_too_far_dropped"]:
+            pytest.fail("too-far replay should increment the too-far receive-window drop stat")
+        if stats_after["rx_window_too_old_dropped"] != stats_before["rx_window_too_old_dropped"]:
+            pytest.fail("too-far replay was incorrectly counted as too old")
+    finally:
+        drop_future.cleanup(vm)
+        ack_probe.cleanup(vm)
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_established_window_disable_accepts_replayed_far_future_payload(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, established_window_bytes=0)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    local_port = PORTS_A[0]
+    remote_port = PORTS_B[0]
+    dst_mac = read_netns_iface_mac(vm, NS_A, VETH_A)
+    capture = spawn_ready_capture(
+        vm,
+        NS_A,
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": remote_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": local_port,
+            "payload": "p1",
+            "timeout_sec": 15,
+        },
+    )
+    drop_future = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": remote_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": local_port,
+                "payload": payload,
+                "comment": f"drop_window_disable_{payload}",
+            }
+            for payload in ("p2", "p3", "p4", "p5")
+        ],
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": local_port,
+                "dst_port": remote_port,
+                "flags_expr": "rst | ack",
+                "comment": "window_disable_rst",
+            }
+        ],
+    )
+    receiver = spawn_netns_scenario(
+        vm,
+        NS_A,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": local_port,
+            "count": 2,
+            "timeout_sec": 15,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        sender_result = run_netns_scenario(
+            vm,
+            NS_B,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": remote_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": local_port,
+                "payloads": ["p1", "p2", "p3", "p4", "p5"],
+            },
+        )
+        capture_result = capture.communicate(timeout=15)
+        assert_completed(sender_result, "window-disable sender")
+        assert_completed(capture_result, "window-disable capture")
+
+        captured = parse_guest_json(capture_result.stdout, "window-disable capture stdout")
+        replay_seq = captured["seq"] + len("p1") + len("p2") + len("p3") + len("p4")
+        drop_future.cleanup(vm)
+        baseline_rst = rst_probe.packets(vm, "window_disable_rst")
+        stats_before = read_module_stats(vm)
+
+        run_netns_scenario(
+            vm,
+            NS_B,
+            "send_l2_tcp_packet",
+            {
+                "device": VETH_B,
+                "dst_mac": dst_mac,
+                "bind_addr": NS_ADDR_B,
+                "bind_port": remote_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": local_port,
+                "flags": "ack",
+                "seq": replay_seq,
+                "ack": captured["ack"],
+                "payload": "p5",
+            },
+        )
+
+        receiver_result = receiver.communicate(timeout=15)
+        assert_completed(receiver_result, "window-disable receiver")
+
+        receiver_data = parse_guest_json(receiver_result.stdout, "window-disable receiver stdout")
+        receiver_messages = [entry["message"] for entry in receiver_data.get("received", [])]
+        if receiver_messages != ["p1", "p5"]:
+            pytest.fail(
+                f"disabling the established window should allow replayed far-future payloads: {receiver_messages!r}"
+            )
+
+        stats_after = read_module_stats(vm)
+        if rst_probe.packets(vm, "window_disable_rst") != baseline_rst:
+            pytest.fail("window-disable mode should not trigger RST|ACK for far-future replay")
+        if stats_after["rx_window_too_far_dropped"] != stats_before["rx_window_too_far_dropped"]:
+            pytest.fail("window-disable mode must not count far-future replays as too-far drops")
+        if stats_after["rx_window_too_old_dropped"] != stats_before["rx_window_too_old_dropped"]:
+            pytest.fail("window-disable far-future replay was incorrectly counted as too old")
+    finally:
+        drop_future.cleanup(vm)
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_established_window_disable_accepts_replayed_stale_payload(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, established_window_bytes=0)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    local_port = PORTS_A[0]
+    remote_port = PORTS_B[0]
+    dst_mac = read_netns_iface_mac(vm, NS_A, VETH_A)
+    capture = spawn_ready_capture(
+        vm,
+        NS_A,
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": remote_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": local_port,
+            "payload": "p1",
+            "timeout_sec": 15,
+        },
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": local_port,
+                "dst_port": remote_port,
+                "flags_expr": "rst | ack",
+                "comment": "window_disable_stale_rst",
+            }
+        ],
+    )
+    receiver = spawn_netns_scenario(
+        vm,
+        NS_A,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": local_port,
+            "count": 6,
+            "timeout_sec": 15,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        sender_result = run_netns_scenario(
+            vm,
+            NS_B,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": remote_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": local_port,
+                "payloads": ["p1", "p2", "p3", "p4", "p5"],
+            },
+        )
+        capture_result = capture.communicate(timeout=15)
+        assert_completed(sender_result, "window-disable stale sender")
+        assert_completed(capture_result, "window-disable stale capture")
+
+        captured = parse_guest_json(capture_result.stdout, "window-disable stale capture stdout")
+        baseline_rst = rst_probe.packets(vm, "window_disable_stale_rst")
+        stats_before = read_module_stats(vm)
+
+        run_netns_scenario(
+            vm,
+            NS_B,
+            "send_l2_tcp_packet",
+            {
+                "device": VETH_B,
+                "dst_mac": dst_mac,
+                "bind_addr": NS_ADDR_B,
+                "bind_port": remote_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": local_port,
+                "flags": "ack",
+                "seq": captured["seq"],
+                "ack": captured["ack"],
+                "payload": "p1",
+            },
+        )
+
+        receiver_result = receiver.communicate(timeout=15)
+        assert_completed(receiver_result, "window-disable stale receiver")
+
+        receiver_data = parse_guest_json(receiver_result.stdout, "window-disable stale receiver stdout")
+        receiver_messages = [entry["message"] for entry in receiver_data.get("received", [])]
+        if receiver_messages != ["p1", "p2", "p3", "p4", "p5", "p1"]:
+            pytest.fail(f"disabling the established window should allow stale replays: {receiver_messages!r}")
+
+        stats_after = read_module_stats(vm)
+        if rst_probe.packets(vm, "window_disable_stale_rst") != baseline_rst:
+            pytest.fail("window-disable stale replay should not trigger RST|ACK")
+        if stats_after["rx_window_too_old_dropped"] != stats_before["rx_window_too_old_dropped"]:
+            pytest.fail("window-disable stale replay was incorrectly counted as too old")
+        if stats_after["rx_window_too_far_dropped"] != stats_before["rx_window_too_far_dropped"]:
+            pytest.fail("window-disable stale replay was incorrectly counted as too far")
     finally:
         rst_probe.cleanup(vm)
         cleanup_netns_topology(vm)

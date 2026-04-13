@@ -29,6 +29,8 @@ PHT_STAT_ATTR(udp_packets_queued, PHT_STAT_UDP_PACKETS_QUEUED);
 PHT_STAT_ATTR(udp_packets_dropped, PHT_STAT_UDP_PACKETS_DROPPED);
 PHT_STAT_ATTR(shaping_payloads_dropped, PHT_STAT_SHAPING_PAYLOADS_DROPPED);
 PHT_STAT_ATTR(oversized_payloads_dropped, PHT_STAT_OVERSIZED_PAYLOADS_DROPPED);
+PHT_STAT_ATTR(rx_window_too_old_dropped, PHT_STAT_RX_WINDOW_TOO_OLD_DROPPED);
+PHT_STAT_ATTR(rx_window_too_far_dropped, PHT_STAT_RX_WINDOW_TOO_FAR_DROPPED);
 
 static struct attribute *pht_stats_attrs[] = {
     &flows_created_attr.attr,
@@ -43,6 +45,8 @@ static struct attribute *pht_stats_attrs[] = {
     &udp_packets_dropped_attr.attr,
     &shaping_payloads_dropped_attr.attr,
     &oversized_payloads_dropped_attr.attr,
+    &rx_window_too_old_dropped_attr.attr,
+    &rx_window_too_far_dropped_attr.attr,
     NULL,
 };
 

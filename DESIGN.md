@@ -212,8 +212,8 @@ Each flow stores:
 - state
 - oriented local/remote addresses
 - send sequence number
-- receive acknowledgement number
-- last acknowledged value
+- highest accepted remote sequence end currently advertised in outbound `ACK`
+- last acknowledged value for the local send stream
 - one queued UDP skb pointer
 - reserved first-payload ignore slot
 - responder control-response pending-ACK / pending-release flag
@@ -256,7 +256,8 @@ Behavior:
 
 - if `handshake_request` was injected, flush initiator-owned queued UDP after that injected request
 - if responder first-payload ignore slot is armed, suppress only payload whose starting sequence matches reserved responder control sequence
-- later responder payload may be delivered best-effort once it is wholly above the current receive frontier; payload that overlaps the frontier is invalid
+- inbound payload is accepted when its starting sequence stays within the current sliding receive window around the highest accepted remote sequence end
+- accepted payload may arrive out of order and does not require earlier missing payload to have arrived first
 - normal UDP ↔ fake-TCP translation follows
 - only inbound packets valid for the current generation refresh liveness suspicion, including pure `ACK` and handshake-response acknowledgement traffic
 - after `keepalive_interval_sec` without valid inbound traffic: send pure `ACK` keepalive
@@ -314,7 +315,7 @@ Behavior:
 - inbound fake-TCP payload becomes local UDP unless payload start sequence matches an armed ignore slot
 - payload larger than the translator's maximum supported UDP reinjection size is invalid and rejected with `RST|ACK`
 - `seq` grows by outbound payload length
-- `ack` tracks the next receive frontier monotonically and never regresses
+- `ack` tracks the highest accepted remote sequence end for the current generation and never regresses, even if lower-sequence payload arrives later
 - if injected responder `handshake_response` still awaits acknowledgement, responder UDP follows the one-skb queue/drop rule until release
 - only inbound packets valid for the current generation refresh liveness suspicion
 - keepalive and silent idle teardown use the same policy as initiator-established flows
@@ -326,41 +327,50 @@ Inbound flag priority matches initiator-established handling:
 3. any other packet with `SYN` set → send `RST|ACK`, destroy flow
 4. otherwise → normal data processing
 
-### 6.3 Established receive classifier and acceptance window
+### 6.3 Established receive classifier and sliding acceptance window
 
-Established-state inbound processing uses a classifier over the current flow generation and one inbound fake-TCP packet. The classifier is a design constraint, not merely an implementation detail: packets outside these classes must not refresh liveness, advance ACK state, release queued responder data, or reach the UDP socket.
+Established-state inbound processing uses a classifier over the current flow generation and one inbound fake-TCP packet. The goal is deliberately UDP-like: tolerate loss, reordering, and occasional duplication without pretending the transport is a reliable byte stream. Packets outside these classes must not refresh liveness, advance ACK state, release queued responder data, or reach the UDP socket.
 
 Classifier classes:
 - `VALID_ACK_ONLY`: packet carries `ACK`, no payload, no illegal control flags, and its `ack_seq` is valid for the current generation
-- `VALID_IN_ORDER_PAYLOAD`: packet carries `ACK` and payload that starts at or beyond the current receive frontier and can be delivered immediately as best-effort UDP
-- `VALID_RESERVED_SHAPING_DROP`: packet matches an armed reserved shaping sequence slot and is silently suppressed without UDP delivery
-- `VALID_DUPLICATE_OLD`: packet is entirely below the current receive frontier and may be silently absorbed without changing externally visible state
+- `VALID_WINDOW_PAYLOAD`: packet carries `ACK` and payload whose starting sequence stays within the configured established receive window for the current generation
+- `VALID_RESERVED_SHAPING_DROP`: packet matches an armed reserved shaping sequence slot, passes the same window checks, and is silently suppressed without UDP delivery
 - `VALID_RESPONSE_SKIP_PROOF`: while responder `handshake_response` is still pending acknowledgement, later initiator payload may prove that the reserved responder-control slot was skipped; this both releases queued responder UDP and still delivers the proving payload to UDP
-- `INVALID`: impossible ACK progression, overlapping old/new payload, missing required `ACK`, or any packet that does not fit the current generation's rules
+- `DROP_TOO_OLD`: payload lies entirely below the sliding lower bound and is silently discarded as stale traffic for this generation
+- `DROP_TOO_FAR`: payload starts beyond the sliding upper bound and is silently discarded as implausibly far ahead for this generation
+- `INVALID`: impossible ACK progression, missing required `ACK`, illegal control flags, or any packet that does not fit the current generation's rules
+
+> Established receive window parameter: `established_window_bytes`
+- default: `131072` bytes (`128 KiB`)
+- `0` disables the receive-window sequence-range check entirely
+- when enabled, the accepted payload-start range is centered on the highest accepted remote sequence end currently tracked in `ack`
+- lower bound: older than this is treated as stale traffic and dropped silently
+- upper bound: newer than this is treated as implausibly far ahead and dropped silently
 
 Receive-window definition for this protocol:
-- There is no general out-of-order receive queue in v1
-- The current receive frontier is the flow's `ack` value
-- Pure ACK may be silently absorbed when its `seq` is below or above the current receive frontier, but only the exact-frontier form is allowed to refresh liveness or release responder-side state
-- Whole payload datagrams that start at or above the current receive frontier may still be delivered best-effort, even when they arrive later than an unseen lower-sequence datagram
-- Duplicate old payload is tolerated only when the entire payload lies below the current receive frontier; duplicates must not be reinjected to UDP and must not regress ACK state
-- Payload that starts below the current receive frontier but extends past it is invalid because there is no overlap trimming or partial reassembly path
+- There is no out-of-order receive queue and no byte-stream reassembly path in v1
+- The translator tracks only the highest accepted remote sequence end, not contiguous delivery progress
+- Missing lower-sequence payload is not retransmitted by the sender and does not block later higher-sequence payload
+- Accepted payload within the configured window is delivered immediately to UDP, even if it arrives after newer payload or duplicates an earlier payload
+- The translator does not attempt duplicate suppression in established state; if a duplicate payload arrives within the accepted window, it may be delivered again to UDP and the UDP application is expected to tolerate that
+- Window checks apply to payload sequence only; pure `ACK` packets remain bookkeeping traffic and are validated primarily by the local send frontier
 
 ACK validation rules in `ESTABLISHED`:
 - Normal established traffic must carry `ACK`
 - `ack_seq` must stay within the local send frontier of the current generation
 - `ack_seq` greater than locally sent bytes is invalid
-- Pure ACK outside the current receive frontier may be silently absorbed as harmless bookkeeping, but it must not refresh liveness, release `response_pending_ack`, or advance any sequence state
+- `ack_seq` lower than the opening local send sequence is invalid
+- Pure `ACK` outside the receive window may be silently absorbed when their `ack_seq` is otherwise valid, but ACK-only packets that advance current-generation bookkeeping or validly acknowledge the injected responder handshake-response range are still accepted even if their own `seq` does not equal the current `ack` value
 
 State-machine consequences:
 - `VALID_ACK_ONLY` refreshes liveness and may release queued responder UDP only when it validly acknowledges the injected responder handshake-response range
-- `VALID_IN_ORDER_PAYLOAD` refreshes liveness, advances the receive frontier monotonically, may release responder queued UDP when it proves a reserved response slot was skipped, and reinjects payload to local UDP
-- `VALID_RESERVED_SHAPING_DROP` refreshes liveness only for the current generation, never delivers to UDP, and must not regress ACK state
-- `VALID_DUPLICATE_OLD` is silently absorbed; it does not refresh liveness, does not deliver to UDP, and does not alter ACK state
-- `VALID_RESPONSE_SKIP_PROOF` refreshes liveness, advances the receive frontier monotonically, releases queued responder UDP, and still delivers the proving payload to UDP
+- `VALID_WINDOW_PAYLOAD` refreshes liveness, updates `ack` monotonically to the highest accepted remote sequence end, may release responder queued UDP only when it validly acknowledges the injected responder handshake-response range or when later payload proves the reserved responder-control slot was skipped, and reinjects payload to local UDP
+- `VALID_RESERVED_SHAPING_DROP` refreshes liveness only for the current generation, never delivers to UDP, may still advance `ack` monotonically because the shaping payload was accepted by sequence even though it was hidden from the UDP app, and must not by itself release responder queued UDP
+- `VALID_RESPONSE_SKIP_PROOF` refreshes liveness, updates `ack` monotonically, releases queued responder UDP, and still delivers the proving payload to UDP
+- `DROP_TOO_OLD` and `DROP_TOO_FAR` are silent-drop classes: no UDP delivery, no ACK-state change, no responder release, and no liveness refresh
 - `INVALID` is a protocol error and triggers `RST|ACK` plus local teardown, except where the failure policy explicitly lists a silent-drop case
 
-These rules intentionally preserve handshake shaping loss-tolerance and tolerate benign datagram reordering while still rejecting impossible ACK progression and overlapping payload shapes.
+These rules intentionally model a fake-TCP carrier for UDP traffic, not a reliable TCP byte stream: sequence numbers provide generation plausibility and bounded drift detection, while loss and duplication remain visible to the UDP application.
 ## 7. Failure policy
 
 ### 7.1 Immediate `RST` + flow destruction
@@ -380,6 +390,7 @@ Peer-only mode keeps this rule: if a packet from a managed remote peer does not 
 - inbound packets failing IPv4 or TCP checksum validation
 - packets from immediately previous generation while quarantine is active
 - shaping-payload loss, duplication, delay, or reordering
+- established payload outside the configured receive window (`DROP_TOO_OLD` / `DROP_TOO_FAR`)
 
 ### 7.3 Handshake loss tolerance
 

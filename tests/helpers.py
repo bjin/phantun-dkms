@@ -31,6 +31,8 @@ MODULE_STAT_NAMES = (
     "udp_packets_dropped",
     "shaping_payloads_dropped",
     "oversized_payloads_dropped",
+    "rx_window_too_old_dropped",
+    "rx_window_too_far_dropped",
 )
 
 

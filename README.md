@@ -180,6 +180,7 @@ Validation rules:
 | `keepalive_misses` | `3` | Unanswered keepalives allowed before teardown. |
 | `hard_idle_timeout_sec` | `300` | Hard upper bound for idle flow lifetime. |
 | `reopen_guard_bytes` | `4194304` | Minimum sequence-space distance before reopening same tuple. |
+| `established_window_bytes` | `131072` | Established-state receive window in bytes. `0` disables sequence-range checks. |
 
 ### Shaping payload formats
 
@@ -278,6 +279,8 @@ cat /sys/module/phantun/stats/rst_sent
 | `udp_packets_dropped` | UDP packets dropped by policy or queue pressure, including raw inbound UDP dropped by selector policy. |
 | `shaping_payloads_dropped` | Payloads intentionally hidden from the UDP app by shaping logic. |
 | `oversized_payloads_dropped` | Inbound fake-TCP payloads dropped because they exceed the module's UDP reinjection size limit. |
+| `rx_window_too_old_dropped` | Inbound payloads silently dropped because they fall entirely below the established receive window. |
+| `rx_window_too_far_dropped` | Inbound payloads silently dropped because they start beyond the established receive window. |
 
 ## Build, reload, unload
 
