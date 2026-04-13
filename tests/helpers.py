@@ -30,6 +30,7 @@ MODULE_STAT_NAMES = (
     "udp_packets_queued",
     "udp_packets_dropped",
     "shaping_payloads_dropped",
+    "oversized_payloads_dropped",
 )
 
 

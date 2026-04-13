@@ -11,6 +11,8 @@
 
 #define PHT_V4_DEFAULT_TTL 64
 #define PHT_V4_MAX_PACKET_LEN 1500U
+#define PHT_V4_MAX_UDP_PAYLOAD_LEN                                                                 \
+    (PHT_V4_MAX_PACKET_LEN - sizeof(struct iphdr) - sizeof(struct udphdr))
 #define PHT_TCP_DEFAULT_WINDOW 0xffffU
 #define PHT_TCP_WINDOW_SCALE 14U
 

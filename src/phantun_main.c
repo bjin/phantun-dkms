@@ -796,6 +796,10 @@ static int phantun_flush_queued_udp(struct pht_flow *flow, struct net *net) {
     return ret;
 }
 
+static bool phantun_payload_exceeds_udp_reinject_limit(unsigned int payload_len) {
+    return payload_len > PHT_V4_MAX_UDP_PAYLOAD_LEN;
+}
+
 static int phantun_reinject_inbound_payload(const struct pht_ipv4_endpoint_pair *ep,
                                             const struct sk_buff *skb,
                                             const struct pht_l4_view *view,
@@ -897,6 +901,16 @@ static int phantun_finalize_established_rx(
     struct net *net, struct net_device *dev, bool reinject_payload, bool send_idle_ack) {
     bool allow_flush = false;
     int ret = 0;
+
+    /* Oversized inbound payload is a protocol violation for this translator.
+     * We cannot truthfully repackage it into a local UDP skb within our fixed
+     * packet budget, so reject it before any ACK/liveness state is refreshed
+     * or any large atomic allocation is attempted.
+     */
+    if (view->payload_len && phantun_payload_exceeds_udp_reinject_limit(view->payload_len)) {
+        pht_stats_inc(PHT_STAT_OVERSIZED_PAYLOADS_DROPPED);
+        return -EMSGSIZE;
+    }
 
     phantun_apply_established_rx(flow, decision, &allow_flush);
 
@@ -1529,6 +1543,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                                                           state->net, in_dev, true, true);
                     if (ret) {
                         pht_pr_warn("failed to process responder open payload: %d\n", ret);
+                        if (ret == -EMSGSIZE)
+                            phantun_send_rstack(state->net, &ep, &view, false);
                         pht_flow_remove(flow);
                     }
                     pht_flow_put(flow);
@@ -1567,6 +1583,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                                                       state->net, in_dev, !drop_open_payload, true);
                 if (ret) {
                     pht_pr_warn("failed to process responder open payload: %d\n", ret);
+                    if (ret == -EMSGSIZE)
+                        phantun_send_rstack(state->net, &ep, &view, false);
                     pht_flow_remove(flow);
                 }
                 pht_flow_put(flow);
@@ -1672,6 +1690,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                                               reinject_payload, true);
         if (ret) {
             pht_pr_warn("failed to process established inbound payload: %d\n", ret);
+            if (ret == -EMSGSIZE)
+                phantun_send_rstack(state->net, &ep, &view, false);
             pht_flow_remove(flow);
         }
         pht_flow_put(flow);
