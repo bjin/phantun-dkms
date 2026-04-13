@@ -135,6 +135,16 @@ class VM:
         except ValueError:
             self.base_ssh_cmd.extend(["-l", "root"])
 
+        self.control_socket = self.session_log_dir / f"ssh_control_{self.kernel_ver}_{id(self)}.sock"
+        self.base_ssh_cmd[1:1] = [
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            f"ControlPath={self.control_socket}",
+            "-o",
+            "ControlPersist=2m",
+        ]
+
         # Wait for SSH
         success = False
         for _ in range(60):
@@ -185,6 +195,9 @@ class VM:
             self.dmesg_proc.terminate()
             self.dmesg_proc.wait()
             self.dmesg_file.close()
+
+        if hasattr(self, "control_socket") and self.control_socket.exists():
+            subprocess.run(self.base_ssh_cmd + ["-O", "exit"], check=False, capture_output=True)
 
         if hasattr(self, "vng_log") and not self.vng_log.closed:
             self.vng_log.close()
