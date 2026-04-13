@@ -18,6 +18,7 @@
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_core.h>
 #include <net/netns/generic.h>
+#include <net/route.h>
 
 #include "phantun_compat.h" // IWYU pragma: keep
 
@@ -207,6 +208,16 @@ static bool phantun_pre_routing_uses_loopback_dev(const struct sk_buff *skb,
 
     in_dev = state->in ? state->in : skb->dev;
     return phantun_dev_is_loopback(in_dev);
+}
+
+/* PRE_ROUTING sees both locally delivered traffic and pure forwarding traffic.
+ * The translator only owns packets that will terminate on this host/netns; it
+ * must ignore transit packets even if their 4-tuple matches configured
+ * selectors, otherwise a router deployment will spuriously reset or drop
+ * forwarded traffic.
+ */
+static bool phantun_pre_routing_targets_local_host(const struct net *net, __be32 addr) {
+    return net && inet_addr_type_table((struct net *)net, addr, RT_TABLE_LOCAL) == RTN_LOCAL;
 }
 
 static bool phantun_local_port_allowed(__be16 port) {
@@ -1152,6 +1163,9 @@ static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb
     if (ret)
         return NF_ACCEPT;
 
+    if (!phantun_pre_routing_targets_local_host(state->net, view.iph->daddr))
+        return NF_ACCEPT;
+
     if (!phantun_selectors_allow(view.udp->dest, view.iph->saddr, view.udp->source))
         return NF_ACCEPT;
 
@@ -1199,6 +1213,9 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
     ret = pht_parse_ipv4_tcp(skb, &view);
     if (ret)
+        return NF_ACCEPT;
+
+    if (!phantun_pre_routing_targets_local_host(state->net, view.iph->daddr))
         return NF_ACCEPT;
 
     if (!phantun_selectors_allow(view.tcp->dest, view.iph->saddr, view.tcp->source))
