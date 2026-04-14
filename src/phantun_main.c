@@ -932,6 +932,40 @@ static int phantun_finalize_established_rx(
     return ret;
 }
 
+static int phantun_finalize_responder_open_payload(
+    struct pht_flow *flow, const struct pht_ipv4_endpoint_pair *ep, const struct sk_buff *skb,
+    const struct pht_l4_view *view, const struct phantun_established_rx_decision *decision,
+    struct net *net, struct net_device *dev) {
+    bool reinject_payload;
+
+    if (!decision)
+        return -EPROTO;
+
+    switch (decision->rx_class) {
+    case PHANTUN_EST_RX_SILENT_ABSORB:
+        return 0;
+    case PHANTUN_EST_RX_DROP_TOO_OLD:
+        pht_stats_inc(PHT_STAT_RX_WINDOW_TOO_OLD_DROPPED);
+        return 0;
+    case PHANTUN_EST_RX_DROP_TOO_FAR:
+        pht_stats_inc(PHT_STAT_RX_WINDOW_TOO_FAR_DROPPED);
+        return 0;
+    case PHANTUN_EST_RX_RESERVED_SHAPING_DROP:
+        pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
+        reinject_payload = false;
+        break;
+    case PHANTUN_EST_RX_WINDOW_PAYLOAD:
+    case PHANTUN_EST_RX_RESPONSE_SKIP_PROOF:
+        reinject_payload = true;
+        break;
+    default:
+        return -EPROTO;
+    }
+
+    return phantun_finalize_established_rx(flow, ep, skb, view, decision, net, dev,
+                                           reinject_payload, true);
+}
+
 static int phantun_confirm_outbound_udp_conntrack(struct sk_buff *skb) {
     enum ip_conntrack_info ctinfo;
     struct nf_conn *ct;
@@ -1501,8 +1535,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         spin_unlock_bh(&flow->lock);
 
         {
-            bool drop_open_payload = view.payload_len && phantun_request_enabled() &&
-                                     ntohl(view.tcp->seq) == peer_syn_next;
+            struct phantun_established_rx_decision open_decision;
 
             /* Injected handshake_response occupies responder_seq + 1.
              * Keep responder-owned UDP blocked until the peer ACKs that
@@ -1510,11 +1543,6 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
              * skipped.
              */
             if (phantun_response_enabled()) {
-                if (drop_open_payload) {
-                    phantun_note_inbound_payload(flow, &view);
-                    pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
-                }
-
                 ret = phantun_send_handshake_response(flow, state->net);
                 if (ret) {
                     pht_pr_warn("failed to emit handshake response: %d\n", ret);
@@ -1526,72 +1554,38 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 spin_lock_bh(&flow->lock);
                 flow->response_pending_ack = true;
                 spin_unlock_bh(&flow->lock);
-
-                if (view.payload_len == 0)
-                    pht_flow_touch_inbound(flow);
-                pht_flow_update_state(flow, PHT_FLOW_STATE_ESTABLISHED);
-                if (view.payload_len == 0 || drop_open_payload) {
-                    pht_flow_put(flow);
-                    return NF_DROP;
-                }
-                {
-                    struct phantun_established_rx_decision open_decision;
-
-                    spin_lock_bh(&flow->lock);
-                    open_decision = phantun_classify_established_rx_locked(flow, &view);
-                    spin_unlock_bh(&flow->lock);
-
-                    ret = phantun_finalize_established_rx(flow, &ep, skb, &view, &open_decision,
-                                                          state->net, in_dev, true, true);
-                    if (ret) {
-                        pht_pr_warn("failed to process responder open payload: %d\n", ret);
-                        if (ret == -EMSGSIZE)
-                            phantun_send_rstack(state->net, &ep, &view, false);
-                        pht_flow_remove(flow);
-                    }
-                    pht_flow_put(flow);
-                    return NF_DROP;
-                }
-            }
-
-            pht_flow_touch_inbound(flow);
-            pht_flow_update_state(flow, PHT_FLOW_STATE_ESTABLISHED);
-
-            /* The responder transitions to ESTABLISHED. We must flush any
-             * queued UDP data. */
-            ret = phantun_flush_queued_udp(flow, state->net);
-            if (ret) {
-                pht_pr_warn("failed to flush responder queue: %d\n", ret);
-                pht_flow_remove(flow);
-                pht_flow_put(flow);
-                return NF_DROP;
             }
 
             if (view.payload_len == 0) {
-                pht_flow_put(flow);
-                return NF_DROP;
-            }
-            {
-                struct phantun_established_rx_decision open_decision;
-
-                if (drop_open_payload)
-                    pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
-
-                spin_lock_bh(&flow->lock);
-                open_decision = phantun_classify_established_rx_locked(flow, &view);
-                spin_unlock_bh(&flow->lock);
-
-                ret = phantun_finalize_established_rx(flow, &ep, skb, &view, &open_decision,
-                                                      state->net, in_dev, !drop_open_payload, true);
-                if (ret) {
-                    pht_pr_warn("failed to process responder open payload: %d\n", ret);
-                    if (ret == -EMSGSIZE)
-                        phantun_send_rstack(state->net, &ep, &view, false);
-                    pht_flow_remove(flow);
+                pht_flow_touch_inbound(flow);
+                pht_flow_update_state(flow, PHT_FLOW_STATE_ESTABLISHED);
+                if (!phantun_response_enabled()) {
+                    ret = phantun_flush_queued_udp(flow, state->net);
+                    if (ret) {
+                        pht_pr_warn("failed to flush responder queue: %d\n", ret);
+                        pht_flow_remove(flow);
+                    }
                 }
                 pht_flow_put(flow);
                 return NF_DROP;
             }
+
+            pht_flow_update_state(flow, PHT_FLOW_STATE_ESTABLISHED);
+
+            spin_lock_bh(&flow->lock);
+            open_decision = phantun_classify_established_rx_locked(flow, &view);
+            spin_unlock_bh(&flow->lock);
+
+            ret = phantun_finalize_responder_open_payload(flow, &ep, skb, &view, &open_decision,
+                                                          state->net, in_dev);
+            if (ret) {
+                pht_pr_warn("failed to process responder open payload: %d\n", ret);
+                if (ret == -EMSGSIZE || ret == -EPROTO)
+                    phantun_send_rstack(state->net, &ep, &view, false);
+                pht_flow_remove(flow);
+            }
+            pht_flow_put(flow);
+            return NF_DROP;
         }
     }
 

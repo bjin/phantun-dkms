@@ -305,7 +305,10 @@ On valid final `ACK`:
   - send `ACK + handshake_response`
   - advance `seq` by `handshake_response.len()`
   - keep responder-owned queued UDP blocked until later initiator `ACK` covers injected response or later initiator traffic establishes reserved responder sequence was skipped
-- otherwise transition directly to `ESTABLISHED`
+- transition to `ESTABLISHED`
+- if the final `ACK` carries payload that is not immediately suppressed as the reserved initiator first-payload slot:
+  - classify that same packet with the established receive classifier before UDP delivery, ACK emission, or queued responder release
+  - `DROP_TOO_OLD`, `DROP_TOO_FAR`, and other silent-drop classes still establish the flow but must not deliver payload, refresh liveness, or release queued responder UDP
 
 #### `ESTABLISHED`
 

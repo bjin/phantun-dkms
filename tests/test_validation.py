@@ -1798,6 +1798,151 @@ def test_bad_final_ack_wrong_seq_is_rejected_with_rstack(phantun_module, vm):
         cleanup_netns_topology(vm)
 
 
+def test_responder_open_too_far_payload_is_silently_dropped(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, established_window_bytes=64)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    drop_synack = make_netns_prerouting_flag_drop_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "drop_half_open_synack_too_far",
+            }
+        ],
+    )
+    synack_capture = spawn_ready_capture(
+        vm,
+        NS_A,
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "payload": "",
+            "timeout_sec": 10,
+        },
+    )
+    ack_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "ack",
+                "comment": "bad_final_too_far_ack",
+            }
+        ],
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "bad_final_too_far_rst",
+            }
+        ],
+    )
+
+    try:
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn",
+                "seq": 4095,
+            },
+        )
+        synack_result = synack_capture.communicate(timeout=10)
+        assert_completed(synack_result, "capture responder SYN|ACK for too-far final ACK")
+        synack_data = parse_guest_json(synack_result.stdout, "captured responder SYN|ACK for too-far final ACK")
+        if (synack_data.get("flags", 0) & 0x12) != 0x12:
+            pytest.fail(f"expected SYN|ACK from responder, got {synack_data!r}")
+
+        no_delivery = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_many",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 1,
+                "timeout_sec": 2,
+            },
+        )
+        wait_for_guest_condition(
+            vm,
+            ["ip", "netns", "exec", NS_B, "ss", "-lun", "sport", "=", f":{dst_port}"],
+            timeout=5,
+            description="responder too-far receiver bind",
+        )
+
+        baseline_ack = ack_probe.packets(vm, "bad_final_too_far_ack")
+        baseline_rst = rst_probe.packets(vm, "bad_final_too_far_rst")
+        stats_before = read_module_stats(vm)
+
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack",
+                "seq": 4096 + 128,
+                "ack": synack_data["seq"] + 1,
+                "payload": "future",
+            },
+        )
+
+        no_delivery_result = no_delivery.communicate(timeout=5)
+        stats_after = read_module_stats(vm)
+
+        if no_delivery_result.returncode == 0:
+            pytest.fail("too-far responder-open payload must not be delivered to UDP")
+        if "TimeoutError" not in no_delivery_result.stderr:
+            pytest.fail(f"too-far responder-open receiver failed unexpectedly: {no_delivery_result.stderr!r}")
+        if ack_probe.packets(vm, "bad_final_too_far_ack") != baseline_ack:
+            pytest.fail("too-far responder-open payload should not provoke a fresh ACK reply")
+        if rst_probe.packets(vm, "bad_final_too_far_rst") != baseline_rst:
+            pytest.fail("too-far responder-open payload should be dropped silently without RST|ACK")
+        if stats_after["rx_window_too_far_dropped"] <= stats_before["rx_window_too_far_dropped"]:
+            pytest.fail("too-far responder-open payload should increment the too-far receive-window drop stat")
+        if stats_after["rx_window_too_old_dropped"] != stats_before["rx_window_too_old_dropped"]:
+            pytest.fail("too-far responder-open payload was incorrectly counted as too old")
+    finally:
+        ack_probe.cleanup(vm)
+        rst_probe.cleanup(vm)
+        drop_synack.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
 def test_bad_final_ack_flags_are_rejected_with_rstack(phantun_module, vm):
     phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
