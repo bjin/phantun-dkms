@@ -14,7 +14,7 @@
 #define PHANTUN_DEFAULT_KEEPALIVE_MISSES 3U
 #define PHANTUN_DEFAULT_HARD_IDLE_TIMEOUT_SEC 300U
 #define PHANTUN_DEFAULT_REOPEN_GUARD_BYTES 4194304U
-#define PHANTUN_REPLACEMENT_QUARANTINE_MS 1000U
+#define PHANTUN_DEFAULT_REPLACEMENT_QUARANTINE_MS 3000U
 #define PHANTUN_PRE_ROUTING_PRIORITY (-400)
 #define PHANTUN_LOCAL_OUT_PRIORITY (-199)
 /* Marks reinjected UDP so PRE_ROUTING accepts it without recapturing it. */
@@ -46,6 +46,7 @@ struct phantun_config {
     unsigned int keepalive_misses;
     unsigned int hard_idle_timeout_sec;
     unsigned int reopen_guard_bytes;
+    unsigned int replacement_quarantine_ms;
 };
 
 #endif

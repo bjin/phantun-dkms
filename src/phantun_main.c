@@ -49,7 +49,7 @@ static unsigned int keepalive_interval_sec = PHANTUN_DEFAULT_KEEPALIVE_INTERVAL_
 static unsigned int keepalive_misses = PHANTUN_DEFAULT_KEEPALIVE_MISSES;
 static unsigned int hard_idle_timeout_sec = PHANTUN_DEFAULT_HARD_IDLE_TIMEOUT_SEC;
 static unsigned int reopen_guard_bytes = PHANTUN_DEFAULT_REOPEN_GUARD_BYTES;
-
+static unsigned int replacement_quarantine_ms = PHANTUN_DEFAULT_REPLACEMENT_QUARANTINE_MS;
 module_param_array_named(managed_local_ports, managed_local_ports, uint, &managed_local_ports_count,
                          0444);
 MODULE_PARM_DESC(managed_local_ports, "Comma-separated local UDP/TCP ports managed by phantun");
@@ -78,6 +78,9 @@ module_param(hard_idle_timeout_sec, uint, 0444);
 MODULE_PARM_DESC(hard_idle_timeout_sec, "Maximum idle flow timeout in seconds (hard GC limit)");
 module_param(reopen_guard_bytes, uint, 0444);
 MODULE_PARM_DESC(reopen_guard_bytes, "Minimum sequence space separation for new connections");
+module_param(replacement_quarantine_ms, uint, 0444);
+MODULE_PARM_DESC(replacement_quarantine_ms,
+                 "Previous-generation quarantine window in milliseconds after tuple replacement");
 
 static struct phantun_config phantun_cfg;
 static void *phantun_alloc_req;
@@ -294,8 +297,9 @@ static bool phantun_seq_between(u32 seq, u32 start, u32 end) {
 }
 
 /* Remember only the immediately previous generation on a tuple. During the
- * short quarantine window, packets that still fit that old seq/ack space are
- * dropped instead of provoking fresh RSTs after a replacement SYN wins.
+ * configured quarantine window, packets that still fit that old seq/ack
+ * space are dropped instead of provoking fresh RSTs after a replacement SYN
+ * wins.
  */
 static void phantun_flow_arm_prev_generation_quarantine(struct pht_flow *flow, u32 prev_local_start,
                                                         u32 prev_local_end, u32 prev_remote_start,
@@ -308,7 +312,8 @@ static void phantun_flow_arm_prev_generation_quarantine(struct pht_flow *flow, u
     flow->quarantine_prev_local_seq_end = prev_local_end;
     flow->quarantine_prev_remote_seq_start = prev_remote_start;
     flow->quarantine_prev_remote_seq_end = prev_remote_end;
-    flow->quarantine_until_jiffies = jiffies + msecs_to_jiffies(PHANTUN_REPLACEMENT_QUARANTINE_MS);
+    flow->quarantine_until_jiffies =
+        jiffies + msecs_to_jiffies(phantun_cfg.replacement_quarantine_ms);
     flow->quarantine_prev_active = true;
     spin_unlock_bh(&flow->lock);
 }
@@ -1633,6 +1638,11 @@ static int phantun_validate_config(void) {
         pht_pr_err("reopen_guard_bytes must be smaller than 2147483648\n");
         return -EINVAL;
     }
+
+    if (!replacement_quarantine_ms) {
+        pht_pr_err("replacement_quarantine_ms must be greater than zero\n");
+        return -EINVAL;
+    }
     return 0;
 }
 
@@ -1766,6 +1776,7 @@ static int phantun_snapshot_config(void) {
     phantun_cfg.keepalive_misses = keepalive_misses;
     phantun_cfg.hard_idle_timeout_sec = hard_idle_timeout_sec;
     phantun_cfg.reopen_guard_bytes = reopen_guard_bytes;
+    phantun_cfg.replacement_quarantine_ms = replacement_quarantine_ms;
 
     return 0;
 }
@@ -1776,11 +1787,13 @@ static void phantun_log_config(void) {
     pht_pr_info("loading with %u managed local port(s), %u managed remote peer(s), "
                 "handshake_timeout_ms=%u, handshake_retries=%u, "
                 "keepalive_interval_sec=%u, keepalive_misses=%u, "
-                "hard_idle_timeout_sec=%u, reopen_guard_bytes=%u\n",
+                "hard_idle_timeout_sec=%u, reopen_guard_bytes=%u, "
+                "replacement_quarantine_ms=%u\n",
                 phantun_cfg.managed_local_ports_count, phantun_cfg.managed_remote_peers_count,
                 phantun_cfg.handshake_timeout_ms, phantun_cfg.handshake_retries,
                 phantun_cfg.keepalive_interval_sec, phantun_cfg.keepalive_misses,
-                phantun_cfg.hard_idle_timeout_sec, phantun_cfg.reopen_guard_bytes);
+                phantun_cfg.hard_idle_timeout_sec, phantun_cfg.reopen_guard_bytes,
+                phantun_cfg.replacement_quarantine_ms);
 
     for (i = 0; i < phantun_cfg.managed_local_ports_count; i++)
         pht_pr_info("managed_local_ports[%u]=%u\n", i, phantun_cfg.managed_local_ports[i]);
