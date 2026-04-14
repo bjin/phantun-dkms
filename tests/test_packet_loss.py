@@ -291,6 +291,93 @@ def test_half_open_retry_exhaustion_releases_flow_slot(phantun_module, vm):
         cleanup_netns_topology(vm)
 
 
+def test_lost_first_payload_without_handshake_request_does_not_trigger_rstack(phantun_module, vm):
+    load_loss_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    drop_payload = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "src_port": src_port,
+                "dst_addr": NS_ADDR_B,
+                "dst_port": dst_port,
+                "payload": "client-0",
+                "comment": "drop_first_payload",
+            }
+        ],
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "lost_first_payload_rst",
+            }
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        baseline_rst = rst_probe.packets(vm, "lost_first_payload_rst")
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["client-0", "client-1", "client-2"],
+                "delay_ms": 400,
+            },
+        )
+        time.sleep(1.25)
+        drop_payload.cleanup(vm)
+        server_result = server.communicate(timeout=15)
+
+        assert_completed(client_result, "first-payload-loss sender")
+        assert_completed(server_result, "first-payload-loss receiver")
+
+        server_data = parse_guest_json(server_result.stdout, "first-payload-loss server stdout")
+        if received_entry_messages(server_data) != ["client-1", "client-2"]:
+            pytest.fail(
+                "lost first ACK+payload opener must not reset the responder or drop later payloads; "
+                f"got {received_entry_messages(server_data)!r}"
+            )
+        if rst_probe.packets(vm, "lost_first_payload_rst") != baseline_rst:
+            pytest.fail("lost first ACK+payload opener must not trigger responder RST|ACK")
+    finally:
+        drop_payload.cleanup(vm)
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
 def test_handshake_request_loss_does_not_drop_later_payloads(phantun_module, vm):
     load_loss_module(phantun_module, handshake_request=REQ)
     ensure_netns_topology(vm)

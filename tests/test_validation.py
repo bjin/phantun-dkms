@@ -1791,7 +1791,7 @@ def test_bad_final_ack_wrong_seq_is_rejected_with_rstack(phantun_module, vm):
         time.sleep(0.2)
 
         if invalid_probe.packets(vm, "bad_final_wrong_seq_rst") <= baseline_bad_final_rst:
-            pytest.fail("expected RST|ACK for final ACK with wrong sequence number")
+            pytest.fail("expected RST|ACK for final ACK with future sequence gap")
     finally:
         drop_synack.cleanup(vm)
         invalid_probe.cleanup(vm)

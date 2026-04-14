@@ -416,15 +416,17 @@ static bool phantun_tcp_is_valid_final_ack(const struct pht_l4_view *view, u32 p
         return false;
 
     seq = ntohl(view->tcp->seq);
+
     if (seq == peer_syn_next)
         return true;
 
-    /* If the initiator's reserved handshake_request slot was lost, the next
-     * payload can arrive at a higher sequence while we are still in
-     * SYN_RCVD. Accept only that payload-bearing skip case.
+    /* A lost ACK+payload opener can leave the responder in SYN_RCVD while the
+     * initiator has already advanced to later UDP payload. Accept only
+     * payload-bearing later sequence numbers here; a pure-ACK jump would
+     * create a permanent future-sequence bypass before the established
+     * classifier can judge the packet.
      */
-    return phantun_request_enabled() && view->payload_len > 0 &&
-           phantun_seq_after_eq(seq, peer_syn_next);
+    return view->payload_len > 0 && phantun_seq_after(seq, peer_syn_next);
 }
 
 /* Established-state classifier for current-generation inbound packets. The
@@ -1466,8 +1468,9 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         return NF_DROP;
     }
 
-    /* Responder half-open state: duplicate SYN retransmits SYN|ACK, and only
-     * the exact final ACK can complete the handshake.
+    /* Responder half-open state: duplicate SYN retransmits SYN|ACK. The final
+     * ACK may carry payload at peer_syn_next or later if an earlier opener
+     * payload was lost, but a pure-ACK sequence jump is still invalid.
      */
     if (state_now == PHT_FLOW_STATE_SYN_RCVD) {
         if (!phantun_tcp_is_valid_final_ack(&view, peer_syn_next) ||
