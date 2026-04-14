@@ -198,6 +198,18 @@ def wait_for_guest_ready_file(vm, path, timeout=5):
     wait_for_guest_condition(vm, ["test", "-e", path], timeout, f"guest readiness file {path!r}")
 
 
+def spawn_ready_capture(vm, namespace, config):
+    ready_file = f"/tmp/phantun-capture-{uuid.uuid4().hex}"
+    capture = spawn_netns_scenario(
+        vm,
+        namespace,
+        "capture_tcp_packet",
+        {**config, "ready_file": ready_file},
+    )
+    wait_for_guest_ready_file(vm, ready_file, timeout=config.get("timeout_sec", 10))
+    return capture
+
+
 def require_guest_command(vm, command):
     res = vm.run(f"command -v {shlex.quote(command)}", check=False)
     return res.returncode == 0

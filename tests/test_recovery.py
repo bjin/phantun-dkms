@@ -1,5 +1,4 @@
 import time
-import uuid
 
 import pytest
 from helpers import (
@@ -14,17 +13,19 @@ from helpers import (
     assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
-    require_guest_command,
-    received_plain_messages,
-    run_netns_scenario,
-    spawn_netns_scenario,
-    parse_guest_json,
     make_netns_ingress_drop_probe,
     make_netns_ingress_flag_drop_probe,
     make_netns_output_flag_probe,
     make_netns_prerouting_flag_drop_probe,
+    parse_guest_json,
     read_module_stats,
+    received_plain_messages,
+    require_guest_command,
+    run_netns_scenario,
+    spawn_netns_scenario,
+    spawn_ready_capture,
     wait_for_guest_condition,
+    wait_for_guest_ready_file,
 )
 
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
@@ -39,27 +40,6 @@ def load_recovery_module(phantun_module, **kwargs):
         handshake_retries=20,
         **kwargs,
     )
-
-
-def wait_for_guest_ready_file(vm, path, timeout=10):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if vm.run(["test", "-e", path], check=False).returncode == 0:
-            return
-        time.sleep(0.1)
-    pytest.fail(f"guest readiness file {path!r} was not observed within {timeout}s")
-
-
-def spawn_ready_capture(vm, namespace, config):
-    ready_file = f"/tmp/phantun-capture-{uuid.uuid4().hex}"
-    capture = spawn_netns_scenario(
-        vm,
-        namespace,
-        "capture_tcp_packet",
-        {**config, "ready_file": ready_file},
-    )
-    wait_for_guest_ready_file(vm, ready_file, timeout=config.get("timeout_sec", 10))
-    return capture
 
 
 def test_liveness_timeout_recovers(phantun_module, vm):
