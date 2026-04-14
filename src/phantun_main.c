@@ -542,7 +542,7 @@ done:
             phantun_seq_after_eq(decision.ack_seq,
                                  flow->local_isn + 1 + phantun_cfg.handshake_response_len) ||
             decision.rx_class == PHANTUN_EST_RX_RESPONSE_SKIP_PROOF ||
-            decision.rx_class == PHANTUN_EST_RX_WINDOW_PAYLOAD;
+            (decision.rx_class == PHANTUN_EST_RX_WINDOW_PAYLOAD && decision.seq == flow->ack);
     }
 
     return decision;

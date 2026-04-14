@@ -339,6 +339,7 @@ Classifier classes:
 - `VALID_WINDOW_PAYLOAD`: packet carries `ACK` and payload whose starting sequence stays within the configured established receive window for the current generation
 - `VALID_RESERVED_SHAPING_DROP`: packet matches an armed reserved shaping sequence slot, passes the same window checks, and is silently suppressed without UDP delivery
 - `VALID_RESPONSE_SKIP_PROOF`: while responder `handshake_response` is still pending acknowledgement, later initiator payload may prove that the reserved responder-control slot was skipped; this both releases queued responder UDP and still delivers the proving payload to UDP
+  - replayed lower-sequence in-window payload is not skip proof and must not release queued responder UDP
 - `DROP_TOO_OLD`: payload lies entirely below the sliding lower bound and is silently discarded as stale traffic for this generation
 - `DROP_TOO_FAR`: payload starts beyond the sliding upper bound and is silently discarded as implausibly far ahead for this generation
 - `INVALID`: impossible ACK progression, missing required `ACK`, illegal control flags, or any packet that does not fit the current generation's rules
@@ -367,9 +368,9 @@ ACK validation rules in `ESTABLISHED`:
 
 State-machine consequences:
 - `VALID_ACK_ONLY` refreshes liveness and may release queued responder UDP only when it validly acknowledges the injected responder handshake-response range
-- `VALID_WINDOW_PAYLOAD` refreshes liveness, updates `ack` monotonically to the highest accepted remote sequence end, may release responder queued UDP only when it validly acknowledges the injected responder handshake-response range or when later payload proves the reserved responder-control slot was skipped, and reinjects payload to local UDP
-- `VALID_RESERVED_SHAPING_DROP` refreshes liveness only for the current generation, never delivers to UDP, may still advance `ack` monotonically because the shaping payload was accepted by sequence even though it was hidden from the UDP app, and must not by itself release responder queued UDP
+- `VALID_WINDOW_PAYLOAD` refreshes liveness, updates `ack` monotonically to the highest accepted remote sequence end, may release responder queued UDP only when it validly acknowledges the injected responder handshake-response range or when it is the first fresh payload at the current receive frontier, and reinjects payload to local UDP
 - `VALID_RESPONSE_SKIP_PROOF` refreshes liveness, updates `ack` monotonically, releases queued responder UDP, and still delivers the proving payload to UDP
+- `VALID_RESERVED_SHAPING_DROP` refreshes liveness only for the current generation, never delivers to UDP, may still advance `ack` monotonically because the shaping payload was accepted by sequence even though it was hidden from the UDP app, and must not by itself release responder queued UDP
 - `DROP_TOO_OLD` and `DROP_TOO_FAR` are silent-drop classes: no UDP delivery, no ACK-state change, no responder release, and no liveness refresh
 - `INVALID` is a protocol error and triggers `RST|ACK` plus local teardown, except where the failure policy explicitly lists a silent-drop case
 

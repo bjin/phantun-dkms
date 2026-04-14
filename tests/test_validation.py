@@ -25,12 +25,15 @@ from helpers import (
     make_netns_ingress_payload_drop_probe,
     make_netns_output_flag_probe,
     make_netns_prerouting_flag_drop_probe,
+    make_netns_tcp_payload_probe,
     read_module_stats,
     read_netns_iface_mac,
     wait_for_guest_condition,
 )
 
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
+REQ = "HSREQ42"
+RESP = "HSRESP42"
 
 
 def load_recovery_module(phantun_module, **kwargs):
@@ -1940,6 +1943,180 @@ def test_responder_open_too_far_payload_is_silently_dropped(phantun_module, vm):
         ack_probe.cleanup(vm)
         rst_probe.cleanup(vm)
         drop_synack.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_replayed_payload_does_not_release_responder_queue_while_response_pending(phantun_module, vm):
+    phantun_module.load(
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        handshake_request=REQ,
+        handshake_response=RESP,
+    )
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    drop_response = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "payload": RESP,
+                "comment": "drop_resp_replay_hold",
+            }
+        ],
+    )
+    drop_client_payload = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "src_port": src_port,
+                "dst_addr": NS_ADDR_B,
+                "dst_port": dst_port,
+                "payload": "client-0",
+                "comment": "drop_client0_replay_hold",
+            }
+        ],
+    )
+    syn_capture = spawn_ready_capture(
+        vm,
+        NS_B,
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payload": "",
+            "timeout_sec": 10,
+        },
+    )
+    synack_capture = spawn_ready_capture(
+        vm,
+        NS_A,
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "payload": "",
+            "timeout_sec": 10,
+        },
+    )
+    reply_probe = make_netns_tcp_payload_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "payload": "server-0",
+                "comment": "queued_reply_replay",
+                "action": "accept",
+            }
+        ],
+    )
+    delayed_sender = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "delayed_send",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "payload": "server-0",
+            "delay_ms": 300,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["client-0"],
+            },
+        )
+        syn_result = syn_capture.communicate(timeout=10)
+        synack_result = synack_capture.communicate(timeout=10)
+        delayed_sender_result = delayed_sender.communicate(timeout=10)
+        assert_completed(client_result, "response-pending replay sender")
+        assert_completed(syn_result, "response-pending SYN capture")
+        assert_completed(synack_result, "response-pending SYN|ACK capture")
+        assert_completed(delayed_sender_result, "response-pending delayed responder sender")
+
+        time.sleep(0.5)
+        if reply_probe.packets(vm, "queued_reply_replay") != 0:
+            pytest.fail("responder data must stay queued while handshake_response acknowledgement is pending")
+
+        syn_data = parse_guest_json(syn_result.stdout, "response-pending SYN capture stdout")
+        synack_data = parse_guest_json(synack_result.stdout, "response-pending SYN|ACK capture stdout")
+        baseline_reply = reply_probe.packets(vm, "queued_reply_replay")
+
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack",
+                "seq": syn_data["seq"] + 2,
+                "ack": synack_data["seq"] + 1,
+                "payload": "x",
+            },
+        )
+        time.sleep(0.5)
+
+        if reply_probe.packets(vm, "queued_reply_replay") != baseline_reply:
+            pytest.fail(
+                "payload replay below the current receive frontier must not release responder data while handshake_response is pending"
+            )
+
+        drop_response.cleanup(vm)
+        drop_client_payload.cleanup(vm)
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["client-1"],
+            },
+        )
+        time.sleep(0.5)
+
+        if reply_probe.packets(vm, "queued_reply_replay") == baseline_reply:
+            pytest.fail("queued responder payload was never released after later skip-proof traffic")
+    finally:
+        drop_response.cleanup(vm)
+        drop_client_payload.cleanup(vm)
+        reply_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 
