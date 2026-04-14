@@ -1,4 +1,5 @@
 import time
+import uuid
 
 import pytest
 from helpers import (
@@ -21,6 +22,7 @@ from helpers import (
     make_netns_ingress_drop_probe,
     make_netns_ingress_flag_drop_probe,
     make_netns_output_flag_probe,
+    make_netns_prerouting_flag_drop_probe,
     read_module_stats,
     wait_for_guest_condition,
 )
@@ -37,6 +39,27 @@ def load_recovery_module(phantun_module, **kwargs):
         handshake_retries=20,
         **kwargs,
     )
+
+
+def wait_for_guest_ready_file(vm, path, timeout=10):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if vm.run(["test", "-e", path], check=False).returncode == 0:
+            return
+        time.sleep(0.1)
+    pytest.fail(f"guest readiness file {path!r} was not observed within {timeout}s")
+
+
+def spawn_ready_capture(vm, namespace, config):
+    ready_file = f"/tmp/phantun-capture-{uuid.uuid4().hex}"
+    capture = spawn_netns_scenario(
+        vm,
+        namespace,
+        "capture_tcp_packet",
+        {**config, "ready_file": ready_file},
+    )
+    wait_for_guest_ready_file(vm, ready_file, timeout=config.get("timeout_sec", 10))
+    return capture
 
 
 def test_liveness_timeout_recovers(phantun_module, vm):
@@ -518,6 +541,207 @@ def test_established_bare_syn_replacement(phantun_module, vm):
             ["ip", "netns", "exec", NS_B, "nft", "delete", "table", "inet", "filter"],
             check=False,
         )
+
+
+def prepare_replacement_quarantine_boundary_case(vm, src_port, dst_port):
+    captured_packet = spawn_ready_capture(
+        vm,
+        NS_B,
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payload": "msg1",
+            "timeout_sec": 10,
+        },
+    )
+    replacement_synack = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "replacement_boundary_synack",
+            }
+        ],
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "replacement_boundary_rst",
+            }
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "echo_server",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "timeout_sec": 15,
+        },
+    )
+
+    time.sleep(0.2)
+    client_result = run_netns_scenario(
+        vm,
+        NS_A,
+        "echo_client",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payloads": ["msg1"],
+            "timeout_sec": 15,
+        },
+    )
+    captured_result = captured_packet.communicate(timeout=10)
+    server_result = server.communicate(timeout=15)
+    assert_completed(client_result, "quarantine boundary client send 1")
+    assert_completed(captured_result, "quarantine boundary capture old generation packet")
+    assert_completed(server_result, "quarantine boundary server")
+
+    drop_synack = make_netns_prerouting_flag_drop_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "replacement_boundary_synack_drop",
+            }
+        ],
+    )
+    baseline_synack = replacement_synack.packets(vm, "replacement_boundary_synack")
+    run_netns_scenario(
+        vm,
+        NS_A,
+        "send_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "flags": "syn",
+            "seq": 8190,
+        },
+    )
+    time.sleep(0.2)
+    if replacement_synack.packets(vm, "replacement_boundary_synack") <= baseline_synack:
+        pytest.fail("expected responder replacement SYN|ACK before injecting stale packet")
+
+    return {
+        "captured": parse_guest_json(captured_result.stdout, "quarantine boundary captured old packet"),
+        "drop_synack": drop_synack,
+        "replacement_synack": replacement_synack,
+        "rst_probe": rst_probe,
+    }
+
+
+def test_replacement_quarantine_silently_drops_old_packet_before_expiry(phantun_module, vm):
+    load_recovery_module(phantun_module, replacement_quarantine_ms=800)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    context = None
+
+    try:
+        context = prepare_replacement_quarantine_boundary_case(vm, src_port, dst_port)
+        baseline_rst = context["rst_probe"].packets(vm, "replacement_boundary_rst")
+
+        time.sleep(0.2)
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack",
+                "seq": context["captured"]["seq"],
+                "ack": context["captured"]["ack"],
+                "payload": context["captured"]["payload"],
+            },
+        )
+        time.sleep(0.2)
+
+        if context["rst_probe"].packets(vm, "replacement_boundary_rst") != baseline_rst:
+            pytest.fail("stale old-generation packet should be dropped silently before quarantine expiry")
+    finally:
+        if context is not None:
+            context["drop_synack"].cleanup(vm)
+            context["replacement_synack"].cleanup(vm)
+            context["rst_probe"].cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_replacement_quarantine_expiry_restores_rstack(phantun_module, vm):
+    load_recovery_module(phantun_module, replacement_quarantine_ms=800)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    context = None
+
+    try:
+        context = prepare_replacement_quarantine_boundary_case(vm, src_port, dst_port)
+        baseline_rst = context["rst_probe"].packets(vm, "replacement_boundary_rst")
+
+        time.sleep(1.1)
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack",
+                "seq": context["captured"]["seq"],
+                "ack": context["captured"]["ack"],
+                "payload": context["captured"]["payload"],
+            },
+        )
+        time.sleep(0.2)
+
+        if context["rst_probe"].packets(vm, "replacement_boundary_rst") <= baseline_rst:
+            pytest.fail("stale old-generation packet should provoke RST|ACK after quarantine expiry")
+    finally:
+        if context is not None:
+            context["drop_synack"].cleanup(vm)
+            context["replacement_synack"].cleanup(vm)
+            context["rst_probe"].cleanup(vm)
+        cleanup_netns_topology(vm)
 
 
 def test_replacement_quarantine_drops_delayed_old_generation_packet(phantun_module, vm):
