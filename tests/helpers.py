@@ -2,8 +2,11 @@ import json
 import shlex
 import subprocess
 import textwrap
+import time
 import uuid
 from pathlib import Path
+
+import pytest
 
 NS_A = "pht-a"
 NS_B = "pht-b"
@@ -91,6 +94,11 @@ class NetnsNftProbe:
         )
 
 
+def assert_completed(result, label):
+    if result.returncode != 0:
+        pytest.fail(f"{label} failed: {result.stderr!r}")
+
+
 def run_guest_python(vm, script, check=True):
     body = textwrap.dedent(script).strip()
     command = f"python3 - <<'PY'\n{body}\nPY"
@@ -152,6 +160,19 @@ def spawn_netns_scenario(vm, namespace, scenario, config, **kwargs):
         ],
         **kwargs,
     )
+
+
+def wait_for_guest_condition(vm, cmd, timeout, description, interval=0.1):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if vm.run(cmd, check=False).returncode == 0:
+            return
+        time.sleep(interval)
+    pytest.fail(f"{description} was not observed within {timeout}s")
+
+
+def wait_for_guest_ready_file(vm, path, timeout=5):
+    wait_for_guest_condition(vm, ["test", "-e", path], timeout, f"guest readiness file {path!r}")
 
 
 def parse_guest_json(stdout, context):

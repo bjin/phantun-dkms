@@ -9,6 +9,7 @@ from helpers import (
     NS_B,
     PORTS_A,
     PORTS_B,
+    assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
     make_netns_tcp_payload_probe,
@@ -25,11 +26,6 @@ RESP = "HSRESP42"
 
 def load_handshake_module(phantun_module, **kwargs):
     phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, **kwargs)
-
-
-def assert_completed(result, label):
-    if result.returncode != 0:
-        pytest.fail(f"{label} failed: {result.stderr!r}")
 
 
 def received_messages(payload):

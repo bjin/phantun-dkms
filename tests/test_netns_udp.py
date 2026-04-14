@@ -11,6 +11,7 @@ from helpers import (
     NetnsNftProbe,
     PORTS_A,
     PORTS_B,
+    assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
     make_netns_output_probe,
@@ -27,11 +28,6 @@ MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
 
 def load_netns_module(phantun_module):
     phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
-
-
-def assert_completed(result, label):
-    if result.returncode != 0:
-        pytest.fail(f"{label} failed: {result.stderr!r}")
 
 
 # Build small INPUT policies that mimic stateful host firewalls. The reply path
