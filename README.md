@@ -181,6 +181,7 @@ Validation rules:
 | `hard_idle_timeout_sec` | `300` | Hard upper bound for idle flow lifetime. |
 | `reopen_guard_bytes` | `4194304` | Minimum sequence-space distance before reopening same tuple. |
 | `established_window_bytes` | `1048576` | Established-state receive window in bytes. `0` disables sequence-range checks. |
+| `replacement_quarantine_ms` | `3000` | Previous-generation quarantine window after tuple replacement. Matching old-generation packets are silently dropped during this window. |
 
 ### Shaping payload formats
 

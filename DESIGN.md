@@ -179,6 +179,7 @@ If an established flow accepts a valid bare replacement `SYN` on the same tuple:
 - keep a short quarantine record for the immediately previous generation only
 - during that short window, packets that still look like the old generation are silently dropped instead of provoking `RST`
 - after expiry, normal unknown-tuple handling resumes
+- v1 default quarantine window: `3000 ms` (`replacement_quarantine_ms`)
 
 Purpose: avoid poisoning recovery with delayed old-generation packets just after tuple reuse.
 
