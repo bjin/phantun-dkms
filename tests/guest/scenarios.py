@@ -250,6 +250,67 @@ def delayed_send(config):
     _emit({"sent": config["payload"]})
 
 
+def tcp_bulk_server(config):
+    import time
+
+    expected_bytes = config["bytes"]
+    timeout = config.get("timeout_sec", TIMEOUT_SEC)
+    chunk_size = config.get("chunk_size", 65536)
+    received = 0
+    peer = None
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.settimeout(timeout)
+        server.bind((config["bind_addr"], config["bind_port"]))
+        server.listen(1)
+        conn, addr = server.accept()
+        peer = [addr[0], addr[1]]
+        with conn:
+            conn.settimeout(timeout)
+            start = time.time()
+            while received < expected_bytes:
+                data = conn.recv(min(chunk_size, expected_bytes - received))
+                if not data:
+                    break
+                received += len(data)
+            end = time.time()
+
+    if received != expected_bytes:
+        raise RuntimeError(f"tcp_bulk_server expected {expected_bytes} bytes but received {received}")
+
+    _emit({"received_bytes": received, "seconds": end - start, "peer": peer})
+
+
+def tcp_bulk_client(config):
+    import time
+
+    total_bytes = config["bytes"]
+    timeout = config.get("timeout_sec", TIMEOUT_SEC)
+    chunk_size = config.get("chunk_size", 65536)
+    payload_byte = config.get("payload_byte", "x")
+    if isinstance(payload_byte, str):
+        payload_byte = payload_byte.encode()
+    if not payload_byte:
+        payload_byte = b"x"
+    chunk = payload_byte[:1] * chunk_size
+    sent = 0
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.bind((config["bind_addr"], config.get("bind_port", 0)))
+        sock.connect((config["target_addr"], config["target_port"]))
+        start = time.time()
+        while sent < total_bytes:
+            to_send = min(chunk_size, total_bytes - sent)
+            sock.sendall(chunk[:to_send])
+            sent += to_send
+        sock.shutdown(socket.SHUT_WR)
+        end = time.time()
+
+    _emit({"sent_bytes": sent, "seconds": end - start})
+
+
 def _checksum(data):
     if len(data) % 2:
         data += b"\x00"
@@ -561,6 +622,8 @@ SCENARIOS = {
     "recv_many": recv_many,
     "send_many": send_many,
     "delayed_send": delayed_send,
+    "tcp_bulk_server": tcp_bulk_server,
+    "tcp_bulk_client": tcp_bulk_client,
     "simultaneous_exchange": simultaneous_exchange,
     "send_tcp_packet": send_tcp_packet,
     "send_l2_tcp_packet": send_l2_tcp_packet,

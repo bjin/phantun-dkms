@@ -9,14 +9,20 @@ from helpers import (
     NS_ADDR_A,
     NS_ADDR_B,
     NS_B,
+    VETH_A,
     VETH_B,
+    assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
     make_netns_output_probe,
     make_netns_tcp_payload_probe,
+    parse_guest_json,
     probe_comment,
+    read_module_stats,
     require_guest_command,
     run_in_netns,
+    run_netns_scenario,
+    spawn_netns_scenario,
 )
 
 WG_ADDR_A = "10.10.0.1/24"
@@ -225,6 +231,113 @@ def build_payload_probes(vm, handshake_request=None, handshake_response=None):
             ],
         )
     return probe_a, probe_b
+
+
+def set_underlay_netem(vm, delay_ms, loss_percent=None):
+    cmd_a = ["tc", "qdisc", "replace", "dev", VETH_A, "root", "netem", "delay", f"{delay_ms}ms"]
+    cmd_b = ["tc", "qdisc", "replace", "dev", VETH_B, "root", "netem", "delay", f"{delay_ms}ms"]
+    if loss_percent is not None:
+        cmd_a.extend(["loss", f"{loss_percent}%"])
+        cmd_b.extend(["loss", f"{loss_percent}%"])
+    run_in_netns(vm, NS_A, cmd_a)
+    run_in_netns(vm, NS_B, cmd_b)
+
+
+def clear_underlay_netem(vm):
+    run_in_netns(vm, NS_A, ["tc", "qdisc", "del", "dev", VETH_A, "root"], check=False)
+    run_in_netns(vm, NS_B, ["tc", "qdisc", "del", "dev", VETH_B, "root"], check=False)
+
+
+def test_kernel_wireguard_bulk_tcp_transfer_keeps_flows_stable(phantun_module, vm):
+    require_wireguard_stack(vm)
+    if not require_guest_command(vm, "tc"):
+        pytest.skip("tc is not available in the guest")
+
+    load_wireguard_module(phantun_module, handshake_request=REQ)
+    ensure_netns_topology(vm)
+
+    key_a_path = "/tmp/wg-a.key"
+    key_b_path = "/tmp/wg-b.key"
+    total_bytes = 8 * 1024 * 1024
+    baseline_stats = None
+
+    try:
+        set_underlay_netem(vm, delay_ms=20)
+        key_a_path, key_b_path = setup_wireguard_pair(vm)
+        wait_for_handshake(vm, timeout=20)
+        wait_for_endpoint(vm, NS_A, f"{NS_ADDR_B}:{PORT_B}", timeout=20)
+        wait_for_endpoint(vm, NS_B, f"{NS_ADDR_A}:{PORT_A}", timeout=20)
+        ping_wireguard_peer(vm, NS_A, WG_PEER_B, "bulk wireguard ping a->b")
+        ping_wireguard_peer(vm, NS_B, WG_PEER_A, "bulk wireguard ping b->a")
+
+        baseline_stats = read_module_stats(vm)
+        server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "tcp_bulk_server",
+            {
+                "bind_addr": WG_PEER_B,
+                "bind_port": 5001,
+                "bytes": total_bytes,
+                "timeout_sec": 30,
+            },
+        )
+        time.sleep(0.2)
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "tcp_bulk_client",
+            {
+                "bind_addr": WG_PEER_A,
+                "bind_port": 0,
+                "target_addr": WG_PEER_B,
+                "target_port": 5001,
+                "bytes": total_bytes,
+                "timeout_sec": 30,
+            },
+            timeout=40,
+        )
+        server_result = server.communicate(timeout=40)
+
+        assert_completed(client_result, "wireguard bulk tcp client")
+        assert_completed(server_result, "wireguard bulk tcp server")
+
+        client_data = parse_guest_json(client_result.stdout, "wireguard bulk tcp client stdout")
+        server_data = parse_guest_json(server_result.stdout, "wireguard bulk tcp server stdout")
+        final_stats = read_module_stats(vm)
+
+        if client_data.get("sent_bytes") != total_bytes:
+            pytest.fail(f"bulk tcp client sent unexpected byte count: {client_data!r}")
+        if server_data.get("received_bytes") != total_bytes:
+            pytest.fail(f"bulk tcp server received unexpected byte count: {server_data!r}")
+
+        server_seconds = server_data.get("seconds", 0)
+        if not isinstance(server_seconds, (int, float)) or server_seconds <= 0:
+            pytest.fail(f"bulk tcp server reported invalid duration: {server_data!r}")
+        if server_seconds > 15:
+            pytest.fail(f"bulk tcp transfer took unexpectedly long over WireGuard: {server_data!r}")
+
+        created_delta = final_stats["flows_created"] - baseline_stats["flows_created"]
+        queued_delta = final_stats["udp_packets_queued"] - baseline_stats["udp_packets_queued"]
+        rst_delta = final_stats["rst_sent"] - baseline_stats["rst_sent"]
+        if created_delta > 2:
+            pytest.fail(
+                f"bulk tcp transfer created too many new phantun flows after handshake: baseline={baseline_stats!r} final={final_stats!r}"
+            )
+        if queued_delta > 2:
+            pytest.fail(
+                f"bulk tcp transfer queued too many UDP packets after handshake: baseline={baseline_stats!r} final={final_stats!r}"
+            )
+        if rst_delta != 0:
+            pytest.fail(
+                f"bulk tcp transfer emitted unexpected RSTs after handshake: baseline={baseline_stats!r} final={final_stats!r}"
+            )
+    finally:
+        clear_underlay_netem(vm)
+        run_in_netns(vm, NS_A, ["ip", "link", "del", "wg0"], check=False)
+        run_in_netns(vm, NS_B, ["ip", "link", "del", "wg0"], check=False)
+        vm.run(["rm", "-f", key_a_path, key_b_path], check=False)
+        cleanup_netns_topology(vm)
 
 
 @pytest.mark.parametrize(
