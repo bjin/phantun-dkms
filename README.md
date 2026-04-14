@@ -180,7 +180,7 @@ Validation rules:
 | `keepalive_misses` | `3` | Unanswered keepalives allowed before teardown. |
 | `hard_idle_timeout_sec` | `300` | Hard upper bound for idle flow lifetime. |
 | `reopen_guard_bytes` | `4194304` | Minimum sequence-space distance before reopening same tuple. |
-| `established_window_bytes` | `131072` | Established-state receive window in bytes. `0` disables sequence-range checks. |
+| `established_window_bytes` | `1048576` | Established-state receive window in bytes. `0` disables sequence-range checks. |
 
 ### Shaping payload formats
 

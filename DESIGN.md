@@ -345,7 +345,7 @@ Classifier classes:
 - `INVALID`: impossible ACK progression, missing required `ACK`, illegal control flags, or any packet that does not fit the current generation's rules
 
 > Established receive window parameter: `established_window_bytes`
-- default: `131072` bytes (`128 KiB`)
+- default: `1048576` bytes (`1 MiB`)
 - `0` disables the receive-window sequence-range check entirely
 - when enabled, the accepted payload-start range is centered on the highest accepted remote sequence end currently tracked in `ack`
 - lower bound: older than this is treated as stale traffic and dropped silently
