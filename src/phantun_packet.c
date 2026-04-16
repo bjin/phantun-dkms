@@ -113,21 +113,29 @@ int pht_parse_ipv4_tcp(struct sk_buff *skb, struct pht_l4_view *view) {
 }
 
 int pht_validate_ipv4_tcp_checksums(const struct sk_buff *skb, const struct pht_l4_view *view) {
-    unsigned int tcp_len;
+    unsigned int ip_tot_len, tcp_len;
     __wsum csum;
 
     if (!skb || !view || !view->iph || !view->tcp)
         return -EINVAL;
 
     /*
-     * Trust hardware/GRO validation (CHECKSUM_UNNECESSARY) or locally generated
-     * packets waiting for hardware TX checksumming (CHECKSUM_PARTIAL) to avoid
-     * falsely dropping them when manual checksum verification fails.
+     * Skip software TCP checksum verification if the stack/NIC has already
+     * validated the checksum for this packet.
+     *
+     * CHECKSUM_PARTIAL is accepted here only for plain outer IPv4/TCP packets,
+     * where the skb checksum state is known to refer to this TCP header.
      */
     if (skb_csum_unnecessary(skb) || skb->ip_summed == CHECKSUM_PARTIAL)
         return 0;
 
-    tcp_len = ntohs(view->iph->tot_len) - view->ip_hdr_len;
+    ip_tot_len = ntohs(view->iph->tot_len);
+    if (ip_tot_len < view->ip_hdr_len || ip_tot_len > skb->len) {
+        pht_stats_inc(PHT_STAT_BAD_CHECKSUM_DROPPED);
+        return -EBADMSG;
+    }
+
+    tcp_len = ip_tot_len - view->ip_hdr_len;
     csum = skb_checksum(skb, view->ip_hdr_len, tcp_len, 0);
     if (tcp_v4_check(tcp_len, view->iph->saddr, view->iph->daddr, csum)) {
         pht_stats_inc(PHT_STAT_BAD_CHECKSUM_DROPPED);
