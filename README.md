@@ -25,10 +25,6 @@ Main reasons:
 
 Short version: **same broad wire shape, different enough behavior that you should treat this as kernel-to-kernel only unless proven otherwise**.
 
-## Reference
-
-- Project: [dndx/phantun](https://github.com/dndx/phantun/)
-- README: [README.md](https://github.com/dndx/phantun/blob/master/README.md)
 
 ## If you know Phantun, here are the practical differences
 
@@ -294,6 +290,7 @@ cat /sys/module/phantun/stats/rst_sent
 ## Limits and current status
 
 - **IPv4 only** today.
+- Linux kernel compatibility: from `6.1` to `7.0`.
 - Mixed **Phantun** / **`phantun-dkms`** deployments are **untested** and should be treated as **likely non-seamless**.
 - **No FIN close state machine**.
 - This is a **kernel-to-kernel protocol variant** in practice, even though the basic packet shape stays close to Phantun.
