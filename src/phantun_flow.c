@@ -157,6 +157,10 @@ static void pht_flow_shutdown_retransmit_sync(struct pht_flow *flow) {
     if (!flow)
         return;
 
+    /* Callers mark the flow DEAD before teardown. That invariant blocks both
+     * pht_flow_arm_retransmit() and the callback's self-rearm path, so the
+     * old-kernel timer_delete_sync()-based compat wrapper is sufficient here.
+     */
     timer_shutdown_sync(&flow->retransmit_timer);
     spin_lock_bh(&flow->lock);
     if (flow->retransmit_armed) {

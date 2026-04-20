@@ -83,6 +83,98 @@ AS_IF([test "x$ac_cv_have_timer_container_of" = xyes], [
             [Define to 1 if timer_container_of is available])
 ])
 
+AC_CACHE_CHECK([for timer_shutdown_sync], [ac_cv_have_timer_shutdown_sync], [
+  conftest_dir="$ac_pwd/conftest-kbuild-$$"
+
+  rm -rf "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to remove $conftest_dir])
+  mkdir -p "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to create $conftest_dir])
+
+  trap 'rm -rf "$conftest_dir"' 0 1 2 15
+
+  cat >"$conftest_dir/Makefile" <<'EOF'
+obj-m := conftest.o
+EOF
+
+  cat >"$conftest_dir/conftest.c" <<'EOF'
+#include <linux/timer.h>
+#include <linux/module.h>
+
+static int conftest_timer_shutdown_sync(void)
+{
+    struct timer_list *timer = NULL;
+
+    return timer_shutdown_sync(timer);
+}
+
+module_init(conftest_timer_shutdown_sync);
+MODULE_LICENSE("GPL");
+EOF
+
+  if ${MAKE-make} -C "$KDIR" M="$conftest_dir" modules \
+      >"$conftest_dir/build.log" 2>&1; then
+    ac_cv_have_timer_shutdown_sync=yes
+  else
+    cat "$conftest_dir/build.log" >&5
+    ac_cv_have_timer_shutdown_sync=no
+  fi
+
+  rm -rf "$conftest_dir"
+  trap - 0 1 2 15
+])
+
+AS_IF([test "x$ac_cv_have_timer_shutdown_sync" = xyes], [
+  AC_DEFINE([HAVE_TIMER_SHUTDOWN_SYNC], [1],
+            [Define to 1 if timer_shutdown_sync is available])
+])
+
+AC_CACHE_CHECK([for timer_delete], [ac_cv_have_timer_delete], [
+  conftest_dir="$ac_pwd/conftest-kbuild-$$"
+
+  rm -rf "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to remove $conftest_dir])
+  mkdir -p "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to create $conftest_dir])
+
+  trap 'rm -rf "$conftest_dir"' 0 1 2 15
+
+  cat >"$conftest_dir/Makefile" <<'EOF'
+obj-m := conftest.o
+EOF
+
+  cat >"$conftest_dir/conftest.c" <<'EOF'
+#include <linux/timer.h>
+#include <linux/module.h>
+
+static int conftest_timer_delete(void)
+{
+    struct timer_list *timer = NULL;
+
+    return timer_delete(timer);
+}
+
+module_init(conftest_timer_delete);
+MODULE_LICENSE("GPL");
+EOF
+
+  if ${MAKE-make} -C "$KDIR" M="$conftest_dir" modules \
+      >"$conftest_dir/build.log" 2>&1; then
+    ac_cv_have_timer_delete=yes
+  else
+    cat "$conftest_dir/build.log" >&5
+    ac_cv_have_timer_delete=no
+  fi
+
+  rm -rf "$conftest_dir"
+  trap - 0 1 2 15
+])
+
+AS_IF([test "x$ac_cv_have_timer_delete" = xyes], [
+  AC_DEFINE([HAVE_TIMER_DELETE], [1],
+            [Define to 1 if timer_delete is available])
+])
+
 AS_IF([test "x$ac_cv_have_ip_route_input_dscp" = xyes], [
   AC_DEFINE(
     [HAVE_IP_ROUTE_INPUT_DSCP], [1],
