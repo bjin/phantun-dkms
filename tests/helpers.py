@@ -203,6 +203,10 @@ def require_guest_command(vm, command):
     return res.returncode == 0
 
 
+def kernel_has_base64_support(vm):
+    return vm.run("test -f /usr/lib/modules/$(uname -r)/build/include/linux/base64.h", check=False).returncode == 0
+
+
 def read_module_stat(vm, name):
     res = run_guest_python(
         vm,

@@ -186,9 +186,9 @@ Validation rules:
 |---|---|---|
 | Plain string | `HELLO` | Send bytes as-is |
 | Hex | `hex:deadbeef` | Decode remaining text as hex |
-| Base64 | `base64:YWJj` | Decode remaining text as Base64 |
+| Base64 | `base64:YWJj` | Decode remaining text as Base64 when the target kernel supports it |
 
-Invalid hex or Base64 is ignored safely, with a kernel log warning.
+Invalid hex is ignored safely. Invalid Base64, or Base64 on kernels without in-kernel Base64 support, is ignored safely with a kernel log warning.
 
 ## Common setups
 

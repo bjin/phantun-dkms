@@ -182,9 +182,6 @@ AS_IF([test "x$ac_cv_have_base64_decode_3args" = xyes], [
     [Define to 1 if base64_decode takes 3 arguments]
   )
 ])
-AS_IF([test "x$ac_cv_have_base64_decode_5args" = xno && test "x$ac_cv_have_base64_decode_3args" = xno], [
-  AC_MSG_ERROR([kernel does not have a supported base64_decode interface])
-])
 
 AC_CACHE_CHECK([for linux/hex.h], [ac_cv_have_linux_hex_h], [
   conftest_dir="$ac_pwd/conftest-kbuild-$$"

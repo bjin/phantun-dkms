@@ -1,3 +1,4 @@
+import base64
 import time
 
 import pytest
@@ -12,6 +13,7 @@ from helpers import (
     assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
+    kernel_has_base64_support,
     make_netns_tcp_payload_probe,
     parse_guest_json,
     require_guest_command,
@@ -22,6 +24,9 @@ from helpers import (
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
 REQ = "HSREQ42"
 RESP = "HSRESP42"
+
+REQ_BASE64 = "base64:" + base64.b64encode(REQ.encode()).decode()
+RESP_BASE64 = "base64:" + base64.b64encode(RESP.encode()).decode()
 
 
 def load_handshake_module(phantun_module, **kwargs):
@@ -104,11 +109,23 @@ def test_handshake_request_is_injected_and_hidden_from_udp_app(phantun_module, v
         cleanup_netns_topology(vm)
 
 
-def test_handshake_request_and_response_are_both_hidden_from_udp_apps(phantun_module, vm):
+@pytest.mark.parametrize(
+    ("request_param", "response_param"),
+    [
+        pytest.param(REQ, RESP, id="plain"),
+        pytest.param(REQ_BASE64, RESP_BASE64, id="base64"),
+    ],
+)
+def test_handshake_request_and_response_are_both_hidden_from_udp_apps(
+    phantun_module, vm, request_param, response_param
+):
+    if request_param.startswith("base64:") and not kernel_has_base64_support(vm):
+        pytest.skip("kernel lacks in-kernel base64 decode support")
+
     load_handshake_module(
         phantun_module,
-        handshake_request=REQ,
-        handshake_response=RESP,
+        handshake_request=request_param,
+        handshake_response=response_param,
     )
     ensure_netns_topology(vm)
 

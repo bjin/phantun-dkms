@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-#include <linux/base64.h>
 #include <linux/inet.h>
 #include <linux/inetdevice.h>
 #include <linux/init.h>
@@ -21,6 +20,9 @@
 #include <net/route.h>
 
 #include "phantun_compat.h" // IWYU pragma: keep
+#if PHANTUN_HAVE_BASE64_DECODE
+#include <linux/base64.h>
+#endif
 
 #ifdef HAVE_LINUX_HEX_H
 #include <linux/hex.h>
@@ -59,12 +61,14 @@ MODULE_PARM_DESC(managed_remote_peers, "Comma-separated remote IPv4:port peers m
 module_param(handshake_request, charp, 0444);
 MODULE_PARM_DESC(handshake_request,
                  "Optional initiator control payload sent as the first fake-TCP payload (plain "
-                 "string, or hex/base64 if prefixed with 'hex:'/'base64:')");
+                 "string, or hex/base64 if prefixed with 'hex:'/'base64:'; base64 requires kernel "
+                 "support)");
 module_param(handshake_response, charp, 0444);
 MODULE_PARM_DESC(
     handshake_response,
     "Optional responder control payload sent as the first fake-TCP payload when handshake_request "
-    "is also set (plain string, or hex/base64 if prefixed with 'hex:'/'base64:')");
+    "is also set (plain string, or hex/base64 if prefixed with 'hex:'/'base64:'; base64 requires "
+    "kernel support)");
 module_param(handshake_timeout_ms, uint, 0444);
 MODULE_PARM_DESC(handshake_timeout_ms, "Handshake retransmit timeout in milliseconds");
 module_param(handshake_retries, uint, 0444);
@@ -1646,6 +1650,7 @@ static int phantun_validate_config(void) {
     return 0;
 }
 
+#if PHANTUN_HAVE_BASE64_DECODE
 static int phantun_base64_decode(const char *src, size_t srclen, u8 **out_dst,
                                  unsigned int *out_len) {
     u8 *dst;
@@ -1669,10 +1674,10 @@ static int phantun_base64_decode(const char *src, size_t srclen, u8 **out_dst,
     *out_len = decoded_len;
     return 0;
 }
+#endif
 
 static int phantun_parse_payload_param(const char *raw_str, void **out_buf, unsigned int *out_len) {
     size_t len;
-    int ret;
 
     *out_buf = NULL;
     *out_len = 0;
@@ -1688,6 +1693,11 @@ static int phantun_parse_payload_param(const char *raw_str, void **out_buf, unsi
         if (len == 0)
             return 0;
 
+#if !PHANTUN_HAVE_BASE64_DECODE
+        pht_pr_warn("base64 parameter is unsupported by this kernel, ignoring\n");
+        return 0;
+#else
+        int ret;
         ret = phantun_base64_decode(raw_str, len, (u8 **)out_buf, out_len);
         if (ret == -ENOMEM)
             return -ENOMEM;
@@ -1697,6 +1707,7 @@ static int phantun_parse_payload_param(const char *raw_str, void **out_buf, unsi
             *out_len = 0;
         }
         return 0;
+#endif
     }
 
     if (len >= 4 && strncmp(raw_str, "hex:", 4) == 0) {

@@ -10,12 +10,14 @@
 #endif
 
 #if defined(HAVE_BASE64_DECODE_5ARGS)
+#define PHANTUN_HAVE_BASE64_DECODE 1
 #define BASE64_DECODE_COMPAT(src, srclen, dst)                                                     \
     base64_decode((src), (srclen), (dst), true, BASE64_STD)
 #elif defined(HAVE_BASE64_DECODE_3ARGS)
+#define PHANTUN_HAVE_BASE64_DECODE 1
 #define BASE64_DECODE_COMPAT(src, srclen, dst) base64_decode((src), (srclen), (dst))
 #else
-#error "kernel doesn't support base64_decode()"
+#define PHANTUN_HAVE_BASE64_DECODE 0
 #endif
 
 #endif

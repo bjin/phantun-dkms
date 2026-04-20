@@ -1,5 +1,7 @@
 import pytest
 
+from helpers import kernel_has_base64_support
+
 
 def assert_modprobe_rejected(result, context):
     if result.returncode == 0:
@@ -29,6 +31,26 @@ def test_module_load_success(phantun_module, dmesg, vm):
         pytest.fail("phantun module is not loaded in lsmod")
     if not dmesg.wait_for(f"phantun {phantun_module.version} loaded", timeout=5):
         pytest.fail("Module did not log successful module initialization")
+    if not dmesg.wait_for("registered IPv4 LOCAL_OUT/PRE_ROUTING hooks", timeout=5):
+        pytest.fail("Module did not log successful netfilter hook registration")
+
+
+def test_module_load_ignores_base64_prefix_without_kernel_support(phantun_module, dmesg, vm):
+    if kernel_has_base64_support(vm):
+        pytest.skip("kernel provides in-kernel base64 decode support")
+
+    dmesg.clear()
+    phantun_module.load(
+        managed_local_ports="1234",
+        handshake_request="base64:YWJj",
+        handshake_response="base64:ZGVm",
+    )
+
+    res = vm.run(["lsmod"])
+    if "phantun" not in res.stdout:
+        pytest.fail("phantun module is not loaded in lsmod")
+    if not dmesg.wait_for("base64 parameter is unsupported by this kernel, ignoring", timeout=5):
+        pytest.fail("Module did not warn that base64-prefixed handshake payloads are unsupported")
     if not dmesg.wait_for("registered IPv4 LOCAL_OUT/PRE_ROUTING hooks", timeout=5):
         pytest.fail("Module did not log successful netfilter hook registration")
 
