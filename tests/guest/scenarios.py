@@ -1,8 +1,10 @@
 import json
 import select
+import signal
 import socket
 import struct
 import sys
+import time
 from pathlib import Path
 
 TIMEOUT_SEC = 5
@@ -248,6 +250,63 @@ def delayed_send(config):
         )
 
     _emit({"sent": config["payload"]})
+
+
+def _tcp_listener(bind_addr, bind_port, backlog=1):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind((bind_addr, bind_port))
+    sock.listen(backlog)
+    return sock
+
+
+def hold_tcp_listener(config):
+    ready_file = config.get("ready_file")
+    stop_file = config.get("stop_file")
+    stopped = False
+
+    with _tcp_listener(config["bind_addr"], config["bind_port"], config.get("backlog", 1)) as sock:
+        if ready_file:
+            Path(ready_file).write_text("ready")
+        try:
+            _emit(
+                {
+                    "ok": True,
+                    "errno": 0,
+                    "sockname": [sock.getsockname()[0], sock.getsockname()[1]],
+                }
+            )
+
+            def _stop(_signum, _frame):
+                nonlocal stopped
+
+                stopped = True
+
+            signal.signal(signal.SIGTERM, _stop)
+            signal.signal(signal.SIGINT, _stop)
+
+            while not stopped:
+                if stop_file and Path(stop_file).exists():
+                    break
+                time.sleep(0.1)
+        finally:
+            if ready_file:
+                Path(ready_file).unlink(missing_ok=True)
+            if stop_file:
+                Path(stop_file).unlink(missing_ok=True)
+
+
+def tcp_bind_listen(config):
+    try:
+        with _tcp_listener(config["bind_addr"], config["bind_port"], config.get("backlog", 1)) as sock:
+            _emit(
+                {
+                    "ok": True,
+                    "errno": 0,
+                    "sockname": [sock.getsockname()[0], sock.getsockname()[1]],
+                }
+            )
+    except OSError as exc:
+        _emit({"ok": False, "errno": exc.errno, "error": str(exc)})
 
 
 def _checksum(data):
@@ -562,6 +621,8 @@ SCENARIOS = {
     "send_many": send_many,
     "delayed_send": delayed_send,
     "simultaneous_exchange": simultaneous_exchange,
+    "hold_tcp_listener": hold_tcp_listener,
+    "tcp_bind_listen": tcp_bind_listen,
     "send_tcp_packet": send_tcp_packet,
     "send_l2_tcp_packet": send_l2_tcp_packet,
     "capture_tcp_packet": capture_tcp_packet,

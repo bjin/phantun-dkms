@@ -5,6 +5,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/net.h>
 #include <linux/net_namespace.h>
 #include <linux/netdevice.h>
 #include <linux/netfilter.h>
@@ -13,6 +14,7 @@
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/workqueue.h>
 
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_core.h>
@@ -95,6 +97,11 @@ static struct notifier_block phantun_inetaddr_nb;
 struct phantun_net {
     struct pht_flow_table flows;
     struct notifier_block netdev_nb;
+    /* Local-only mode reserves TCP listener ports per netns so later real TCP
+     * binds fail loudly instead of being intercepted silently by PRE_ROUTING.
+     */
+    struct work_struct tcp_reservation_work;
+    struct socket *tcp_reservation_socks[PHANTUN_MAX_MANAGED_PORTS];
 };
 
 static unsigned int phantun_netns_id(const struct net *net) { return net ? net->ns.inum : 0; }
@@ -259,6 +266,136 @@ static bool phantun_remote_peer_allowed(__be32 addr, __be16 port) {
 static bool phantun_selectors_allow(__be16 local_port, __be32 remote_addr, __be16 remote_port) {
     return phantun_local_port_allowed(local_port) &&
            phantun_remote_peer_allowed(remote_addr, remote_port);
+}
+
+static bool phantun_needs_tcp_reservations(void) {
+    return phantun_cfg.managed_local_ports_count && !phantun_cfg.managed_remote_peers_count;
+}
+
+static int phantun_managed_local_port_index(__be16 port) {
+    unsigned int i;
+
+    for (i = 0; i < phantun_cfg.managed_local_ports_count; i++) {
+        if (phantun_cfg.managed_local_ports[i] == ntohs(port))
+            return (int)i;
+    }
+
+    return -1;
+}
+
+/* Duplicate managed_local_ports entries are semantically redundant. Reserve only
+ * the first occurrence so best-effort socket ownership stays 1:1 with the real
+ * TCP bind table.
+ */
+static bool phantun_managed_local_port_is_primary(unsigned int idx) {
+    if (idx >= phantun_cfg.managed_local_ports_count)
+        return false;
+
+    return phantun_managed_local_port_index(htons((u16)phantun_cfg.managed_local_ports[idx])) ==
+           (int)idx;
+}
+
+static int phantun_reserve_tcp_port(struct phantun_net *pnet, struct net *net, unsigned int idx,
+                                    bool retry) {
+    struct sockaddr_in addr;
+    struct socket *sock;
+    unsigned int port;
+    int ret;
+
+    if (!pnet || !net || !phantun_needs_tcp_reservations() ||
+        idx >= phantun_cfg.managed_local_ports_count || !phantun_managed_local_port_is_primary(idx))
+        return -EINVAL;
+
+    if (READ_ONCE(pnet->tcp_reservation_socks[idx]))
+        return 0;
+
+    port = phantun_cfg.managed_local_ports[idx];
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((u16)port);
+
+    ret = sock_create_kern(net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
+    if (ret)
+        goto fail;
+
+    ret = kernel_bind(sock, (struct sockaddr_unsized *)&addr, sizeof(addr));
+    if (ret)
+        goto release_sock;
+
+    /* A bound TCP socket is enough to reserve the port against later binds.
+     * Keep it out of LISTEN so loopback clients still see a refused port
+     * rather than a real passive endpoint.
+     */
+
+    WRITE_ONCE(pnet->tcp_reservation_socks[idx], sock);
+    if (retry)
+        pht_pr_info("best-effort TCP reservation succeeded for managed local port %u in netns %u "
+                    "after earlier failure\n",
+                    port, phantun_netns_id(net));
+    return 0;
+
+release_sock:
+    sock_release(sock);
+fail:
+    if (retry)
+        pht_pr_warn_rl(
+            "best-effort TCP reservation retry failed for managed local port %u in netns %u: %d; "
+            "phantun will keep intercepting anyway and non-phantun TCP on this port may still "
+            "break until the port becomes free or configuration changes\n",
+            port, phantun_netns_id(net), ret);
+    else
+        pht_pr_warn("best-effort TCP reservation failed for managed local port %u in netns %u: %d; "
+                    "phantun will keep intercepting anyway and non-phantun TCP on this port may "
+                    "still break until the port becomes free or configuration changes\n",
+                    port, phantun_netns_id(net), ret);
+    return ret;
+}
+
+static void phantun_release_tcp_port(struct phantun_net *pnet, unsigned int idx) {
+    struct socket *sock;
+
+    if (!pnet || idx >= PHANTUN_MAX_MANAGED_PORTS)
+        return;
+
+    sock = READ_ONCE(pnet->tcp_reservation_socks[idx]);
+    if (!sock)
+        return;
+
+    WRITE_ONCE(pnet->tcp_reservation_socks[idx], NULL);
+    sock_release(sock);
+}
+
+static void phantun_release_all_tcp_ports(struct phantun_net *pnet) {
+    unsigned int i;
+
+    if (!pnet)
+        return;
+
+    for (i = 0; i < PHANTUN_MAX_MANAGED_PORTS; i++)
+        phantun_release_tcp_port(pnet, i);
+}
+
+static void phantun_retry_tcp_reservations_work(struct work_struct *work) {
+    struct phantun_net *pnet = container_of(work, struct phantun_net, tcp_reservation_work);
+    struct net *net = pnet->flows.net;
+    unsigned int i;
+
+    if (!net || !phantun_needs_tcp_reservations())
+        return;
+
+    for (i = 0; i < phantun_cfg.managed_local_ports_count; i++) {
+        if (!phantun_managed_local_port_is_primary(i) || READ_ONCE(pnet->tcp_reservation_socks[i]))
+            continue;
+
+        phantun_reserve_tcp_port(pnet, net, i, true);
+    }
+}
+
+static void phantun_queue_tcp_reservation_retry(struct phantun_net *pnet) {
+    if (!pnet || !phantun_needs_tcp_reservations())
+        return;
+
+    queue_work(system_wq, &pnet->tcp_reservation_work);
 }
 
 static void phantun_fill_udp_endpoint_pair(const struct pht_l4_view *view,
@@ -774,6 +911,7 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
                                       const struct nf_hook_state *state) {
     struct pht_l4_view view;
     struct pht_ipv4_endpoint_pair ep;
+    struct phantun_net *pnet;
     struct pht_flow_table *flows;
     struct pht_flow *flow;
     struct pht_flow *new_flow;
@@ -781,15 +919,18 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
     u32 init_seq;
     u32 prev_seq = 0;
     bool has_prev_seq = false;
+    int reservation_idx = -1;
     int ret;
     bool queued;
 
-    if (!state || !skb)
+    if (!state || !skb || !state->net)
         return NF_ACCEPT;
 
-    flows = phantun_net_flows(state->net);
-    if (!flows)
+    pnet = net_generic(state->net, phantun_net_id);
+    if (!pnet)
         return NF_ACCEPT;
+
+    flows = &pnet->flows;
 
     ret = pht_parse_ipv4_udp(skb, &view);
     if (ret)
@@ -809,6 +950,9 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
     }
 
     phantun_fill_udp_endpoint_pair(&view, &ep);
+
+    if (phantun_needs_tcp_reservations())
+        reservation_idx = phantun_managed_local_port_index(view.udp->source);
 
 retry_lookup:
     flow = pht_flow_lookup_oriented(flows, &ep);
@@ -873,6 +1017,15 @@ retry_lookup:
         pht_flow_put(flow);
         kfree_skb(skb);
         return NF_STOLEN;
+    }
+
+    if (reservation_idx >= 0 && !READ_ONCE(pnet->tcp_reservation_socks[reservation_idx])) {
+        pht_pr_warn_rl(
+            "managed local TCP port %u is still unreserved in netns %u; queueing best-effort retry "
+            "while phantun keeps intercepting and non-phantun TCP on this port may still break "
+            "until the port becomes free or configuration changes\n",
+            phantun_cfg.managed_local_ports[reservation_idx], phantun_netns_id(state->net));
+        phantun_queue_tcp_reservation_retry(pnet);
     }
 
     new_flow = pht_flow_create(flows, &ep, PHT_FLOW_ROLE_INITIATOR, PHT_FLOW_STATE_SYN_SENT);
@@ -1532,6 +1685,7 @@ static struct nf_hook_ops phantun_nf_ops[] = {
 static int __net_init phantun_net_init(struct net *net) {
     struct phantun_net *pnet = net_generic(net, phantun_net_id);
     struct pht_flow_table *flows;
+    unsigned int i;
     int ret;
 
     if (!pnet)
@@ -1544,18 +1698,32 @@ static int __net_init phantun_net_init(struct net *net) {
         return ret;
     }
 
+    INIT_WORK(&pnet->tcp_reservation_work, phantun_retry_tcp_reservations_work);
+
     pnet->netdev_nb.notifier_call = phantun_netdev_event;
     ret = register_netdevice_notifier_net(net, &pnet->netdev_nb);
     if (ret) {
         pht_pr_err("failed to register netdevice notifier: %d\n", ret);
+        cancel_work_sync(&pnet->tcp_reservation_work);
         pht_flow_table_destroy(flows);
         return ret;
+    }
+
+    if (phantun_needs_tcp_reservations()) {
+        for (i = 0; i < phantun_cfg.managed_local_ports_count; i++) {
+            if (!phantun_managed_local_port_is_primary(i))
+                continue;
+
+            phantun_reserve_tcp_port(pnet, net, i, false);
+        }
     }
 
     ret = nf_register_net_hooks(net, phantun_nf_ops, ARRAY_SIZE(phantun_nf_ops));
     if (ret) {
         pht_pr_err("failed to register netfilter hooks: %d\n", ret);
         unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
+        cancel_work_sync(&pnet->tcp_reservation_work);
+        phantun_release_all_tcp_ports(pnet);
         pht_flow_table_destroy(flows);
         return ret;
     }
@@ -1575,6 +1743,8 @@ static void __net_exit phantun_net_exit(struct net *net) {
     flows = &pnet->flows;
     nf_unregister_net_hooks(net, phantun_nf_ops, ARRAY_SIZE(phantun_nf_ops));
     unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
+    cancel_work_sync(&pnet->tcp_reservation_work);
+    phantun_release_all_tcp_ports(pnet);
     pht_flow_table_destroy(flows);
     pht_pr_info("unregistered netfilter hooks and topology notifiers: netns %u\n",
                 phantun_netns_id(net));

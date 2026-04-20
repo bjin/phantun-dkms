@@ -140,14 +140,20 @@ Rules:
 - If you configure **both**, **both must match**.
 - Selector ownership applies only to **non-loopback** traffic.
 - Raw inbound UDP that matches the selectors is dropped on **non-loopback ingress** so traffic is not delivered both as raw UDP and translated UDP.
+- In **local-only** mode (`managed_local_ports` set, `managed_remote_peers` empty), the module also makes a **best-effort per-netns kernel TCP reservation** for each managed port.
+- That reservation is only a defensive ownership guard. It does **not** turn fake TCP into a real TCP service endpoint; selector-based interception is still the data plane.
+- If reservation fails at init time, the module only warns and keeps intercepting. That means unrelated real TCP on that port may still break until reservation later succeeds or the configuration changes.
+- Reservation retries happen asynchronously from later matching `LOCAL_OUT` traffic in the same netns.
+- The reservation binds `0.0.0.0:port`, so it also blocks loopback-only TCP binds such as `127.0.0.1:port` in that netns.
+- **Peer-only** and **intersection** modes keep pure selector semantics; they do **not** broadly reserve TCP ports.
 
 ### Selector modes
 
 | Mode | What you set | Tradeoff |
 |---|---|---|
-| **Local-only** | `managed_local_ports` | Easiest and closest to Phantun's **server-side selector model**: own traffic by local service port. |
+| **Local-only** | `managed_local_ports` | Easiest and closest to Phantun's **server-side selector model**. Also adds the best-effort per-netns TCP reservation guard described above. |
 | **Peer-only** | `managed_remote_peers` | Closest to Phantun's **client-side selector model**: own traffic by chosen remote peer. Inbound TCP ownership becomes broad for that remote `IPv4:port`, so use only when that peer is dedicated to this translator. |
-| **Intersection** | Both | Most explicit and usually safest. |
+| **Intersection** | Both | Most explicit and usually safest. Keeps selector matching on both sides without the local-only broad TCP reservation guard. |
 
 ## Everyday parameters
 

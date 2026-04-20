@@ -27,7 +27,7 @@ For installation, everyday configuration, examples, stats, MTU guidance, and ope
 - user-space Phantun interoperability guarantees
 - eBPF as the primary implementation
 - xtables target as the core data plane
-- real kernel TCP listener/socket ownership
+- presenting fake TCP as a real kernel TCP service endpoint
 
 ## 2. Core protocol contract
 
@@ -127,12 +127,21 @@ Constraints:
 - outbound UDP routed to loopback stays UDP
 - inbound fake TCP arriving on loopback is ignored by the module
 - raw inbound UDP arriving on loopback is not subject to selector-owned drop
+- **local-only** mode (`managed_local_ports` set, `managed_remote_peers` empty) additionally attempts best-effort kernel TCP reservation sockets for those managed ports in the current netns at init time
+- reservation is a defensive ownership guard only: selector-based interception still owns the data plane, and the module still does **not** present fake TCP as a normal TCP service
+- reservation failure is warning-only; interception continues, and later matching `LOCAL_OUT` traffic in the same netns triggers asynchronous retry
+- reservation binds `0.0.0.0:port`, so loopback-only TCP binds on that port in the same netns are blocked too
+
+Peer-only and intersection boundaries:
+
+- peer-only mode keeps selector semantics only; inbound TCP ownership becomes broad for that remote `IPv4:port`
+- intersection mode keeps selector semantics only; both selectors must still match
+- neither peer-only nor intersection mode broadly reserves local TCP ports
 
 Peer-only caveat:
 
 - inbound TCP ownership becomes broad for that remote `IPv4:port`
 - use peer-only mode only when that remote peer is dedicated to this translator
-
 ### 4.3 Default inbound raw-UDP drop
 
 By default, raw inbound UDP that matches configured selectors, is destined for local delivery in the current host/netns, and arrives from a non-loopback device is dropped in `PRE_ROUTING`.
@@ -469,9 +478,11 @@ Future control plane direction:
 
 Translation, state ownership, timers, reinjection, and protocol semantics belong in a real module, not in a target callback abstraction built mainly for policy plumbing.
 
-### Selector-based interception, not fake TCP listener sockets
+### Selector-based interception first; local-only reservation sockets are guard rails
 
-This design works with existing UDP applications directly, supports local-port and exact-peer ownership, and does not lie to the kernel by pretending fake TCP is normal TCP.
+Selector matching remains the ownership and translation mechanism. In local-only mode only, the module first attempts best-effort per-netns kernel TCP reservation sockets on `0.0.0.0:managed_local_port` to reduce accidental conflicts with real TCP listeners.
+
+Those sockets are defensive ownership guards, not fake-TCP data-plane endpoints. If reservation fails, the module warns, keeps intercepting, and retries later from matching `LOCAL_OUT` traffic. Peer-only and intersection modes do not allocate those broad reservation sockets.
 
 ### One queued UDP skb per half-open flow
 

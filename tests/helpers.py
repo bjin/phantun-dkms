@@ -102,6 +102,10 @@ def assert_completed(result, label):
         pytest.fail(f"{label} failed: {result.stderr!r}")
 
 
+def run_guest_scenario(vm, scenario, config, check=True, **kwargs):
+    return vm.run(["python3", GUEST_SCENARIOS, scenario, json.dumps(config)], check=check, **kwargs)
+
+
 def run_guest_python(vm, script, check=True):
     body = textwrap.dedent(script).strip()
     command = f"python3 - <<'PY'\n{body}\nPY"
@@ -136,6 +140,10 @@ def spawn_guest_command(vm, cmd, **kwargs):
         **kwargs,
     )
     return GuestProcess(proc)
+
+
+def spawn_guest_scenario(vm, scenario, config, **kwargs):
+    return spawn_guest_command(vm, ["python3", GUEST_SCENARIOS, scenario, json.dumps(config)], **kwargs)
 
 
 def run_netns_scenario(vm, namespace, scenario, config, check=True, **kwargs):
@@ -176,6 +184,23 @@ def wait_for_guest_condition(vm, cmd, timeout, description, interval=0.1):
 
 def wait_for_guest_ready_file(vm, path, timeout=5):
     wait_for_guest_condition(vm, ["test", "-e", path], timeout, f"guest readiness file {path!r}")
+
+
+def spawn_ready_guest_scenario(vm, scenario, config, timeout=5, **kwargs):
+    ready_file = f"/tmp/phantun-ready-{uuid.uuid4().hex}"
+    proc = spawn_guest_scenario(vm, scenario, {**config, "ready_file": ready_file}, **kwargs)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if vm.run(["test", "-e", ready_file], check=False).returncode == 0:
+            return proc
+        if proc.proc.poll() is not None:
+            result = proc.communicate(timeout=1)
+            pytest.fail(
+                f"guest scenario {scenario!r} exited before becoming ready: "
+                f"stdout={result.stdout!r}, stderr={result.stderr!r}"
+            )
+        time.sleep(0.1)
+    pytest.fail(f"guest scenario {scenario!r} did not become ready within {timeout}s")
 
 
 def spawn_ready_capture(vm, namespace, config):

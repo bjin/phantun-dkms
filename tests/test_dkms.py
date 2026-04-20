@@ -1,6 +1,6 @@
 import pytest
 
-from helpers import kernel_has_base64_support
+from helpers import kernel_has_base64_support, spawn_ready_guest_scenario
 
 
 def assert_modprobe_rejected(result, context):
@@ -53,6 +53,35 @@ def test_module_load_ignores_base64_prefix_without_kernel_support(phantun_module
         pytest.fail("Module did not warn that base64-prefixed handshake payloads are unsupported")
     if not dmesg.wait_for("registered IPv4 LOCAL_OUT/PRE_ROUTING hooks", timeout=5):
         pytest.fail("Module did not log successful netfilter hook registration")
+
+
+def test_module_load_warns_when_init_netns_tcp_reservation_is_busy(phantun_module, dmesg, vm):
+    phantun_module.unload()
+    managed_port = 1234
+    holder_stop = "/tmp/phantun-hold-init-stop"
+    holder = spawn_ready_guest_scenario(
+        vm,
+        "hold_tcp_listener",
+        {"bind_addr": "0.0.0.0", "bind_port": managed_port, "stop_file": holder_stop},
+        timeout=5,
+    )
+    try:
+        dmesg.clear()
+        phantun_module.load(managed_local_ports=str(managed_port))
+
+        res = vm.run(["lsmod"])
+        if "phantun" not in res.stdout:
+            pytest.fail("phantun module should still load when TCP reservation is occupied")
+        if not dmesg.wait_for(f"best-effort TCP reservation failed for managed local port {managed_port}", timeout=5):
+            pytest.fail("Module did not warn about the occupied managed TCP port during load")
+        if not dmesg.wait_for("registered IPv4 LOCAL_OUT/PRE_ROUTING hooks", timeout=5):
+            pytest.fail("Module did not log successful netfilter hook registration")
+    finally:
+        if holder.proc.poll() is None:
+            vm.run(["touch", holder_stop])
+            holder_result = holder.communicate(timeout=5)
+            if holder_result.returncode != 0:
+                pytest.fail(f"TCP listener holder did not exit cleanly: {holder_result.stderr!r}")
 
 
 def test_module_unload_success(phantun_module, dmesg, vm):

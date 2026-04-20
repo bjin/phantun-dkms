@@ -1,11 +1,11 @@
-import json
+import errno
 import subprocess
 import time
+import uuid
 
 import pytest
 
 from helpers import (
-    GUEST_SCENARIOS,
     MODULE_STAT_NAMES,
     NS_A,
     NS_ADDR_A,
@@ -20,9 +20,11 @@ from helpers import (
     parse_guest_json,
     probe_comment,
     read_module_stats,
+    run_guest_scenario,
     run_netns_scenario,
-    spawn_guest_command,
+    spawn_guest_scenario,
     spawn_netns_scenario,
+    wait_for_guest_ready_file,
 )
 
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
@@ -30,12 +32,16 @@ REQ = "HSREQ42"
 RESP = "HSRESP42"
 
 
-def run_guest_scenario(vm, scenario, config, check=True, **kwargs):
-    return vm.run(["python3", GUEST_SCENARIOS, scenario, json.dumps(config)], check=check, **kwargs)
-
-
-def spawn_guest_scenario(vm, scenario, config, **kwargs):
-    return spawn_guest_command(vm, ["python3", GUEST_SCENARIOS, scenario, json.dumps(config)], **kwargs)
+def assert_tcp_bind_listen(result, expected_ok, context, expected_errno=None):
+    data = parse_guest_json(result.stdout, f"{context} stdout")
+    if data.get("ok") is not expected_ok:
+        pytest.fail(f"{context} returned unexpected result: {data!r}")
+    if expected_ok:
+        if data.get("errno") != 0:
+            pytest.fail(f"{context} unexpectedly reported errno {data.get('errno')}: {data!r}")
+    elif data.get("errno") != expected_errno:
+        pytest.fail(f"{context} expected errno {expected_errno}, got {data.get('errno')}: {data!r}")
+    return data
 
 
 def test_sysfs_stats_exist_and_increment(phantun_module, vm):
@@ -294,6 +300,232 @@ def test_peer_only_mode_translates_matching_peers(phantun_module, vm):
     finally:
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_local_only_mode_reserves_managed_tcp_port_in_init_and_new_netns(phantun_module, vm):
+    managed_port = PORTS_A[0]
+    phantun_module.load(managed_local_ports=str(managed_port))
+
+    init_probe = run_guest_scenario(
+        vm,
+        "tcp_bind_listen",
+        {"bind_addr": "0.0.0.0", "bind_port": managed_port},
+    )
+    assert_tcp_bind_listen(init_probe, False, "init-netns TCP wildcard bind probe", expected_errno=errno.EADDRINUSE)
+
+    ensure_netns_topology(vm)
+    try:
+        wildcard_probe = run_netns_scenario(
+            vm,
+            NS_A,
+            "tcp_bind_listen",
+            {"bind_addr": "0.0.0.0", "bind_port": managed_port},
+        )
+        assert_tcp_bind_listen(
+            wildcard_probe,
+            False,
+            "new-netns TCP wildcard bind probe",
+            expected_errno=errno.EADDRINUSE,
+        )
+
+        netns_probe = run_netns_scenario(
+            vm,
+            NS_A,
+            "tcp_bind_listen",
+            {"bind_addr": NS_ADDR_A, "bind_port": managed_port},
+        )
+        assert_tcp_bind_listen(
+            netns_probe,
+            False,
+            "new-netns TCP specific-address bind probe",
+            expected_errno=errno.EADDRINUSE,
+        )
+
+        loopback_probe = run_netns_scenario(
+            vm,
+            NS_A,
+            "tcp_bind_listen",
+            {"bind_addr": "127.0.0.1", "bind_port": managed_port},
+        )
+        assert_tcp_bind_listen(
+            loopback_probe,
+            False,
+            "new-netns TCP loopback bind probe",
+            expected_errno=errno.EADDRINUSE,
+        )
+    finally:
+        cleanup_netns_topology(vm)
+
+
+def test_intersection_mode_does_not_reserve_managed_tcp_port(phantun_module, vm):
+    managed_port = PORTS_A[0]
+    phantun_module.load(
+        managed_local_ports=str(managed_port),
+        managed_remote_peers=f"{NS_ADDR_B}:{PORTS_B[0]}",
+    )
+
+    init_probe = run_guest_scenario(
+        vm,
+        "tcp_bind_listen",
+        {"bind_addr": "0.0.0.0", "bind_port": managed_port},
+    )
+    assert_tcp_bind_listen(init_probe, True, "intersection init-netns TCP wildcard bind probe")
+
+    ensure_netns_topology(vm)
+    try:
+        wildcard_probe = run_netns_scenario(
+            vm,
+            NS_A,
+            "tcp_bind_listen",
+            {"bind_addr": "0.0.0.0", "bind_port": managed_port},
+        )
+        assert_tcp_bind_listen(
+            wildcard_probe,
+            True,
+            "intersection new-netns TCP wildcard bind probe",
+        )
+
+        netns_probe = run_netns_scenario(
+            vm,
+            NS_A,
+            "tcp_bind_listen",
+            {"bind_addr": NS_ADDR_A, "bind_port": managed_port},
+        )
+        assert_tcp_bind_listen(
+            netns_probe,
+            True,
+            "intersection new-netns TCP specific-address bind probe",
+        )
+
+        loopback_probe = run_netns_scenario(
+            vm,
+            NS_A,
+            "tcp_bind_listen",
+            {"bind_addr": "127.0.0.1", "bind_port": managed_port},
+        )
+        assert_tcp_bind_listen(
+            loopback_probe,
+            True,
+            "intersection new-netns TCP loopback bind probe",
+        )
+    finally:
+        cleanup_netns_topology(vm)
+
+
+def test_local_only_retry_reserves_port_after_netns_conflict_clears(phantun_module, dmesg, vm):
+    managed_port = PORTS_A[0]
+    first_dst_port = PORTS_B[0]
+    second_dst_port = PORTS_B[1]
+    holder_ready = f"/tmp/phantun-hold-{uuid.uuid4().hex}"
+    holder_stop = f"/tmp/phantun-hold-stop-{uuid.uuid4().hex}"
+
+    ensure_netns_topology(vm)
+    holder = spawn_netns_scenario(
+        vm,
+        NS_A,
+        "hold_tcp_listener",
+        {
+            "bind_addr": "0.0.0.0",
+            "bind_port": managed_port,
+            "ready_file": holder_ready,
+            "stop_file": holder_stop,
+        },
+    )
+    wait_for_guest_ready_file(vm, holder_ready, timeout=5)
+
+    try:
+        dmesg.clear()
+        phantun_module.load(managed_local_ports=str(managed_port))
+        if not dmesg.wait_for(f"best-effort TCP reservation failed for managed local port {managed_port}", timeout=5):
+            pytest.fail("module load did not warn about the occupied managed TCP port in the attached netns")
+
+        time.sleep(0.2)
+        first = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": managed_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": first_dst_port,
+                "payloads": ["retry-before-free"],
+            },
+        )
+        assert_completed(first, "retry trigger before release")
+        if not dmesg.wait_for(f"managed local TCP port {managed_port} is still unreserved", timeout=5):
+            pytest.fail("local-only flow creation did not queue a retry for the unreserved netns port")
+        if not dmesg.wait_for(
+            f"best-effort TCP reservation retry failed for managed local port {managed_port}", timeout=5
+        ):
+            pytest.fail("retry while the conflicting listener was still active did not log failure")
+
+        vm.run(["touch", holder_stop])
+        holder_result = holder.communicate(timeout=5)
+        if holder_result.returncode != 0:
+            pytest.fail(f"TCP listener holder did not exit cleanly: {holder_result.stderr!r}")
+
+        second = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": managed_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": second_dst_port,
+                "payloads": ["retry-after-free"],
+            },
+        )
+        assert_completed(second, "retry trigger after release")
+        if not dmesg.wait_for(
+            f"best-effort TCP reservation succeeded for managed local port {managed_port}", timeout=5
+        ):
+            pytest.fail("retry after freeing the conflicting listener did not log success")
+
+        wildcard_probe = run_netns_scenario(
+            vm,
+            NS_A,
+            "tcp_bind_listen",
+            {"bind_addr": "0.0.0.0", "bind_port": managed_port},
+        )
+        assert_tcp_bind_listen(
+            wildcard_probe,
+            False,
+            "post-retry TCP wildcard bind probe",
+            expected_errno=errno.EADDRINUSE,
+        )
+
+        reserved_probe = run_netns_scenario(
+            vm,
+            NS_A,
+            "tcp_bind_listen",
+            {"bind_addr": NS_ADDR_A, "bind_port": managed_port},
+        )
+        assert_tcp_bind_listen(
+            reserved_probe,
+            False,
+            "post-retry TCP specific-address bind probe",
+            expected_errno=errno.EADDRINUSE,
+        )
+
+        loopback_probe = run_netns_scenario(
+            vm,
+            NS_A,
+            "tcp_bind_listen",
+            {"bind_addr": "127.0.0.1", "bind_port": managed_port},
+        )
+        assert_tcp_bind_listen(
+            loopback_probe,
+            False,
+            "post-retry TCP loopback bind probe",
+            expected_errno=errno.EADDRINUSE,
+        )
+    finally:
+        if holder.proc.poll() is None:
+            vm.run(["touch", holder_stop])
+            holder.communicate(timeout=5)
         cleanup_netns_topology(vm)
 
 
