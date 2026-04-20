@@ -1,3 +1,4 @@
+import hashlib
 import pytest
 import subprocess
 import time
@@ -113,15 +114,30 @@ class VM:
 
         vng_log_path = self.session_log_dir / "vng.log"
         self.vng_log = open(vng_log_path, "w")
+        # Keep virtme-ng and OpenSSH socket paths short even when TMPDIR points
+        # at a long nested CI work directory.
+        runtime_tmpdir = Path(os.environ.get("TMPDIR", "/tmp"))
+        if len(str(runtime_tmpdir / "virtme-ng-sock")) > 80:
+            runtime_tmpdir = Path("/tmp")
+
+        runtime_env = os.environ.copy()
+        runtime_env["TMPDIR"] = str(runtime_tmpdir)
+
         self.proc = subprocess.Popen(
             cmd,
             stdout=self.vng_log,
             stderr=subprocess.STDOUT,
             preexec_fn=os.setsid,
+            env=runtime_env,
         )
 
         # Get SSH cmd
-        res = subprocess.run(["vng", "--ssh-client", "--dry-run"], capture_output=True, text=True)
+        res = subprocess.run(
+            ["vng", "--ssh-client", "--dry-run"],
+            capture_output=True,
+            text=True,
+            env=runtime_env,
+        )
         if res.returncode != 0:
             raise Exception(f"Failed to get ssh client command: {res.stderr}")
         full_ssh_cmd = shlex.split(res.stdout.strip())
@@ -135,10 +151,12 @@ class VM:
         except ValueError:
             self.base_ssh_cmd.extend(["-l", "root"])
 
-        if os.environ.get("GITHUB_ACTIONS") == "true":
-            self.control_socket = Path(f"/dev/shm/ssh_control_{self.kernel_ver}_{id(self)}.sock")
-        else:
-            self.control_socket = self.session_log_dir / f"ssh_control_{self.kernel_ver}_{id(self)}.sock"
+        control_socket_hash = hashlib.sha256(f"{self.session_log_dir}:{self.kernel_ver}:{id(self)}".encode())
+        control_socket_name = f"pht-ssh-{control_socket_hash.hexdigest()[:16]}"
+        # Use the same socket-safe temp base for OpenSSH control sockets.
+        control_socket_dir = runtime_tmpdir
+
+        self.control_socket = control_socket_dir / control_socket_name
         self.base_ssh_cmd[1:1] = [
             "-o",
             "ControlMaster=auto",
