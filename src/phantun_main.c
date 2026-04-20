@@ -318,7 +318,7 @@ static int phantun_reserve_tcp_port(struct phantun_net *pnet, struct net *net, u
     if (ret)
         goto fail;
 
-    ret = kernel_bind(sock, (struct sockaddr_unsized *)&addr, sizeof(addr));
+    ret = KERNEL_BIND_COMPAT(sock, &addr, sizeof(addr));
     if (ret)
         goto release_sock;
 
