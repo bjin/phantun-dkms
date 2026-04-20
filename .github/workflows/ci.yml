@@ -48,6 +48,8 @@ jobs:
       fail-fast: false
       matrix:
         kernel:
+          - v5.10.251
+          - v5.15.201
           - v6.1.167
           - v6.8.12
           - v6.12.80

@@ -290,7 +290,7 @@ cat /sys/module/phantun/stats/rst_sent
 ## Limits and current status
 
 - **IPv4 only** today.
-- Linux kernel compatibility: from `6.1` to `7.0`.
+- Linux kernel compatibility: from `5.10` to `7.0`.
 - Mixed **Phantun** / **`phantun-dkms`** deployments are **untested** and should be treated as **likely non-seamless**.
 - **No FIN close state machine**.
 - This is a **kernel-to-kernel protocol variant** in practice, even though the basic packet shape stays close to Phantun.
