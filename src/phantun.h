@@ -34,6 +34,8 @@ struct pht_managed_peer {
 struct phantun_config {
     u16 managed_local_ports[PHANTUN_MAX_MANAGED_PORTS];
     unsigned int managed_local_ports_count;
+    u16 reserved_local_ports[PHANTUN_MAX_MANAGED_PORTS];
+    unsigned int reserved_local_ports_count;
     struct pht_managed_peer managed_remote_peers[PHANTUN_MAX_MANAGED_PEERS];
     unsigned int managed_remote_peers_count;
     const char *handshake_request;

@@ -1,11 +1,10 @@
-import json
+import errno
 import subprocess
 import time
 
 import pytest
 
 from helpers import (
-    GUEST_SCENARIOS,
     MODULE_STAT_NAMES,
     NS_A,
     NS_ADDR_A,
@@ -20,8 +19,10 @@ from helpers import (
     parse_guest_json,
     probe_comment,
     read_module_stats,
+    run_guest_scenario,
+    run_in_netns,
     run_netns_scenario,
-    spawn_guest_command,
+    spawn_guest_scenario,
     spawn_netns_scenario,
 )
 
@@ -30,12 +31,35 @@ REQ = "HSREQ42"
 RESP = "HSRESP42"
 
 
-def run_guest_scenario(vm, scenario, config, check=True, **kwargs):
-    return vm.run(["python3", GUEST_SCENARIOS, scenario, json.dumps(config)], check=check, **kwargs)
+def run_tcp_bind_probe(vm, bind_addr, bind_port, namespace=None):
+    config = {
+        "bind_addr": bind_addr,
+        "bind_port": bind_port,
+    }
+
+    if namespace is None:
+        result = run_guest_scenario(vm, "tcp_bind_listen", config)
+        context = f"init-net TCP bind probe {bind_addr}:{bind_port}"
+    else:
+        result = run_netns_scenario(vm, namespace, "tcp_bind_listen", config)
+        context = f"{namespace} TCP bind probe {bind_addr}:{bind_port}"
+
+    assert_completed(result, context)
+    return parse_guest_json(result.stdout, f"{context} stdout")
 
 
-def spawn_guest_scenario(vm, scenario, config, **kwargs):
-    return spawn_guest_command(vm, ["python3", GUEST_SCENARIOS, scenario, json.dumps(config)], **kwargs)
+def assert_tcp_bind_ok(result, bind_addr, bind_port):
+    if not result.get("ok"):
+        pytest.fail(f"expected TCP bind to succeed on {bind_addr}:{bind_port}, got {result!r}")
+
+
+def assert_tcp_bind_errno(result, expected_errno, bind_addr, bind_port):
+    if result.get("ok"):
+        pytest.fail(f"expected TCP bind on {bind_addr}:{bind_port} to fail with errno {expected_errno}, got {result!r}")
+    if result.get("errno") != expected_errno:
+        pytest.fail(
+            f"unexpected errno for TCP bind on {bind_addr}:{bind_port}: expected {expected_errno}, got {result!r}"
+        )
 
 
 def test_sysfs_stats_exist_and_increment(phantun_module, vm):
@@ -445,3 +469,68 @@ def test_inbound_udp_to_managed_local_port_is_dropped(phantun_module, vm):
             pytest.fail("server unexpectedly received raw UDP on a managed local port")
     finally:
         cleanup_netns_topology(vm)
+
+
+def test_default_local_only_mode_does_not_reserve_tcp_port(phantun_module, vm):
+    managed_port = PORTS_A[0]
+
+    phantun_module.load(managed_local_ports=str(managed_port))
+
+    probe = run_tcp_bind_probe(vm, "0.0.0.0", managed_port)
+    assert_tcp_bind_ok(probe, "0.0.0.0", managed_port)
+
+
+def test_reserved_local_ports_off_keeps_local_only_mode_unreserved(phantun_module, vm):
+    managed_port = PORTS_A[0]
+
+    phantun_module.load(managed_local_ports=str(managed_port), reserved_local_ports="off")
+
+    probe = run_tcp_bind_probe(vm, "0.0.0.0", managed_port)
+    assert_tcp_bind_ok(probe, "0.0.0.0", managed_port)
+
+
+def test_reserved_local_ports_all_blocks_init_netns_tcp_bind(phantun_module, vm):
+    managed_port = PORTS_A[0]
+
+    phantun_module.load(managed_local_ports=str(managed_port), reserved_local_ports="all")
+
+    wildcard_probe = run_tcp_bind_probe(vm, "0.0.0.0", managed_port)
+    loopback_probe = run_tcp_bind_probe(vm, "127.0.0.1", managed_port)
+
+    assert_tcp_bind_errno(wildcard_probe, errno.EADDRINUSE, "0.0.0.0", managed_port)
+    assert_tcp_bind_errno(loopback_probe, errno.EADDRINUSE, "127.0.0.1", managed_port)
+
+
+def test_reserved_local_ports_filters_to_managed_local_ports_only(phantun_module, dmesg, vm):
+    dmesg.clear()
+    phantun_module.load(
+        managed_local_ports="2222,3333",
+        reserved_local_ports="2222,4444",
+    )
+
+    if not dmesg.wait_for(
+        "reserved_local_ports[1]=4444 ignored because it is not present in managed_local_ports", timeout=5
+    ):
+        pytest.fail("Module did not log that non-managed reserved_local_ports entries were ignored")
+
+    reserved_probe = run_tcp_bind_probe(vm, "0.0.0.0", 2222)
+    unreserved_probe = run_tcp_bind_probe(vm, "0.0.0.0", 3333)
+
+    assert_tcp_bind_errno(reserved_probe, errno.EADDRINUSE, "0.0.0.0", 2222)
+    assert_tcp_bind_ok(unreserved_probe, "0.0.0.0", 3333)
+
+
+def test_reserved_local_ports_applies_to_new_netns(phantun_module, vm):
+    managed_port = PORTS_A[0]
+    namespace = "pht-reserve-after-load"
+
+    phantun_module.load(managed_local_ports=str(managed_port), reserved_local_ports="all")
+    vm.run(["ip", "netns", "del", namespace], check=False)
+    vm.run(["ip", "netns", "add", namespace])
+
+    try:
+        run_in_netns(vm, namespace, ["ip", "link", "set", "lo", "up"])
+        probe = run_tcp_bind_probe(vm, "0.0.0.0", managed_port, namespace=namespace)
+        assert_tcp_bind_errno(probe, errno.EADDRINUSE, "0.0.0.0", managed_port)
+    finally:
+        vm.run(["ip", "netns", "del", namespace], check=False)

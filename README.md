@@ -149,6 +149,36 @@ Rules:
 | **Peer-only** | `managed_remote_peers` | Closest to Phantun's **client-side selector model**: own traffic by chosen remote peer. Inbound TCP ownership becomes broad for that remote `IPv4:port`, so use only when that peer is dedicated to this translator. |
 | **Intersection** | Both | Most explicit and usually safest. |
 
+### Optional local TCP reservation for local-only mode
+
+`managed_local_ports` tells `phantun-dkms` which traffic to intercept. It does **not** automatically make the module the real kernel TCP owner of that port.
+
+That matters in **local-only** mode (`managed_local_ports` set, `managed_remote_peers` empty): inbound fake TCP for the chosen port is intercepted before the normal TCP stack sees it, but another application can still successfully `bind()` / `listen()` on the same TCP port. The result is misleading ownership: the application appears to own the port, yet the fake-TCP traffic you expected to reach it is intercepted by `phantun-dkms` first.
+
+For a WireGuard-server-style deployment, this means `managed_local_ports=51820` alone can shadow another TCP listener on port `51820` even though the listener started successfully. If that same host or namespace also runs user-space Phantun on `127.0.0.1:51820`, the default behavior is still safe because loopback traffic is ignored.
+
+`managed_remote_peers` narrows ownership to an exact remote `IPv4:port`, so unrelated listeners on the same local port are not broadly shadowed in the same way. That is why `reserved_local_ports` is only honored in pure local-only mode.
+
+`reserved_local_ports` is optional and defaults to empty. The special values `off` and empty input both disable it.
+
+| Value | Meaning |
+|---|---|
+| empty / omitted | disabled (default) |
+| `off` | disabled |
+| comma-separated ports (max 16) | reserve only the listed ports that also appear in `managed_local_ports` |
+| `all` | reserve every effective `managed_local_ports` entry |
+
+Rules and trade-offs:
+
+- only honored when `managed_local_ports` is set and `managed_remote_peers` is empty
+- reservation is attempted in **every network namespace where phantun attaches**
+- reservation uses a wildcard kernel bind on `0.0.0.0:<port>`
+- wildcard reservation also blocks `127.0.0.1:<port>` in that namespace
+- if a port is already occupied, the module stays active and logs that truthfully instead of failing the load
+
+Use `reserved_local_ports` only when you want `phantun-dkms` to proactively claim those fake-TCP ports and you are willing to give up loopback TCP coexistence on those same ports in the affected namespace(s). If you want a local WireGuard server and a user-space Phantun process to share the host by using `127.0.0.1:<port>`, keep this parameter unset.
+
+
 ## Everyday parameters
 
 ### Required selectors
@@ -164,6 +194,11 @@ Validation rules:
 - `managed_remote_peers`: valid `IPv4:port`
 - at least one selector list required
 
+### Optional local TCP reservation
+
+| Parameter | Type | Default | Meaning |
+|---|---|---:|---|
+| `reserved_local_ports` | string | empty | Optional local-only TCP reservation set. Empty or `off` disables it, `all` reserves every `managed_local_ports` entry, and a comma-separated list of up to 16 ports reserves only the listed `managed_local_ports` subset. Ignored unless `managed_local_ports` is set and `managed_remote_peers` is empty. |
 ### Optional timing and behavior
 
 | Parameter | Default | Meaning |
@@ -238,7 +273,7 @@ sudo modprobe phantun
 |---|---|
 | **No TUN plumbing** | Do not copy Phantun's TUN DNAT/SNAT/masquerade setup into this project. |
 | **Conntrack** | The module stays on the normal host path and integrates with conntrack instead of creating a separate TUN routing topology. |
-| **Loopback** | Loopback traffic is left alone; this is why local Phantun-on-loopback setups can coexist. |
+| **Loopback** | Loopback traffic is still left alone by the data path, so default local Phantun-on-loopback setups can coexist. Only an effective `reserved_local_ports` wildcard bind in pure local-only mode blocks loopback listeners on the same port in that namespace; ignored or failed reservations do not. |
 | **MTU** | Same basic fake-TCP packet overhead as Phantun; Phantun's MTU guidance still applies. |
 | **Handshake buffering** | During handshake, the module queues at most **one** outbound UDP packet per flow; later packets may be dropped and must rely on normal app retransmission. |
 | **Shaping semantics** | `handshake_request` / `handshake_response` are hints, not a verified sub-protocol. |

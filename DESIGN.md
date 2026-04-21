@@ -27,7 +27,7 @@ For installation, everyday configuration, examples, stats, MTU guidance, and ope
 - user-space Phantun interoperability guarantees
 - eBPF as the primary implementation
 - xtables target as the core data plane
-- real kernel TCP listener/socket ownership
+- real kernel TCP listener/service implementation
 
 ## 2. Core protocol contract
 
@@ -133,7 +133,21 @@ Peer-only caveat:
 - inbound TCP ownership becomes broad for that remote `IPv4:port`
 - use peer-only mode only when that remote peer is dedicated to this translator
 
-### 4.3 Default inbound raw-UDP drop
+### 4.3 Optional local TCP reservation guard
+
+Local-only mode selects inbound fake TCP by destination port, but selector ownership alone does not make the module the real TCP owner of that port. Operators that want the kernel to reject competing TCP listeners can configure `reserved_local_ports`.
+
+Rules:
+
+- effective only when `managed_local_ports` is set and `managed_remote_peers` is empty
+- during `phantun_net_init()`, the module attempts a wildcard `0.0.0.0:port` kernel bind for each effective reserved port in that netns
+- those sockets stay bound until `phantun_net_exit()`
+- bind failures are logged and do not disable interception in that namespace
+- wildcard bind intentionally blocks loopback listeners on the same port too
+
+This is a defensive ownership guard only. The module does **not** call `listen()`, does **not** accept connections, and does **not** behave like a real TCP service endpoint.
+
+### 4.4 Default inbound raw-UDP drop
 
 By default, raw inbound UDP that matches configured selectors, is destined for local delivery in the current host/netns, and arrives from a non-loopback device is dropped in `PRE_ROUTING`.
 
@@ -143,7 +157,6 @@ Reason:
 - allowing both raw UDP delivery and translated fake-TCP delivery would create ambiguous mixed delivery
 - forwarded UDP is not translator-owned traffic and must continue through the normal routing path
 - reinjected translated UDP enters after `PRE_ROUTING`, so translated traffic is not black-holed by this drop rule
-
 ## 5. Flow identity and conflict handling
 
 ### 5.1 Canonical flow key

@@ -1,6 +1,15 @@
+import uuid
+
 import pytest
 
-from helpers import kernel_has_base64_support
+from helpers import (
+    assert_completed,
+    kernel_has_base64_support,
+    parse_guest_json,
+    run_guest_scenario,
+    spawn_guest_scenario,
+    wait_for_guest_ready_file,
+)
 
 
 def assert_modprobe_rejected(result, context):
@@ -12,6 +21,36 @@ def assert_modprobe_rejected(result, context):
     output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
     if "Invalid argument" not in output:
         pytest.fail(f"unexpected modprobe output for {context}: stdout={result.stdout!r}, stderr={result.stderr!r}")
+
+
+def run_tcp_bind_probe(vm, bind_addr, bind_port):
+    result = run_guest_scenario(
+        vm,
+        "tcp_bind_listen",
+        {
+            "bind_addr": bind_addr,
+            "bind_port": bind_port,
+        },
+    )
+    assert_completed(result, f"TCP bind probe {bind_addr}:{bind_port}")
+    return parse_guest_json(result.stdout, f"tcp bind probe {bind_addr}:{bind_port} stdout")
+
+
+def start_guest_tcp_listener(vm, bind_addr, bind_port):
+    ready_file = f"/tmp/phantun-tcp-listener-{uuid.uuid4().hex}"
+    stop_file = f"/tmp/phantun-tcp-listener-stop-{uuid.uuid4().hex}"
+    listener = spawn_guest_scenario(
+        vm,
+        "hold_tcp_listener",
+        {
+            "bind_addr": bind_addr,
+            "bind_port": bind_port,
+            "ready_file": ready_file,
+            "stop_file": stop_file,
+        },
+    )
+    wait_for_guest_ready_file(vm, ready_file, timeout=5)
+    return listener, stop_file
 
 
 def test_kernel_version(vm):
@@ -126,3 +165,44 @@ def test_module_rejects_malformed_managed_remote_peer(phantun_module, vm):
         assert_modprobe_rejected(res, "malformed managed_remote_peers entry")
     finally:
         vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
+
+
+def test_module_load_warns_when_reserved_tcp_port_is_already_occupied(phantun_module, dmesg, vm):
+    managed_port = 45123
+    listener, stop_file = start_guest_tcp_listener(vm, "0.0.0.0", managed_port)
+
+    dmesg.clear()
+    try:
+        phantun_module.load(managed_local_ports=str(managed_port), reserved_local_ports="all")
+
+        res = vm.run(["lsmod"])
+        if "phantun" not in res.stdout:
+            pytest.fail("phantun module is not loaded in lsmod after occupied-port warning test")
+        if not dmesg.wait_for(f"local TCP port {managed_port} is already occupied", timeout=5):
+            pytest.fail("Module did not log that reserved_local_ports encountered an already occupied TCP port")
+    finally:
+        vm.run(["touch", stop_file], check=False)
+        try:
+            listener.communicate(timeout=10)
+        except Exception as exc:
+            if listener.proc.poll() is None:
+                listener.terminate()
+            pytest.fail(f"held TCP listener did not terminate cleanly: {exc!r}")
+
+
+def test_reserved_local_ports_is_ignored_outside_local_only_mode(phantun_module, dmesg, vm):
+    managed_port = 45124
+
+    dmesg.clear()
+    phantun_module.load(
+        managed_local_ports=str(managed_port),
+        managed_remote_peers="198.51.100.20:51820",
+        reserved_local_ports="all",
+    )
+
+    if not dmesg.wait_for("reserved_local_ports=all ignored because it only applies", timeout=5):
+        pytest.fail("Module did not log that reserved_local_ports was ignored outside local-only mode")
+
+    probe = run_tcp_bind_probe(vm, "0.0.0.0", managed_port)
+    if not probe.get("ok"):
+        pytest.fail(f"TCP bind unexpectedly failed while reserved_local_ports should be ignored: {probe!r}")

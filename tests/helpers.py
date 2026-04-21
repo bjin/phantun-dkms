@@ -138,6 +138,14 @@ def spawn_guest_command(vm, cmd, **kwargs):
     return GuestProcess(proc)
 
 
+def run_guest_scenario(vm, scenario, config, check=True, **kwargs):
+    return vm.run(["python3", GUEST_SCENARIOS, scenario, json.dumps(config)], check=check, **kwargs)
+
+
+def spawn_guest_scenario(vm, scenario, config, **kwargs):
+    return spawn_guest_command(vm, ["python3", GUEST_SCENARIOS, scenario, json.dumps(config)], **kwargs)
+
+
 def run_netns_scenario(vm, namespace, scenario, config, check=True, **kwargs):
     return run_in_netns(
         vm,

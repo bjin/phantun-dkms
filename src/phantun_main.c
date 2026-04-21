@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <linux/in.h>
 #include <linux/inet.h>
 #include <linux/inetdevice.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/net.h>
 #include <linux/net_namespace.h>
 #include <linux/netdevice.h>
 #include <linux/netfilter.h>
@@ -43,6 +45,7 @@ static unsigned int managed_local_ports[PHANTUN_MAX_MANAGED_PORTS];
 static int managed_local_ports_count;
 static char *managed_remote_peers[PHANTUN_MAX_MANAGED_PEERS];
 static int managed_remote_peers_count;
+static char *reserved_local_ports;
 static char *handshake_request;
 static char *handshake_response;
 static unsigned int handshake_timeout_ms = PHANTUN_DEFAULT_HANDSHAKE_TIMEOUT_MS;
@@ -58,6 +61,11 @@ MODULE_PARM_DESC(managed_local_ports, "Comma-separated local UDP/TCP ports manag
 module_param_array_named(managed_remote_peers, managed_remote_peers, charp,
                          &managed_remote_peers_count, 0444);
 MODULE_PARM_DESC(managed_remote_peers, "Comma-separated remote IPv4:port peers managed by phantun");
+module_param(reserved_local_ports, charp, 0444);
+MODULE_PARM_DESC(reserved_local_ports,
+                 "Optional local-only TCP reservation set: empty or 'off' disables, "
+                 "comma-separated ports reserve up to 16 managed_local_ports entries, and 'all' "
+                 "reserves every managed_local_ports entry");
 module_param(handshake_request, charp, 0444);
 MODULE_PARM_DESC(handshake_request,
                  "Optional initiator control payload sent as the first fake-TCP payload (plain "
@@ -95,6 +103,7 @@ static struct notifier_block phantun_inetaddr_nb;
 struct phantun_net {
     struct pht_flow_table flows;
     struct notifier_block netdev_nb;
+    struct socket *reserved_local_socks[PHANTUN_MAX_MANAGED_PORTS];
 };
 
 static unsigned int phantun_netns_id(const struct net *net) { return net ? net->ns.inum : 0; }
@@ -188,6 +197,192 @@ static int phantun_parse_managed_remote_peer(const char *peer,
     memcpy(&parsed_peer->addr, parsed_addr, sizeof(parsed_addr));
     parsed_peer->port = htons((u16)port_host);
     return 0;
+}
+
+static bool phantun_managed_local_port_configured(u16 port) {
+    unsigned int i;
+
+    for (i = 0; i < managed_local_ports_count; i++) {
+        if ((u16)managed_local_ports[i] == port)
+            return true;
+    }
+
+    return false;
+}
+
+static void phantun_append_unique_port(u16 *ports, unsigned int *count, u16 port) {
+    unsigned int i;
+
+    for (i = 0; i < *count; i++) {
+        if (ports[i] == port)
+            return;
+    }
+
+    ports[*count] = port;
+    (*count)++;
+}
+
+static int phantun_parse_reserved_local_ports_param(const char *raw_str, u16 *ports,
+                                                    unsigned int *count, bool *all_requested) {
+    char *copy;
+    char *cursor;
+    char *token;
+    unsigned int index = 0;
+
+    *count = 0;
+    *all_requested = false;
+
+    if (!raw_str || !*raw_str || strcmp(raw_str, "off") == 0)
+        return 0;
+
+    if (strcmp(raw_str, "all") == 0) {
+        *all_requested = true;
+        return 0;
+    }
+
+    copy = kstrdup(raw_str, GFP_KERNEL);
+    if (!copy)
+        return -ENOMEM;
+
+    cursor = copy;
+    while ((token = strsep(&cursor, ",")) != NULL) {
+        unsigned int port;
+        int ret;
+
+        token = strim(token);
+        if (!*token) {
+            pht_pr_err("reserved_local_ports[%u] must be a decimal port between 1 and 65535\n",
+                       index);
+            kfree(copy);
+            return -EINVAL;
+        }
+
+        if (index >= PHANTUN_MAX_MANAGED_PORTS) {
+            pht_pr_err("reserved_local_ports supports at most %u comma-separated entries\n",
+                       PHANTUN_MAX_MANAGED_PORTS);
+            kfree(copy);
+            return -EINVAL;
+        }
+
+        ret = kstrtouint(token, 10, &port);
+        if (ret || !port || port > U16_MAX) {
+            pht_pr_err("reserved_local_ports[%u] must be a decimal port between 1 and 65535\n",
+                       index);
+            kfree(copy);
+            return -EINVAL;
+        }
+
+        ports[index++] = (u16)port;
+    }
+
+    *count = index;
+    kfree(copy);
+    return 0;
+}
+
+static int phantun_snapshot_reserved_local_ports(struct phantun_config *cfg) {
+    u16 requested_ports[PHANTUN_MAX_MANAGED_PORTS];
+    unsigned int requested_count;
+    bool all_requested;
+    unsigned int i;
+    int ret;
+
+    ret = phantun_parse_reserved_local_ports_param(reserved_local_ports, requested_ports,
+                                                   &requested_count, &all_requested);
+    if (ret)
+        return ret;
+
+    if (!reserved_local_ports || !*reserved_local_ports || strcmp(reserved_local_ports, "off") == 0)
+        return 0;
+
+    if (!managed_local_ports_count || managed_remote_peers_count) {
+        pht_pr_info("reserved_local_ports=%s ignored because it only applies when "
+                    "managed_local_ports is set and managed_remote_peers is empty\n",
+                    reserved_local_ports);
+        return 0;
+    }
+
+    if (all_requested) {
+        for (i = 0; i < managed_local_ports_count; i++)
+            phantun_append_unique_port(cfg->reserved_local_ports, &cfg->reserved_local_ports_count,
+                                       (u16)managed_local_ports[i]);
+        return 0;
+    }
+
+    for (i = 0; i < requested_count; i++) {
+        u16 port = requested_ports[i];
+
+        if (!phantun_managed_local_port_configured(port)) {
+            pht_pr_info("reserved_local_ports[%u]=%u ignored because it is not present in "
+                        "managed_local_ports\n",
+                        i, port);
+            continue;
+        }
+
+        phantun_append_unique_port(cfg->reserved_local_ports, &cfg->reserved_local_ports_count,
+                                   port);
+    }
+
+    return 0;
+}
+
+static void phantun_release_reserved_local_tcp_socket(struct socket **sockp) {
+    if (!sockp || !*sockp)
+        return;
+
+    sock_release(*sockp);
+    *sockp = NULL;
+}
+
+static void phantun_release_reserved_local_tcp_ports(struct phantun_net *pnet) {
+    unsigned int i;
+
+    if (!pnet)
+        return;
+
+    for (i = 0; i < ARRAY_SIZE(pnet->reserved_local_socks); i++)
+        phantun_release_reserved_local_tcp_socket(&pnet->reserved_local_socks[i]);
+}
+
+static void phantun_reserve_local_tcp_port(struct phantun_net *pnet, struct net *net,
+                                           unsigned int slot, u16 port) {
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port = htons(port),
+    };
+    struct socket *sock = NULL;
+    int ret;
+
+    ret = sock_create_kern(net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
+    if (ret) {
+        pht_pr_warn("failed to create reservation socket for local TCP port %u in netns %u: %d\n",
+                    port, phantun_netns_id(net), ret);
+        return;
+    }
+
+    ret = KERNEL_BIND_COMPAT(sock, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret) {
+        if (ret == -EADDRINUSE) {
+            pht_pr_info(
+                "local TCP port %u is already occupied in netns %u, leaving it unreserved\n", port,
+                phantun_netns_id(net));
+        } else {
+            pht_pr_warn("failed to reserve local TCP port %u in netns %u: %d\n", port,
+                        phantun_netns_id(net), ret);
+        }
+        sock_release(sock);
+        return;
+    }
+
+    pnet->reserved_local_socks[slot] = sock;
+}
+
+static void phantun_reserve_configured_local_tcp_ports(struct phantun_net *pnet, struct net *net) {
+    unsigned int i;
+
+    for (i = 0; i < phantun_cfg.reserved_local_ports_count; i++)
+        phantun_reserve_local_tcp_port(pnet, net, i, phantun_cfg.reserved_local_ports[i]);
 }
 
 static void phantun_account_udp_queue_result(bool queued) {
@@ -1552,9 +1747,12 @@ static int __net_init phantun_net_init(struct net *net) {
         return ret;
     }
 
+    phantun_reserve_configured_local_tcp_ports(pnet, net);
+
     ret = nf_register_net_hooks(net, phantun_nf_ops, ARRAY_SIZE(phantun_nf_ops));
     if (ret) {
         pht_pr_err("failed to register netfilter hooks: %d\n", ret);
+        phantun_release_reserved_local_tcp_ports(pnet);
         unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
         pht_flow_table_destroy(flows);
         return ret;
@@ -1576,6 +1774,7 @@ static void __net_exit phantun_net_exit(struct net *net) {
     nf_unregister_net_hooks(net, phantun_nf_ops, ARRAY_SIZE(phantun_nf_ops));
     unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
     pht_flow_table_destroy(flows);
+    phantun_release_reserved_local_tcp_ports(pnet);
     pht_pr_info("unregistered netfilter hooks and topology notifiers: netns %u\n",
                 phantun_netns_id(net));
 }
@@ -1588,6 +1787,9 @@ static struct pernet_operations phantun_pernet_ops = {
 };
 
 static int phantun_validate_config(void) {
+    u16 requested_ports[PHANTUN_MAX_MANAGED_PORTS];
+    unsigned int requested_count;
+    bool all_requested;
     unsigned int i;
     int ret;
 
@@ -1602,6 +1804,11 @@ static int phantun_validate_config(void) {
             return -EINVAL;
         }
     }
+
+    ret = phantun_parse_reserved_local_ports_param(reserved_local_ports, requested_ports,
+                                                   &requested_count, &all_requested);
+    if (ret)
+        return ret;
 
     for (i = 0; i < managed_remote_peers_count; i++) {
         struct pht_managed_peer parsed_peer;
@@ -1767,6 +1974,11 @@ static int phantun_snapshot_config(void) {
                    sizeof(phantun_cfg.managed_remote_peers[i]));
         }
     }
+
+    ret = phantun_snapshot_reserved_local_ports(&phantun_cfg);
+    if (ret)
+        return ret;
+
     ret = phantun_parse_payload_param(handshake_request, &phantun_alloc_req,
                                       &phantun_cfg.handshake_request_len);
     if (ret)
@@ -1795,19 +2007,26 @@ static int phantun_snapshot_config(void) {
 static void phantun_log_config(void) {
     unsigned int i;
 
-    pht_pr_info("loading with %u managed local port(s), %u managed remote peer(s), "
+    pht_pr_info("loading with %u managed local port(s), %u managed remote peer(s), %u reserved "
+                "local TCP port(s), "
                 "handshake_timeout_ms=%u, handshake_retries=%u, "
                 "keepalive_interval_sec=%u, keepalive_misses=%u, "
                 "hard_idle_timeout_sec=%u, reopen_guard_bytes=%u, "
                 "replacement_quarantine_ms=%u\n",
                 phantun_cfg.managed_local_ports_count, phantun_cfg.managed_remote_peers_count,
-                phantun_cfg.handshake_timeout_ms, phantun_cfg.handshake_retries,
-                phantun_cfg.keepalive_interval_sec, phantun_cfg.keepalive_misses,
-                phantun_cfg.hard_idle_timeout_sec, phantun_cfg.reopen_guard_bytes,
-                phantun_cfg.replacement_quarantine_ms);
+                phantun_cfg.reserved_local_ports_count, phantun_cfg.handshake_timeout_ms,
+                phantun_cfg.handshake_retries, phantun_cfg.keepalive_interval_sec,
+                phantun_cfg.keepalive_misses, phantun_cfg.hard_idle_timeout_sec,
+                phantun_cfg.reopen_guard_bytes, phantun_cfg.replacement_quarantine_ms);
 
+    pht_pr_info("reserved_local_ports=%s\n", reserved_local_ports && *reserved_local_ports
+                                                 ? reserved_local_ports
+                                                 : "<disabled>");
     for (i = 0; i < phantun_cfg.managed_local_ports_count; i++)
         pht_pr_info("managed_local_ports[%u]=%u\n", i, phantun_cfg.managed_local_ports[i]);
+    for (i = 0; i < phantun_cfg.reserved_local_ports_count; i++)
+        pht_pr_info("effective_reserved_local_ports[%u]=%u\n", i,
+                    phantun_cfg.reserved_local_ports[i]);
     for (i = 0; i < phantun_cfg.managed_remote_peers_count; i++)
         pht_pr_info("managed_remote_peers[%u]=%pI4:%u\n", i,
                     &phantun_cfg.managed_remote_peers[i].addr,

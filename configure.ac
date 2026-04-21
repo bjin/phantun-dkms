@@ -181,6 +181,109 @@ AS_IF([test "x$ac_cv_have_ip_route_input_dscp" = xyes], [
     [Define to 1 if ip_route_input takes DSCP and works with ip4h_dscp()]
   )
 ])
+AC_CACHE_CHECK([whether kernel_bind takes struct sockaddr_unsized], [ac_cv_have_kernel_bind_sockaddr_unsized], [
+  conftest_dir="$ac_pwd/conftest-kbuild-$$"
+
+  rm -rf "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to remove $conftest_dir])
+  mkdir -p "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to create $conftest_dir])
+
+  trap 'rm -rf "$conftest_dir"' 0 1 2 15
+
+  cat >"$conftest_dir/Makefile" <<'EOF'
+obj-m := conftest.o
+EOF
+
+  cat >"$conftest_dir/conftest.c" <<'EOF'
+#include <linux/module.h>
+#include <linux/net.h>
+
+static int conftest_kernel_bind_sockaddr_unsized(void)
+{
+    struct socket *sock = NULL;
+    struct sockaddr_unsized *addr = NULL;
+
+    return kernel_bind(sock, addr, 0);
+}
+
+module_init(conftest_kernel_bind_sockaddr_unsized);
+MODULE_LICENSE("GPL");
+EOF
+
+  if ${MAKE-make} -C "$KDIR" M="$conftest_dir" modules \
+      >"$conftest_dir/build.log" 2>&1; then
+    ac_cv_have_kernel_bind_sockaddr_unsized=yes
+  else
+    cat "$conftest_dir/build.log" >&5
+    ac_cv_have_kernel_bind_sockaddr_unsized=no
+  fi
+
+  rm -rf "$conftest_dir"
+  trap - 0 1 2 15
+])
+
+AS_IF([test "x$ac_cv_have_kernel_bind_sockaddr_unsized" = xyes], [
+  AC_DEFINE(
+    [HAVE_KERNEL_BIND_SOCKADDR_UNSIZED], [1],
+    [Define to 1 if kernel_bind takes struct sockaddr_unsized]
+  )
+])
+
+AC_CACHE_CHECK([whether kernel_bind takes struct sockaddr], [ac_cv_have_kernel_bind_sockaddr], [
+  conftest_dir="$ac_pwd/conftest-kbuild-$$"
+
+  rm -rf "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to remove $conftest_dir])
+  mkdir -p "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to create $conftest_dir])
+
+  trap 'rm -rf "$conftest_dir"' 0 1 2 15
+
+  cat >"$conftest_dir/Makefile" <<'EOF'
+obj-m := conftest.o
+EOF
+
+  cat >"$conftest_dir/conftest.c" <<'EOF'
+#include <linux/module.h>
+#include <linux/net.h>
+
+static int conftest_kernel_bind_sockaddr(void)
+{
+    struct socket *sock = NULL;
+    struct sockaddr *addr = NULL;
+
+    return kernel_bind(sock, addr, 0);
+}
+
+module_init(conftest_kernel_bind_sockaddr);
+MODULE_LICENSE("GPL");
+EOF
+
+  if ${MAKE-make} -C "$KDIR" M="$conftest_dir" modules \
+      >"$conftest_dir/build.log" 2>&1; then
+    ac_cv_have_kernel_bind_sockaddr=yes
+  else
+    cat "$conftest_dir/build.log" >&5
+    ac_cv_have_kernel_bind_sockaddr=no
+  fi
+
+  rm -rf "$conftest_dir"
+  trap - 0 1 2 15
+])
+
+AS_IF([test "x$ac_cv_have_kernel_bind_sockaddr" = xyes], [
+  AC_DEFINE(
+    [HAVE_KERNEL_BIND_SOCKADDR], [1],
+    [Define to 1 if kernel_bind takes struct sockaddr]
+  )
+])
+
+AS_IF([test "x$ac_cv_have_kernel_bind_sockaddr_unsized" = xno && test "x$ac_cv_have_kernel_bind_sockaddr" = xno], [
+  AC_MSG_ERROR([kernel does not have a supported kernel_bind interface])
+])
+
+
 AC_CACHE_CHECK([whether base64_decode takes 5 arguments], [ac_cv_have_base64_decode_5args], [
   conftest_dir="$ac_pwd/conftest-kbuild-$$"
 
