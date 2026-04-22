@@ -11,8 +11,9 @@
 
 #ifndef HAVE_TIMER_SHUTDOWN_SYNC
 /* Older kernels lack timer_shutdown_sync(). This module only uses the helper
- * after marking the owning flow DEAD and detaching it from rearm paths, so
- * timer_delete_sync() provides the required quiesce semantics here.
+ * after marking the owning flow DEAD, and the retransmit callback re-arms
+ * while holding flow->lock, so timer_delete_sync() provides the required
+ * quiesce semantics here.
  */
 #define timer_shutdown_sync(timer) timer_delete_sync(timer)
 #endif

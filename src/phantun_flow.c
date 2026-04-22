@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/jhash.h>
 #include <linux/jiffies.h>
@@ -145,10 +146,10 @@ static void pht_flow_retransmit_timer(struct timer_list *timer) {
         pht_flow_put(flow);
         return;
     }
-    spin_unlock_bh(&flow->lock);
 
     pht_pr_debug("half-open flow retry %u/%u scheduled\n", flow->retries_done, flow->max_retries);
     mod_timer(&flow->retransmit_timer, next);
+    spin_unlock_bh(&flow->lock);
 }
 
 static void pht_flow_shutdown_retransmit_sync(struct pht_flow *flow) {
@@ -157,9 +158,9 @@ static void pht_flow_shutdown_retransmit_sync(struct pht_flow *flow) {
     if (!flow)
         return;
 
-    /* Callers mark the flow DEAD before teardown. That invariant blocks both
-     * pht_flow_arm_retransmit() and the callback's self-rearm path, so the
-     * old-kernel timer_delete_sync()-based compat wrapper is sufficient here.
+    /* Callers mark the flow DEAD before teardown. The callback also re-arms
+     * under flow->lock, so once teardown owns the lock it cannot race a final
+     * unchecked mod_timer() on old timer_delete_sync()-only kernels.
      */
     timer_shutdown_sync(&flow->retransmit_timer);
     spin_lock_bh(&flow->lock);
@@ -531,9 +532,10 @@ int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow) {
     return 0;
 }
 
-/* Idempotent detach: if the flow is still hashed, remove that table-owned
- * reference exactly once. The caller keeps its own reference and decides when
- * to drop it.
+/* Idempotent detach: once a flow leaves the table, mark it DEAD before timer
+ * shutdown so no later retransmit callback can truthfully keep the generation
+ * alive. After unhash, drop the table-owned reference exactly once; the caller
+ * still owns its own reference and decides when to release it.
  */
 void pht_flow_detach(struct pht_flow *flow) {
     bool removed;
@@ -541,11 +543,15 @@ void pht_flow_detach(struct pht_flow *flow) {
     if (!flow || !flow->table)
         return;
 
+    spin_lock_bh(&flow->lock);
+    flow->state = PHT_FLOW_STATE_DEAD;
+    spin_unlock_bh(&flow->lock);
+
     removed = pht_flow_unhash(flow);
     if (!removed)
         return;
 
-    pht_flow_cancel_retransmit(flow);
+    pht_flow_shutdown_retransmit_sync(flow);
     pht_flow_put(flow);
 }
 
