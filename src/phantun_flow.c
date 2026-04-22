@@ -3,6 +3,7 @@
 #include <linux/jhash.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <net/ip.h>
@@ -14,8 +15,8 @@
 #include "phantun_packet.h"
 #include "phantun_stats.h"
 
-static u32 pht_flow_hash_key(const struct pht_flow_key *key) {
-    return jhash(key, sizeof(*key), 0) & (PHT_FLOW_BUCKETS - 1);
+static u32 pht_flow_hash_key(const struct pht_flow_table *table, const struct pht_flow_key *key) {
+    return jhash(key, sizeof(*key), table->hash_seed) & (PHT_FLOW_BUCKETS - 1);
 }
 
 /* Compare endpoints in host order so the canonical key is stable across both
@@ -247,6 +248,7 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
     table->reopen_guard_bytes = cfg->reopen_guard_bytes;
     table->half_open_limit = cfg->half_open_limit;
     table->half_open_current = 0;
+    table->hash_seed = get_random_u32();
     table->gc_interval_jiffies = msecs_to_jiffies(PHT_FLOW_GC_INTERVAL_SEC * 1000U);
     if (table->keepalive_interval_jiffies > 0) {
         unsigned long min_gc = table->keepalive_interval_jiffies / 2;
@@ -444,7 +446,7 @@ struct pht_flow *pht_flow_lookup(struct pht_flow_table *table, const struct pht_
     if (!table || !key)
         return NULL;
 
-    idx = pht_flow_hash_key(key);
+    idx = pht_flow_hash_key(table, key);
     bucket = &table->buckets[idx];
     spin_lock_bh(&bucket->lock);
     hlist_for_each_entry(flow, &bucket->head, hnode) {
@@ -511,7 +513,7 @@ static bool pht_flow_unhash(struct pht_flow *flow) {
     if (!flow || !flow->table)
         return false;
 
-    idx = pht_flow_hash_key(&flow->key);
+    idx = pht_flow_hash_key(flow->table, &flow->key);
     bucket = &flow->table->buckets[idx];
     spin_lock_bh(&bucket->lock);
     if (!hlist_unhashed(&flow->hnode)) {

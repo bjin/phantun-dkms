@@ -136,6 +136,11 @@ struct pht_flow_table {
     unsigned int reopen_guard_bytes;
     unsigned int half_open_limit;
     unsigned int half_open_current;
+    /* Per-table jhash seed keeps bucket selection stable for one table instance
+     * while preventing a fixed, attacker-known collision set across netns or
+     * module reloads.
+     */
+    u32 hash_seed;
     /* Serializes half-open admission and exact insert->established/dead
      * accounting so SYN_SENT/SYN_RCVD pressure is bounded per netns.
      */
