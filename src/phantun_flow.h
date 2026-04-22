@@ -113,6 +113,7 @@ struct pht_flow {
     bool response_pending_ack;
     bool retransmit_armed;
     bool quarantine_prev_active;
+    bool half_open_tracked;
     /* Latched GC reason for the generation that just died. */
     bool hard_expired;
     bool liveness_failed;
@@ -133,6 +134,12 @@ struct pht_flow_table {
     unsigned int keepalive_misses;
     unsigned int handshake_retries;
     unsigned int reopen_guard_bytes;
+    unsigned int half_open_limit;
+    unsigned int half_open_current;
+    /* Serializes half-open admission and exact insert->established/dead
+     * accounting so SYN_SENT/SYN_RCVD pressure is bounded per netns.
+     */
+    spinlock_t half_open_lock;
     struct net *net;
     const struct phantun_config *cfg;
 };

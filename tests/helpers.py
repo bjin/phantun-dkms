@@ -33,6 +33,7 @@ MODULE_STAT_NAMES = (
     "shaping_payloads_dropped",
     "bad_checksum_dropped",
     "oversized_payloads_dropped",
+    "half_open_rejected",
 )
 
 

@@ -54,6 +54,7 @@ static unsigned int keepalive_interval_sec = PHANTUN_DEFAULT_KEEPALIVE_INTERVAL_
 static unsigned int keepalive_misses = PHANTUN_DEFAULT_KEEPALIVE_MISSES;
 static unsigned int hard_idle_timeout_sec = PHANTUN_DEFAULT_HARD_IDLE_TIMEOUT_SEC;
 static unsigned int reopen_guard_bytes = PHANTUN_DEFAULT_REOPEN_GUARD_BYTES;
+static unsigned int half_open_limit = PHANTUN_DEFAULT_HALF_OPEN_LIMIT;
 static unsigned int replacement_quarantine_ms = PHANTUN_DEFAULT_REPLACEMENT_QUARANTINE_MS;
 module_param_array_named(managed_local_ports, managed_local_ports, uint, &managed_local_ports_count,
                          0444);
@@ -90,6 +91,8 @@ module_param(hard_idle_timeout_sec, uint, 0444);
 MODULE_PARM_DESC(hard_idle_timeout_sec, "Maximum idle flow timeout in seconds (hard GC limit)");
 module_param(reopen_guard_bytes, uint, 0444);
 MODULE_PARM_DESC(reopen_guard_bytes, "Minimum sequence space separation for new connections");
+module_param(half_open_limit, uint, 0444);
+MODULE_PARM_DESC(half_open_limit, "Maximum concurrent half-open flows per network namespace");
 module_param(replacement_quarantine_ms, uint, 0444);
 MODULE_PARM_DESC(replacement_quarantine_ms,
                  "Previous-generation quarantine window in milliseconds after tuple replacement");
@@ -1850,6 +1853,11 @@ static int phantun_validate_config(void) {
         return -EINVAL;
     }
 
+    if (!half_open_limit) {
+        pht_pr_err("half_open_limit must be greater than zero\n");
+        return -EINVAL;
+    }
+
     if (!replacement_quarantine_ms) {
         pht_pr_err("replacement_quarantine_ms must be greater than zero\n");
         return -EINVAL;
@@ -1999,6 +2007,7 @@ static int phantun_snapshot_config(void) {
     phantun_cfg.keepalive_misses = keepalive_misses;
     phantun_cfg.hard_idle_timeout_sec = hard_idle_timeout_sec;
     phantun_cfg.reopen_guard_bytes = reopen_guard_bytes;
+    phantun_cfg.half_open_limit = half_open_limit;
     phantun_cfg.replacement_quarantine_ms = replacement_quarantine_ms;
 
     return 0;
@@ -2011,13 +2020,14 @@ static void phantun_log_config(void) {
                 "local TCP port(s), "
                 "handshake_timeout_ms=%u, handshake_retries=%u, "
                 "keepalive_interval_sec=%u, keepalive_misses=%u, "
-                "hard_idle_timeout_sec=%u, reopen_guard_bytes=%u, "
+                "hard_idle_timeout_sec=%u, reopen_guard_bytes=%u, half_open_limit=%u, "
                 "replacement_quarantine_ms=%u\n",
                 phantun_cfg.managed_local_ports_count, phantun_cfg.managed_remote_peers_count,
                 phantun_cfg.reserved_local_ports_count, phantun_cfg.handshake_timeout_ms,
                 phantun_cfg.handshake_retries, phantun_cfg.keepalive_interval_sec,
                 phantun_cfg.keepalive_misses, phantun_cfg.hard_idle_timeout_sec,
-                phantun_cfg.reopen_guard_bytes, phantun_cfg.replacement_quarantine_ms);
+                phantun_cfg.reopen_guard_bytes, phantun_cfg.half_open_limit,
+                phantun_cfg.replacement_quarantine_ms);
 
     pht_pr_info("reserved_local_ports=%s\n", reserved_local_ports && *reserved_local_ports
                                                  ? reserved_local_ports

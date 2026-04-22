@@ -211,6 +211,7 @@ Validation rules:
 | `keepalive_misses` | `3` | Unanswered keepalives allowed before teardown. |
 | `hard_idle_timeout_sec` | `300` | Hard upper bound for idle flow lifetime. |
 | `reopen_guard_bytes` | `4194304` | Minimum sequence-space distance before reopening same tuple. |
+| `half_open_limit` | `4096` | Maximum concurrent half-open flows per network namespace. New SYN-created or outbound half-open flows beyond this limit are rejected until existing half-open flows establish or time out. |
 | `replacement_quarantine_ms` | `3000` | Previous-generation quarantine window after tuple replacement. Matching old-generation packets are silently dropped during this window. |
 
 ### Shaping payload formats

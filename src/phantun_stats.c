@@ -30,6 +30,7 @@ PHT_STAT_ATTR(udp_packets_dropped, PHT_STAT_UDP_PACKETS_DROPPED);
 PHT_STAT_ATTR(shaping_payloads_dropped, PHT_STAT_SHAPING_PAYLOADS_DROPPED);
 PHT_STAT_ATTR(bad_checksum_dropped, PHT_STAT_BAD_CHECKSUM_DROPPED);
 PHT_STAT_ATTR(oversized_payloads_dropped, PHT_STAT_OVERSIZED_PAYLOADS_DROPPED);
+PHT_STAT_ATTR(half_open_rejected, PHT_STAT_HALF_OPEN_REJECTED);
 
 static struct attribute *pht_stats_attrs[] = {
     &flows_created_attr.attr,
@@ -45,6 +46,7 @@ static struct attribute *pht_stats_attrs[] = {
     &shaping_payloads_dropped_attr.attr,
     &bad_checksum_dropped_attr.attr,
     &oversized_payloads_dropped_attr.attr,
+    &half_open_rejected_attr.attr,
     NULL,
 };
 

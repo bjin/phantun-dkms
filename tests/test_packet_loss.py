@@ -42,6 +42,27 @@ def reply_messages(payload):
     return [entry["message"] for entry in payload.get("replies", [])]
 
 
+def count_nonzero_probe_hits(vm, probe, comments):
+    return sum(1 for comment in comments if probe.packets(vm, comment) > 0)
+
+
+def wait_for_half_open_drain(vm, baseline_stats, expected_rst, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        stats = read_module_stats(vm)
+        if (
+            stats["rst_sent"] - baseline_stats["rst_sent"] >= expected_rst
+            and stats["flows_current"] == baseline_stats["flows_current"]
+        ):
+            return stats
+        time.sleep(0.1)
+
+    pytest.fail(
+        "half-open flows did not drain back to baseline: "
+        f"baseline={baseline_stats!r} current={stats!r} expected_rst={expected_rst}"
+    )
+
+
 def test_syn_loss_is_retried(phantun_module, vm):
     load_loss_module(phantun_module)
     ensure_netns_topology(vm)
@@ -267,20 +288,7 @@ def test_half_open_retry_exhaustion_releases_flow_slot(phantun_module, vm):
         # On slow nested-QEMU CI the responder half-open may be created and
         # exhausted between host-side polls. Assert on cumulative counters and
         # the emitted SYN|ACK instead of a transient flows_current spike.
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            stats = read_module_stats(vm)
-            if (
-                stats["rst_sent"] > baseline_stats["rst_sent"]
-                and stats["flows_current"] == baseline_stats["flows_current"]
-            ):
-                break
-            time.sleep(0.1)
-        else:
-            pytest.fail(
-                "half-open flow should be unhashed promptly after retry exhaustion: "
-                f"baseline={baseline_stats!r} current={stats!r}"
-            )
+        stats = wait_for_half_open_drain(vm, baseline_stats, expected_rst=1)
 
         if synack_probe.packets(vm, "sent_exhausted_synack") <= baseline_synack:
             pytest.fail("expected responder to emit SYN|ACK before retry exhaustion")
@@ -293,6 +301,229 @@ def test_half_open_retry_exhaustion_releases_flow_slot(phantun_module, vm):
     finally:
         drop_synack.cleanup(vm)
         synack_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_responder_half_open_limit_rejects_excess_bare_syns(phantun_module, vm):
+    phantun_module.load(
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        half_open_limit=2,
+        handshake_timeout_ms=2000,
+        handshake_retries=1,
+    )
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    dst_port = PORTS_B[0]
+    source_ports = [41001, 41002, 41003, 41004, 41005]
+    synack_comments = [f"limited_synack_{port}" for port in source_ports]
+    drop_synack = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": f"drop_limited_synack_{src_port}",
+            }
+            for src_port in source_ports
+        ],
+    )
+    synack_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": f"limited_synack_{src_port}",
+            }
+            for src_port in source_ports
+        ],
+    )
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        for index, src_port in enumerate(source_ports[:4], start=1):
+            run_netns_scenario(
+                vm,
+                NS_A,
+                "send_tcp_packet",
+                {
+                    "bind_addr": NS_ADDR_A,
+                    "bind_port": src_port,
+                    "target_addr": NS_ADDR_B,
+                    "target_port": dst_port,
+                    "flags": "syn",
+                    "seq": 4095 * index,
+                },
+            )
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            stats = read_module_stats(vm)
+            rejected = stats["half_open_rejected"] - baseline_stats["half_open_rejected"]
+            admitted = count_nonzero_probe_hits(vm, synack_probe, synack_comments)
+            if rejected == 2 and admitted == 2:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(
+                "responder half-open limit did not reject excess bare SYNs: " f"stats={stats!r} admitted={admitted}"
+            )
+
+        wait_for_half_open_drain(vm, baseline_stats, expected_rst=2)
+
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": source_ports[4],
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn",
+                "seq": 4095 * 5,
+            },
+        )
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            stats = read_module_stats(vm)
+            admitted = count_nonzero_probe_hits(vm, synack_probe, synack_comments)
+            rejected = stats["half_open_rejected"] - baseline_stats["half_open_rejected"]
+            if admitted == 3 and rejected == 2:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(
+                "responder half-open slot should reopen after retry exhaustion: " f"stats={stats!r} admitted={admitted}"
+            )
+    finally:
+        drop_synack.cleanup(vm)
+        synack_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_initiator_half_open_limit_rejects_excess_udp(phantun_module, vm):
+    phantun_module.load(
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        half_open_limit=2,
+        handshake_timeout_ms=2000,
+        handshake_retries=1,
+    )
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    remote_ports = [PORTS_B[0], PORTS_B[1], 6666, 6667, 6668]
+    syn_comments = [f"limited_syn_{port}" for port in remote_ports]
+    drop_synack = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": f"drop_limited_synack_{dst_port}",
+            }
+            for dst_port in remote_ports
+        ],
+    )
+    syn_probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "flags_expr": "syn",
+                "comment": f"limited_syn_{dst_port}",
+            }
+            for dst_port in remote_ports
+        ],
+    )
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        for dst_port in remote_ports[:4]:
+            run_netns_scenario(
+                vm,
+                NS_A,
+                "send_many",
+                {
+                    "bind_addr": NS_ADDR_A,
+                    "bind_port": src_port,
+                    "target_addr": NS_ADDR_B,
+                    "target_port": dst_port,
+                    "payloads": [f"payload-{dst_port}"],
+                },
+            )
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            stats = read_module_stats(vm)
+            rejected = stats["half_open_rejected"] - baseline_stats["half_open_rejected"]
+            dropped = stats["udp_packets_dropped"] - baseline_stats["udp_packets_dropped"]
+            admitted = count_nonzero_probe_hits(vm, syn_probe, syn_comments)
+            if rejected == 2 and dropped == 2 and admitted == 2:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(
+                "initiator half-open limit did not reject excess outbound UDP: " f"stats={stats!r} admitted={admitted}"
+            )
+
+        wait_for_half_open_drain(vm, baseline_stats, expected_rst=2)
+
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": remote_ports[4],
+                "payloads": ["payload-reopen"],
+            },
+        )
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            stats = read_module_stats(vm)
+            admitted = count_nonzero_probe_hits(vm, syn_probe, syn_comments)
+            rejected = stats["half_open_rejected"] - baseline_stats["half_open_rejected"]
+            if admitted == 3 and rejected == 2:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(
+                "initiator half-open slot should reopen after retry exhaustion: " f"stats={stats!r} admitted={admitted}"
+            )
+    finally:
+        drop_synack.cleanup(vm)
+        syn_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 

@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-#include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/jhash.h>
 #include <linux/jiffies.h>
@@ -97,6 +96,7 @@ static int pht_flow_retransmit_now(struct pht_flow *flow) {
 static bool pht_flow_unhash(struct pht_flow *flow);
 
 static void pht_flow_gc_worker(struct work_struct *work);
+static void pht_flow_untrack_half_open(struct pht_flow *flow);
 
 /* Only half-open flows use the retransmit timer. Exhausting the retry budget
  * is a handshake failure, so we fail locally with RST and leave reopen to the
@@ -122,6 +122,7 @@ static void pht_flow_retransmit_timer(struct timer_list *timer) {
         flow->retransmit_armed = false;
         spin_unlock_bh(&flow->lock);
 
+        pht_flow_untrack_half_open(flow);
         removed = pht_flow_unhash(flow);
         pht_flow_send_local_rst(flow);
         if (removed)
@@ -212,6 +213,19 @@ bool pht_flow_state_is_half_open(enum pht_flow_state state) {
     }
 }
 
+static void pht_flow_untrack_half_open(struct pht_flow *flow) {
+    if (!flow || !flow->table)
+        return;
+
+    spin_lock_bh(&flow->table->half_open_lock);
+    if (flow->half_open_tracked) {
+        flow->half_open_tracked = false;
+        if (flow->table->half_open_current > 0)
+            flow->table->half_open_current--;
+    }
+    spin_unlock_bh(&flow->table->half_open_lock);
+}
+
 int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
                         const struct phantun_config *cfg) {
     unsigned int i;
@@ -224,12 +238,15 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
         spin_lock_init(&table->buckets[i].lock);
         INIT_HLIST_HEAD(&table->buckets[i].head);
     }
+    spin_lock_init(&table->half_open_lock);
 
     table->handshake_timeout_jiffies = msecs_to_jiffies(cfg->handshake_timeout_ms);
     table->keepalive_interval_jiffies = msecs_to_jiffies(cfg->keepalive_interval_sec * 1000U);
     table->keepalive_misses = cfg->keepalive_misses;
     table->hard_idle_timeout_jiffies = msecs_to_jiffies(cfg->hard_idle_timeout_sec * 1000U);
     table->reopen_guard_bytes = cfg->reopen_guard_bytes;
+    table->half_open_limit = cfg->half_open_limit;
+    table->half_open_current = 0;
     table->gc_interval_jiffies = msecs_to_jiffies(PHT_FLOW_GC_INTERVAL_SEC * 1000U);
     if (table->keepalive_interval_jiffies > 0) {
         unsigned long min_gc = table->keepalive_interval_jiffies / 2;
@@ -263,6 +280,7 @@ static void pht_flow_detach_all(struct pht_flow_table *table, struct list_head *
             spin_lock(&flow->lock);
             flow->state = PHT_FLOW_STATE_DEAD;
             spin_unlock(&flow->lock);
+            pht_flow_untrack_half_open(flow);
             list_add_tail(&flow->gc_node, expired);
         }
         spin_unlock_bh(&bucket->lock);
@@ -324,6 +342,9 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
             if (expired_flow)
                 flow->state = PHT_FLOW_STATE_DEAD;
             spin_unlock(&flow->lock);
+
+            if (expired_flow)
+                pht_flow_untrack_half_open(flow);
 
             if (is_liveness_failure) {
                 struct sk_buff *queued_skb;
@@ -477,6 +498,7 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table,
     flow->keepalives_sent = 0;
     flow->retransmit_at_jiffies = jiffies;
     flow->retransmit_armed = false;
+    flow->half_open_tracked = false;
     pht_flow_key_from_endpoints(&flow->key, ep, &flow->local_is_low);
     return flow;
 }
@@ -507,12 +529,14 @@ static bool pht_flow_unhash(struct pht_flow *flow) {
 int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow) {
     struct pht_flow_bucket *bucket;
     struct pht_flow *iter;
+    bool half_open;
     u32 idx;
 
     if (!table || !flow)
         return -EINVAL;
 
-    idx = pht_flow_hash_key(&flow->key);
+    half_open = pht_flow_state_is_half_open(flow->state);
+    idx = pht_flow_hash_key(table, &flow->key);
     bucket = &table->buckets[idx];
     spin_lock_bh(&bucket->lock);
     hlist_for_each_entry(iter, &bucket->head, hnode) {
@@ -520,6 +544,18 @@ int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow) {
             spin_unlock_bh(&bucket->lock);
             return -EEXIST;
         }
+    }
+    if (half_open && !flow->half_open_tracked) {
+        spin_lock(&table->half_open_lock);
+        if (table->half_open_current >= table->half_open_limit) {
+            spin_unlock(&table->half_open_lock);
+            spin_unlock_bh(&bucket->lock);
+            pht_stats_inc(PHT_STAT_HALF_OPEN_REJECTED);
+            return -ENOSPC;
+        }
+        table->half_open_current++;
+        flow->half_open_tracked = true;
+        spin_unlock(&table->half_open_lock);
     }
     hlist_add_head(&flow->hnode, &bucket->head);
     spin_unlock_bh(&bucket->lock);
@@ -546,6 +582,7 @@ void pht_flow_detach(struct pht_flow *flow) {
     spin_lock_bh(&flow->lock);
     flow->state = PHT_FLOW_STATE_DEAD;
     spin_unlock_bh(&flow->lock);
+    pht_flow_untrack_half_open(flow);
 
     removed = pht_flow_unhash(flow);
     if (!removed)
@@ -565,6 +602,7 @@ void pht_flow_remove(struct pht_flow *flow) {
     spin_lock_bh(&flow->lock);
     flow->state = PHT_FLOW_STATE_DEAD;
     spin_unlock_bh(&flow->lock);
+    pht_flow_untrack_half_open(flow);
 
     pht_flow_cancel_retransmit(flow);
 }
@@ -669,6 +707,8 @@ void pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state) {
 
     if (state == PHT_FLOW_STATE_ESTABLISHED && old_state != PHT_FLOW_STATE_ESTABLISHED)
         pht_stats_inc(PHT_STAT_FLOWS_ESTABLISHED);
+    if (pht_flow_state_is_half_open(old_state) && !half_open)
+        pht_flow_untrack_half_open(flow);
     if (half_open)
         pht_flow_arm_retransmit(flow);
     else
@@ -768,6 +808,7 @@ pht_flow_invalidate_matching(struct pht_flow_table *table,
             if (!matched)
                 continue;
 
+            pht_flow_untrack_half_open(flow);
             hlist_del_init(&flow->hnode);
             pht_stats_dec(PHT_STAT_FLOWS_CURRENT);
             list_add_tail(&flow->gc_node, &expired);
