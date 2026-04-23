@@ -106,12 +106,13 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y autoconf automake libtool make dkms
+          sudo apt-get install --no-install-recommends -y autoconf automake libtool make dkms rpm
 
       - name: Build Release Artifacts
         run: |
           make dkms
           make dkms-deb
+          make dkms-rpm
 
           TAG_NAME=${GITHUB_REF#refs/tags/}
           STRIPPED_TAG=${TAG_NAME#v}
@@ -135,6 +136,7 @@ jobs:
           shopt -s nullglob
           rename_release_artifact "phantun-dkms_*.tar.gz" "phantun-dkms_${STRIPPED_TAG}.tar.gz"
           rename_release_artifact "phantun-dkms_*_all.deb" "phantun-dkms_${STRIPPED_TAG}_all.deb"
+          rename_release_artifact "phantun-dkms-*.noarch.rpm" "phantun-dkms_${STRIPPED_TAG}_noarch.rpm"
 
       - name: Create Pre-release
         uses: softprops/action-gh-release@v2
@@ -143,3 +145,4 @@ jobs:
           files: |
             phantun-dkms_*.tar.gz
             phantun-dkms_*.deb
+            phantun-dkms_*.rpm

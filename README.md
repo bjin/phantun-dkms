@@ -97,12 +97,14 @@ If kernel autodetection fails, pass `KDIR=/path/to/kernel/build` to `make`.
 ```bash
 make dkms
 make dkms-deb
+make dkms-rpm
 ```
 
 ### Install from DKMS package (latest release)
 
 * Arch Linux: Install AUR package [phantun-dkms](https://aur.archlinux.org/packages/phantun-dkms)
 * Debian/Ubuntu: Download and install `.deb` file from [latest release](https://github.com/bjin/phantun-dkms/releases/latest)
+* Fedora/RHEL/Rocky: Download and install the `.rpm` file from [latest release](https://github.com/bjin/phantun-dkms/releases/latest)
 * Other Distributions: Extract `.tar.gz` dkms tarball from [latest release](https://github.com/bjin/phantun-dkms/releases/latest) to `/usr/src/phantun-0.x.y`, and run `dkms add` manually
 
 ### Simplest load: own one local UDP port

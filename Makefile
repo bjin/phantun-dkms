@@ -7,10 +7,13 @@ PWD := $(CURDIR)
 
 PACKAGE_NAME := phantun-dkms
 MODULE_NAME := phantun
-PACKAGE_ARCH := all
+DEB_PACKAGE_ARCH := all
+RPM_PACKAGE_ARCH := noarch
+RPM_RELEASE := 1
 PACKAGE_VERSION := $(subst ",,$(patsubst PACKAGE_VERSION=%,%,$(filter PACKAGE_VERSION=%,$(file < dkms.conf))))
 DKMS_TARBALL := $(PACKAGE_NAME)_$(PACKAGE_VERSION).tar.gz
-DKMS_DEB := $(PACKAGE_NAME)_$(PACKAGE_VERSION)_$(PACKAGE_ARCH).deb
+DKMS_DEB := $(PACKAGE_NAME)_$(PACKAGE_VERSION)_$(DEB_PACKAGE_ARCH).deb
+DKMS_RPM := $(PACKAGE_NAME)-$(PACKAGE_VERSION)-$(RPM_RELEASE).$(RPM_PACKAGE_ARCH).rpm
 
 DKMS_TARBALL_INPUTS := \
 	$(wildcard src/*.c) \
@@ -25,7 +28,7 @@ DKMS_TARBALL_INPUTS := \
 KDIR_STAMP_DIR := .build
 KDIR_STAMP := $(KDIR_STAMP_DIR)/config$(subst /,_,$(KDIR)).stamp
 
-.PHONY: all modules modules_install clean compile_commands dkms dkms-deb
+.PHONY: all modules modules_install clean compile_commands dkms dkms-deb dkms-rpm
 
 all: modules
 
@@ -90,7 +93,7 @@ $(DKMS_DEB): $(DKMS_TARBALL)
 		'Version: $(PACKAGE_VERSION)' \
 		'Section: kernel' \
 		'Priority: optional' \
-		'Architecture: $(PACKAGE_ARCH)' \
+		'Architecture: $(DEB_PACKAGE_ARCH)' \
 		'Maintainer: Bin Jin <bjin@protonmail.com>' \
 		'Depends: dkms' \
 		'Recommends: linux-headers-generic | linux-headers-virtual | linux-headers-amd64 | linux-headers' \
@@ -135,6 +138,72 @@ $(DKMS_DEB): $(DKMS_TARBALL)
 	chmod 0755 "$$control_dir/postinst" "$$control_dir/prerm"; \
 	rm -f -- '$(DKMS_DEB)'; \
 	dpkg-deb --root-owner-group --build "$$rootfs_dir" '$(DKMS_DEB)' >/dev/null
+
+dkms-rpm: $(DKMS_RPM)
+	@printf '%s\n' '$(DKMS_RPM)'
+
+$(DKMS_RPM): $(DKMS_TARBALL)
+	@set -eu; \
+	if ! command -v rpmbuild >/dev/null 2>&1; then \
+		echo "Error: rpmbuild is required; on Arch Linux install the rpm-tools package" >&2; \
+		exit 1; \
+	fi; \
+	work_dir=$$(mktemp -d '$(CURDIR)/.release-dkms-rpm.XXXXXX'); \
+	trap 'rm -rf "$$work_dir"' EXIT HUP INT TERM; \
+	topdir="$$work_dir/rpmbuild"; \
+	tmp_dir="$$work_dir/tmp"; \
+	rpmdb_dir="$$work_dir/rpmdb"; \
+	spec_dir="$$topdir/SPECS"; \
+	source_dir="$$topdir/SOURCES"; \
+	spec_path="$$spec_dir/$(PACKAGE_NAME).spec"; \
+	rpm_path="$$topdir/RPMS/$(RPM_PACKAGE_ARCH)/$(DKMS_RPM)"; \
+	mkdir -p "$$tmp_dir" "$$rpmdb_dir" "$$spec_dir" "$$source_dir" "$$topdir/BUILD" "$$topdir/RPMS" "$$topdir/SRPMS"; \
+	rpmdb --initdb --dbpath "$$rpmdb_dir" >/dev/null; \
+	cp '$(DKMS_TARBALL)' "$$source_dir/"; \
+	printf '%s\n' \
+		'%global debug_package %{nil}' \
+		'Name: $(PACKAGE_NAME)' \
+		'Version: $(PACKAGE_VERSION)' \
+		'Release: $(RPM_RELEASE)%{?dist}' \
+		'Summary: Kernel module re-implementation of phantun, transform UDP streams into fake-TCP streams' \
+		'License: GPL-2.0-or-later' \
+		'URL: https://github.com/bjin/phantun-dkms' \
+		'Source0: $(DKMS_TARBALL)' \
+		'BuildArch: $(RPM_PACKAGE_ARCH)' \
+		'Requires: dkms' \
+		'Recommends: kernel-devel' \
+		'' \
+		'%description' \
+		'Kernel module re-implementation of phantun, transform UDP streams into fake-TCP streams.' \
+		'' \
+		'%install' \
+		'rm -rf "%{buildroot}"' \
+		'install -d "%{buildroot}/usr/src/$(MODULE_NAME)-%{version}"' \
+		'tar xzf "%{SOURCE0}" -C "%{buildroot}/usr/src/$(MODULE_NAME)-%{version}"' \
+		'' \
+		'%post' \
+		'if command -v dkms >/dev/null 2>&1; then' \
+		'    if ! dkms add -m "$(MODULE_NAME)" -v "%{version}" >/dev/null 2>&1; then' \
+		'        echo "Warning: dkms add for $(MODULE_NAME) %{version} failed; the source tree was still installed to /usr/src." >&2' \
+		'    fi' \
+		'    if ! dkms autoinstall -m "$(MODULE_NAME)" -v "%{version}"; then' \
+		'        echo "Warning: dkms autoinstall for $(MODULE_NAME) %{version} failed; install matching kernel headers and rerun dkms autoinstall manually." >&2' \
+		'    fi' \
+		'else' \
+		'    echo "Warning: dkms is unavailable; install dkms and run dkms add/autoinstall manually." >&2' \
+		'fi' \
+		'' \
+		'%preun' \
+		'if command -v dkms >/dev/null 2>&1 && dkms status -m "$(MODULE_NAME)" -v "%{version}" >/dev/null 2>&1; then' \
+		'    dkms remove -m "$(MODULE_NAME)" -v "%{version}" --all || :' \
+		'fi' \
+		'' \
+		'%files' \
+		'/usr/src/$(MODULE_NAME)-%{version}' \
+		>"$$spec_path"; \
+	rm -f -- '$(DKMS_RPM)'; \
+	rpmbuild -bb --define "_topdir $$topdir" --define "_tmppath $$tmp_dir" --define "_dbpath $$rpmdb_dir" "$$spec_path" >/dev/null; \
+	cp "$$rpm_path" '$(DKMS_RPM)'
 
 clean:
 	@if [ -n "$(strip $(KDIR))" ]; then \
