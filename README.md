@@ -36,11 +36,12 @@ Short version: **same broad wire shape, different enough behavior that you shoul
 | **Node roles** | Fixed client and server | No node-level client/server split; each flow has initiator/responder only |
 | **Application integration** | App talks through Phantun's TUN topology | App keeps its existing UDP socket |
 | **Traffic selection** | Bind/listen topology around TUN endpoints | Selector-based ownership via `managed_local_ports` and/or `managed_remote_peers` |
+| **Full-mesh setup** | Configure a tunnel for each node pair, so a mesh grows O(n²) | Configure selectors once per node; no per-pair tunnels |
 | **Firewall/NAT plumbing** | Requires TUN-side DNAT/SNAT/masquerade setup | No Phantun-specific TUN DNAT/masquerade plumbing; module stays on the normal host path and integrates with conntrack |
 | **Inbound raw UDP policy** | Ownership handled by TUN topology | Selector-matched raw inbound UDP is dropped on non-loopback ingress |
 | **Liveness / keepalive** | No matching kernel-module keepalive behavior here | TCP-like keepalive ACKs plus missed-keepalive teardown |
 | **Protocol compatibility** | Phantun contract | Mixed Phantun / `phantun-dkms` use is **untested and likely not seamless** |
-| **Address family** | IPv4 and IPv6 | IPv4 and IPv6, with `ip_families=both|ipv4|ipv6` selection |
+| **Address family** | IPv4 and IPv6 | IPv4 and IPv6, with `ip_families=both/ipv4/ipv6` selection |
 
 ## What still feels like Phantun
 

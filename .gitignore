@@ -41,3 +41,4 @@ __pycache__
 *.deb
 *.rpm
 .release-dkms-deb.*/
+conftest-*
