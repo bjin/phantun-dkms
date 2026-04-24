@@ -36,15 +36,9 @@ enum pht_flow_state {
     PHT_FLOW_STATE_DEAD,
 };
 
-/* Canonical tuple key: endpoints are sorted lexicographically so outbound UDP
- * creation and inbound bare SYN handling land in the same flow slot.
+/* Flow identity is already local-oriented at packet boundaries: local is this
+ * host/netns and remote is the peer, independent of packet direction.
  */
-struct pht_flow_key {
-    __be32 low_addr;
-    __be32 high_addr;
-    __be16 low_port;
-    __be16 high_port;
-};
 
 struct net;
 struct pht_flow_table;
@@ -68,8 +62,7 @@ struct pht_flow {
     struct list_head gc_node;
     struct timer_list retransmit_timer;
     struct pht_flow_table *table;
-    struct pht_flow_key key;
-    struct pht_ipv4_endpoint_pair oriented;
+    struct pht_endpoint_pair endpoints;
     enum pht_flow_role role;
     enum pht_flow_state state;
     u32 seq;
@@ -101,8 +94,6 @@ struct pht_flow {
      * for best-effort invalidation when that device goes away.
      */
     int egress_ifindex;
-    /* True when the local endpoint occupies key.low_{addr,port}. */
-    bool local_is_low;
     /* Optional first-payload shaping state. drop_next_rx_* suppresses exactly
      * one reserved inbound payload sequence; response_pending_ack blocks
      * responder-owned local UDP until the injected response is ACKed or
@@ -149,21 +140,15 @@ struct pht_flow_table {
     const struct phantun_config *cfg;
 };
 
-bool pht_flow_key_equal(const struct pht_flow_key *a, const struct pht_flow_key *b);
-void pht_flow_key_from_endpoints(struct pht_flow_key *key, const struct pht_ipv4_endpoint_pair *ep,
-                                 bool *local_is_low);
 bool pht_flow_state_is_half_open(enum pht_flow_state state);
 
 int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
                         const struct phantun_config *cfg);
 void pht_flow_table_destroy(struct pht_flow_table *table);
 
-struct pht_flow *pht_flow_lookup(struct pht_flow_table *table, const struct pht_flow_key *key);
-struct pht_flow *pht_flow_lookup_oriented(struct pht_flow_table *table,
-                                          const struct pht_ipv4_endpoint_pair *ep);
-struct pht_flow *pht_flow_create(struct pht_flow_table *table,
-                                 const struct pht_ipv4_endpoint_pair *ep, enum pht_flow_role role,
-                                 enum pht_flow_state state);
+struct pht_flow *pht_flow_lookup(struct pht_flow_table *table, const struct pht_endpoint_pair *ep);
+struct pht_flow *pht_flow_create(struct pht_flow_table *table, const struct pht_endpoint_pair *ep,
+                                 enum pht_flow_role role, enum pht_flow_state state);
 int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow);
 void pht_flow_remove(struct pht_flow *flow);
 void pht_flow_detach(struct pht_flow *flow);
@@ -180,6 +165,7 @@ void pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state);
 void pht_flow_arm_retransmit(struct pht_flow *flow);
 void pht_flow_cancel_retransmit(struct pht_flow *flow);
 unsigned int pht_flow_invalidate_egress_ifindex(struct pht_flow_table *table, int ifindex);
-unsigned int pht_flow_invalidate_local_addr(struct pht_flow_table *table, __be32 local_addr);
+unsigned int pht_flow_invalidate_local_addr(struct pht_flow_table *table,
+                                            const struct pht_addr *addr);
 
 #endif

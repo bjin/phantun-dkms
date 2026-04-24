@@ -8,6 +8,9 @@
 #include <linux/string.h>
 #include <net/ip.h>
 #include <net/route.h>
+#if IS_ENABLED(CONFIG_IPV6)
+#include <net/ipv6.h>
+#endif
 
 #include "phantun_compat.h" // IWYU pragma: keep
 
@@ -15,23 +18,57 @@
 #include "phantun_packet.h"
 #include "phantun_stats.h"
 
-static u32 pht_flow_hash_key(const struct pht_flow_table *table, const struct pht_flow_key *key) {
-    return jhash(key, sizeof(*key), table->hash_seed) & (PHT_FLOW_BUCKETS - 1);
+static u32 pht_addr_hash(const struct pht_addr *addr, u32 seed) {
+    if (!addr)
+        return seed;
+
+    seed = jhash(&addr->family, sizeof(addr->family), seed);
+    switch (addr->family) {
+    case AF_INET:
+        return jhash(&addr->v4, sizeof(addr->v4), seed);
+#if IS_ENABLED(CONFIG_IPV6)
+    case AF_INET6:
+        return jhash(&addr->v6, sizeof(addr->v6), seed);
+#endif
+    default:
+        return seed;
+    }
 }
 
-/* Compare endpoints in host order so the canonical key is stable across both
- * traffic directions.
- */
-static int pht_endpoint_cmp(__be32 addr_a, __be16 port_a, __be32 addr_b, __be16 port_b) {
-    if (ntohl(addr_a) < ntohl(addr_b))
-        return -1;
-    if (ntohl(addr_a) > ntohl(addr_b))
-        return 1;
-    if (ntohs(port_a) < ntohs(port_b))
-        return -1;
-    if (ntohs(port_a) > ntohs(port_b))
-        return 1;
-    return 0;
+static bool pht_addr_equal_local(const struct pht_addr *a, const struct pht_addr *b) {
+    if (!a || !b || a->family != b->family)
+        return false;
+
+    switch (a->family) {
+    case AF_INET:
+        return a->v4 == b->v4;
+#if IS_ENABLED(CONFIG_IPV6)
+    case AF_INET6:
+        return ipv6_addr_equal(&a->v6, &b->v6);
+#endif
+    default:
+        return false;
+    }
+}
+
+static bool pht_endpoint_pair_equal(const struct pht_endpoint_pair *a,
+                                    const struct pht_endpoint_pair *b) {
+    return a && b && a->local_port == b->local_port && a->remote_port == b->remote_port &&
+           a->scope_ifindex == b->scope_ifindex &&
+           pht_addr_equal_local(&a->local_addr, &b->local_addr) &&
+           pht_addr_equal_local(&a->remote_addr, &b->remote_addr);
+}
+
+static u32 pht_flow_hash_key(const struct pht_flow_table *table,
+                             const struct pht_endpoint_pair *ep) {
+    u32 hash;
+
+    hash = pht_addr_hash(&ep->local_addr, table->hash_seed);
+    hash = pht_addr_hash(&ep->remote_addr, hash);
+    hash = jhash(&ep->local_port, sizeof(ep->local_port), hash);
+    hash = jhash(&ep->remote_port, sizeof(ep->remote_port), hash);
+    hash = jhash(&ep->scope_ifindex, sizeof(ep->scope_ifindex), hash);
+    return hash & (PHT_FLOW_BUCKETS - 1);
 }
 
 static void pht_flow_free(struct pht_flow *flow) {
@@ -46,8 +83,8 @@ static int pht_flow_send_local_rst(struct pht_flow *flow) {
     if (!flow || !flow->table || !flow->table->net)
         return -EINVAL;
 
-    ret = pht_emit_fake_tcp_v4(flow->table->net, &flow->oriented, flow->seq, 0, PHT_TCP_FLAG_RST,
-                               NULL, 0, &ifindex);
+    ret = pht_emit_fake_tcp(flow->table->net, &flow->endpoints, flow->seq, 0, PHT_TCP_FLAG_RST,
+                            NULL, 0, &ifindex);
     if (!ret) {
         pht_flow_set_egress_ifindex(flow, ifindex);
         pht_stats_inc(PHT_STAT_RST_SENT);
@@ -56,7 +93,7 @@ static int pht_flow_send_local_rst(struct pht_flow *flow) {
 }
 
 static int pht_flow_retransmit_now(struct pht_flow *flow) {
-    struct pht_ipv4_endpoint_pair ep;
+    struct pht_endpoint_pair ep;
     u32 seq;
     u32 ack;
     enum pht_flow_state state;
@@ -66,7 +103,7 @@ static int pht_flow_retransmit_now(struct pht_flow *flow) {
         return -EINVAL;
     spin_lock_bh(&flow->lock);
     state = flow->state;
-    ep = flow->oriented;
+    ep = flow->endpoints;
     seq = flow->seq;
     ack = flow->ack;
     if (state == PHT_FLOW_STATE_SYN_SENT) {
@@ -87,7 +124,7 @@ static int pht_flow_retransmit_now(struct pht_flow *flow) {
         int ifindex;
         int ret;
 
-        ret = pht_emit_fake_tcp_v4(flow->table->net, &ep, seq, ack, flags, NULL, 0, &ifindex);
+        ret = pht_emit_fake_tcp(flow->table->net, &ep, seq, ack, flags, NULL, 0, &ifindex);
         if (!ret)
             pht_flow_set_egress_ifindex(flow, ifindex);
         return ret;
@@ -174,34 +211,6 @@ static void pht_flow_shutdown_retransmit_sync(struct pht_flow *flow) {
 
     if (drop_ref)
         pht_flow_put(flow);
-}
-
-bool pht_flow_key_equal(const struct pht_flow_key *a, const struct pht_flow_key *b) {
-    return !memcmp(a, b, sizeof(*a));
-}
-
-void pht_flow_key_from_endpoints(struct pht_flow_key *key, const struct pht_ipv4_endpoint_pair *ep,
-                                 bool *local_is_low) {
-    bool is_low;
-    int cmp;
-
-    cmp = pht_endpoint_cmp(ep->local_addr, ep->local_port, ep->remote_addr, ep->remote_port);
-    is_low = cmp <= 0;
-
-    if (is_low) {
-        key->low_addr = ep->local_addr;
-        key->low_port = ep->local_port;
-        key->high_addr = ep->remote_addr;
-        key->high_port = ep->remote_port;
-    } else {
-        key->low_addr = ep->remote_addr;
-        key->low_port = ep->remote_port;
-        key->high_addr = ep->local_addr;
-        key->high_port = ep->local_port;
-    }
-
-    if (local_is_low)
-        *local_is_low = is_low;
 }
 
 bool pht_flow_state_is_half_open(enum pht_flow_state state) {
@@ -362,8 +371,8 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
 
                 spin_lock(&flow->lock);
                 if (flow->table && flow->table->net) {
-                    ret = pht_emit_fake_tcp_v4(flow->table->net, &flow->oriented, flow->seq,
-                                               flow->ack, PHT_TCP_FLAG_ACK, NULL, 0, &ifindex);
+                    ret = pht_emit_fake_tcp(flow->table->net, &flow->endpoints, flow->seq,
+                                            flow->ack, PHT_TCP_FLAG_ACK, NULL, 0, &ifindex);
                     if (!ret)
                         flow->egress_ifindex = ifindex;
                 }
@@ -403,10 +412,24 @@ static void pht_flow_gc_worker(struct work_struct *work) {
     }
 
     while ((skb = __skb_dequeue(&reinject_list)) != NULL) {
-        if (table->net)
-            ip_local_out(table->net, NULL, skb);
-        else
+        if (!table->net) {
             kfree_skb(skb);
+            continue;
+        }
+
+        switch (ntohs(skb->protocol)) {
+        case ETH_P_IP:
+            ip_local_out(table->net, NULL, skb);
+            break;
+#if IS_ENABLED(CONFIG_IPV6)
+        case ETH_P_IPV6:
+            ip6_local_out(table->net, NULL, skb);
+            break;
+#endif
+        default:
+            kfree_skb(skb);
+            break;
+        }
     }
 
     schedule_delayed_work(&table->gc_work, table->gc_interval_jiffies);
@@ -438,19 +461,19 @@ void pht_flow_put(struct pht_flow *flow) {
         pht_flow_free(flow);
 }
 
-struct pht_flow *pht_flow_lookup(struct pht_flow_table *table, const struct pht_flow_key *key) {
+struct pht_flow *pht_flow_lookup(struct pht_flow_table *table, const struct pht_endpoint_pair *ep) {
     struct pht_flow_bucket *bucket;
     struct pht_flow *flow;
     u32 idx;
 
-    if (!table || !key)
+    if (!table || !ep)
         return NULL;
 
-    idx = pht_flow_hash_key(table, key);
+    idx = pht_flow_hash_key(table, ep);
     bucket = &table->buckets[idx];
     spin_lock_bh(&bucket->lock);
     hlist_for_each_entry(flow, &bucket->head, hnode) {
-        if (!pht_flow_key_equal(&flow->key, key))
+        if (!pht_endpoint_pair_equal(&flow->endpoints, ep))
             continue;
         if (!refcount_inc_not_zero(&flow->refs))
             continue;
@@ -461,20 +484,8 @@ struct pht_flow *pht_flow_lookup(struct pht_flow_table *table, const struct pht_
     return NULL;
 }
 
-struct pht_flow *pht_flow_lookup_oriented(struct pht_flow_table *table,
-                                          const struct pht_ipv4_endpoint_pair *ep) {
-    struct pht_flow_key key;
-
-    if (!ep)
-        return NULL;
-
-    pht_flow_key_from_endpoints(&key, ep, NULL);
-    return pht_flow_lookup(table, &key);
-}
-
-struct pht_flow *pht_flow_create(struct pht_flow_table *table,
-                                 const struct pht_ipv4_endpoint_pair *ep, enum pht_flow_role role,
-                                 enum pht_flow_state state) {
+struct pht_flow *pht_flow_create(struct pht_flow_table *table, const struct pht_endpoint_pair *ep,
+                                 enum pht_flow_role role, enum pht_flow_state state) {
     struct pht_flow *flow;
 
     if (!table || !ep)
@@ -491,7 +502,7 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table,
     INIT_LIST_HEAD(&flow->gc_node);
     timer_setup(&flow->retransmit_timer, pht_flow_retransmit_timer, 0);
     flow->table = table;
-    flow->oriented = *ep;
+    flow->endpoints = *ep;
     flow->role = role;
     flow->state = state;
     flow->max_retries = table->handshake_retries;
@@ -501,7 +512,6 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table,
     flow->retransmit_at_jiffies = jiffies;
     flow->retransmit_armed = false;
     flow->half_open_tracked = false;
-    pht_flow_key_from_endpoints(&flow->key, ep, &flow->local_is_low);
     return flow;
 }
 
@@ -513,7 +523,7 @@ static bool pht_flow_unhash(struct pht_flow *flow) {
     if (!flow || !flow->table)
         return false;
 
-    idx = pht_flow_hash_key(flow->table, &flow->key);
+    idx = pht_flow_hash_key(flow->table, &flow->endpoints);
     bucket = &flow->table->buckets[idx];
     spin_lock_bh(&bucket->lock);
     if (!hlist_unhashed(&flow->hnode)) {
@@ -538,11 +548,11 @@ int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow) {
         return -EINVAL;
 
     half_open = pht_flow_state_is_half_open(flow->state);
-    idx = pht_flow_hash_key(table, &flow->key);
+    idx = pht_flow_hash_key(table, &flow->endpoints);
     bucket = &table->buckets[idx];
     spin_lock_bh(&bucket->lock);
     hlist_for_each_entry(iter, &bucket->head, hnode) {
-        if (pht_flow_key_equal(&iter->key, &flow->key)) {
+        if (pht_endpoint_pair_equal(&iter->endpoints, &flow->endpoints)) {
             spin_unlock_bh(&bucket->lock);
             return -EEXIST;
         }
@@ -763,7 +773,7 @@ void pht_flow_cancel_retransmit(struct pht_flow *flow) {
 
 struct pht_flow_invalidate_match {
     int egress_ifindex;
-    __be32 local_addr;
+    struct pht_addr local_addr;
 };
 
 static bool pht_flow_matches_egress_ifindex_locked(const struct pht_flow *flow,
@@ -773,7 +783,7 @@ static bool pht_flow_matches_egress_ifindex_locked(const struct pht_flow *flow,
 
 static bool pht_flow_matches_local_addr_locked(const struct pht_flow *flow,
                                                const struct pht_flow_invalidate_match *match) {
-    return flow->oriented.local_addr == match->local_addr;
+    return pht_addr_equal_local(&flow->endpoints.local_addr, &match->local_addr);
 }
 
 /* Topology-driven invalidation is best-effort local cleanup: the path or
@@ -841,13 +851,14 @@ unsigned int pht_flow_invalidate_egress_ifindex(struct pht_flow_table *table, in
     return pht_flow_invalidate_matching(table, pht_flow_matches_egress_ifindex_locked, &match);
 }
 
-unsigned int pht_flow_invalidate_local_addr(struct pht_flow_table *table, __be32 local_addr) {
-    struct pht_flow_invalidate_match match = {
-        .local_addr = local_addr,
-    };
+unsigned int pht_flow_invalidate_local_addr(struct pht_flow_table *table,
+                                            const struct pht_addr *addr) {
+    struct pht_flow_invalidate_match match;
 
-    if (!local_addr)
+    if (!addr)
         return 0;
 
+    memset(&match, 0, sizeof(match));
+    match.local_addr = *addr;
     return pht_flow_invalidate_matching(table, pht_flow_matches_local_addr_locked, &match);
 }

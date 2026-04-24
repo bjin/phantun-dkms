@@ -11,7 +11,8 @@ TIMEOUT_SEC = 5
 
 
 def _socket(bind_addr, bind_port, timeout=None):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    family = socket.AF_INET6 if ":" in bind_addr else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_DGRAM)
     sock.settimeout(timeout if timeout is not None else TIMEOUT_SEC)
     sock.bind((bind_addr, bind_port))
     return sock
@@ -252,8 +253,11 @@ def delayed_send(config):
     _emit({"sent": config["payload"]})
 
 
-def _tcp_listener(bind_addr, bind_port, backlog=1):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def _tcp_listener(bind_addr, bind_port, backlog=1, v6only=None):
+    family = socket.AF_INET6 if ":" in bind_addr else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    if family == socket.AF_INET6 and v6only is not None:
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, int(v6only))
     sock.bind((bind_addr, bind_port))
     sock.listen(backlog)
     return sock
@@ -264,7 +268,12 @@ def hold_tcp_listener(config):
     stop_file = config.get("stop_file")
     stopped = False
 
-    with _tcp_listener(config["bind_addr"], config["bind_port"], config.get("backlog", 1)) as sock:
+    with _tcp_listener(
+        config["bind_addr"],
+        config["bind_port"],
+        config.get("backlog", 1),
+        config.get("v6only"),
+    ) as sock:
         if ready_file:
             Path(ready_file).write_text("ready\n")
         try:
@@ -297,7 +306,12 @@ def hold_tcp_listener(config):
 
 def tcp_bind_listen(config):
     try:
-        with _tcp_listener(config["bind_addr"], config["bind_port"], config.get("backlog", 1)) as sock:
+        with _tcp_listener(
+            config["bind_addr"],
+            config["bind_port"],
+            config.get("backlog", 1),
+            config.get("v6only"),
+        ) as sock:
             _emit(
                 {
                     "ok": True,

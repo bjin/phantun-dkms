@@ -14,6 +14,8 @@ VETH_A = "veth-pht-a"
 VETH_B = "veth-pht-b"
 NS_ADDR_A = "10.200.0.1"
 NS_ADDR_B = "10.200.0.2"
+NS6_ADDR_A = "fd00:200::1"
+NS6_ADDR_B = "fd00:200::2"
 PORTS_A = (2222, 4444)
 PORTS_B = (3333, 5555)
 
@@ -253,7 +255,7 @@ def cleanup_netns_topology(vm, namespaces=(NS_A, NS_B)):
         vm.run(["ip", "netns", "del", namespace], check=False)
 
 
-def ensure_netns_topology(vm):
+def ensure_netns_topology(vm, with_ipv6=False):
     cleanup_netns_topology(vm)
 
     vm.run(["ip", "netns", "add", NS_A])
@@ -271,9 +273,18 @@ def ensure_netns_topology(vm):
     run_in_netns(vm, NS_B, ["ip", "link", "set", VETH_B, "up"])
     run_in_netns(vm, NS_A, ["ip", "route", "add", f"{NS_ADDR_B}/32", "dev", VETH_A])
     run_in_netns(vm, NS_B, ["ip", "route", "add", f"{NS_ADDR_A}/32", "dev", VETH_B])
+    if with_ipv6:
+        run_in_netns(vm, NS_A, ["ip", "-6", "addr", "add", f"{NS6_ADDR_A}/64", "dev", VETH_A, "nodad"])
+        run_in_netns(vm, NS_B, ["ip", "-6", "addr", "add", f"{NS6_ADDR_B}/64", "dev", VETH_B, "nodad"])
+        run_in_netns(vm, NS_A, ["ip", "-6", "route", "add", f"{NS6_ADDR_B}/128", "dev", VETH_A])
+        run_in_netns(vm, NS_B, ["ip", "-6", "route", "add", f"{NS6_ADDR_A}/128", "dev", VETH_B])
 
 
-def make_netns_output_probe(vm, namespace, channels):
+def nft_ip_prefix(addr):
+    return "ip6" if ":" in addr else "ip"
+
+
+def make_netns_output_probe(vm, namespace, channels, udp_action="drop", tcp_action="accept"):
     table_name = f"phantun_netns_{uuid.uuid4().hex[:8]}"
     lines = [
         f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
@@ -283,17 +294,18 @@ def make_netns_output_probe(vm, namespace, channels):
 
     for src_addr, src_port, dst_addr, dst_port in channels:
         tag = flow_tag(src_addr, src_port, dst_addr, dst_port)
+        ip_prefix = nft_ip_prefix(src_addr)
         lines.append(
             f"nft add rule inet {table_name} output "
-            f"ip saddr {src_addr} ip daddr {dst_addr} "
+            f"{ip_prefix} saddr {src_addr} {ip_prefix} daddr {dst_addr} "
             f"udp sport {src_port} udp dport {dst_port} "
-            f'counter drop comment "udp_{tag}"'
+            f'counter {udp_action} comment "udp_{tag}"'
         )
         lines.append(
             f"nft add rule inet {table_name} output "
-            f"ip saddr {src_addr} ip daddr {dst_addr} "
+            f"{ip_prefix} saddr {src_addr} {ip_prefix} daddr {dst_addr} "
             f"tcp sport {src_port} tcp dport {dst_port} "
-            f'counter accept comment "tcp_{tag}"'
+            f'counter {tcp_action} comment "tcp_{tag}"'
         )
 
     run_in_netns(vm, namespace, "\n".join(lines))
@@ -311,7 +323,8 @@ def make_netns_output_flag_probe(vm, namespace, rules):
     for rule in rules:
         lines.append(
             f"nft 'add rule inet {table_name} output "
-            f"ip saddr {rule['src_addr']} ip daddr {rule['dst_addr']} "
+            f"{nft_ip_prefix(rule['src_addr'])} saddr {rule['src_addr']} "
+            f"{nft_ip_prefix(rule['dst_addr'])} daddr {rule['dst_addr']} "
             f"tcp sport {rule['src_port']} tcp dport {rule['dst_port']} "
             f"tcp flags & (fin|syn|rst|ack) == {rule['flags_expr']} "
             f"counter {rule.get('action', 'accept')} comment \"{rule['comment']}\"'"
@@ -335,7 +348,8 @@ def make_netns_prerouting_flag_drop_probe(vm, namespace, rules):
     for rule in rules:
         lines.append(
             f"nft 'add rule inet {table_name} prerouting "
-            f"ip saddr {rule['src_addr']} ip daddr {rule['dst_addr']} "
+            f"{nft_ip_prefix(rule['src_addr'])} saddr {rule['src_addr']} "
+            f"{nft_ip_prefix(rule['dst_addr'])} daddr {rule['dst_addr']} "
             f"tcp sport {rule['src_port']} tcp dport {rule['dst_port']} "
             f"tcp flags & (fin|syn|rst|ack) == {rule['flags_expr']} "
             f"counter {rule.get('action', 'drop')} comment \"{rule['comment']}\"'"
@@ -413,7 +427,8 @@ def make_netns_ingress_flag_drop_probe(vm, namespace, device, rules):
     for rule in rules:
         lines.append(
             f"nft 'add rule netdev {table_name} ingress "
-            f"ip saddr {rule['src_addr']} ip daddr {rule['dst_addr']} "
+            f"{nft_ip_prefix(rule['src_addr'])} saddr {rule['src_addr']} "
+            f"{nft_ip_prefix(rule['dst_addr'])} daddr {rule['dst_addr']} "
             f"tcp sport {rule['src_port']} tcp dport {rule['dst_port']} "
             f"tcp flags & (fin|syn|rst|ack) == {rule['flags_expr']} "
             f"counter {rule.get('action', 'drop')} comment \"{rule['comment']}\"'"
@@ -454,4 +469,4 @@ def probe_comment(prefix, src_addr, src_port, dst_addr, dst_port):
 
 
 def flow_tag(src_addr, src_port, dst_addr, dst_port):
-    return f"{src_addr}_{src_port}_to_{dst_addr}_{dst_port}".replace(".", "_")
+    return f"{src_addr}_{src_port}_to_{dst_addr}_{dst_port}".replace(".", "_").replace(":", "_")

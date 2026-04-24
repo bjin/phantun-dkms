@@ -2,6 +2,7 @@
 #ifndef PHANTUN_H
 #define PHANTUN_H
 
+#include "phantun_packet.h"
 #include <linux/kernel.h>
 #include <linux/types.h>
 
@@ -20,6 +21,8 @@
 #define PHANTUN_LOCAL_OUT_PRIORITY (-199)
 /* Marks reinjected UDP so PRE_ROUTING accepts it without recapturing it. */
 #define PHANTUN_REINJECT_MARK 0x50485455U
+#define PHT_FAMILY_IPV4 BIT(0)
+#define PHT_FAMILY_IPV6 BIT(1)
 
 #define pht_pr_err(fmt, ...) pr_err(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
 #define pht_pr_warn(fmt, ...) pr_warn(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
@@ -28,11 +31,12 @@
 #define pht_pr_debug(fmt, ...) pr_debug(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
 
 struct pht_managed_peer {
-    __be32 addr;
+    struct pht_addr addr;
     __be16 port;
 };
 
 struct phantun_config {
+    unsigned int enabled_families;
     u16 managed_local_ports[PHANTUN_MAX_MANAGED_PORTS];
     unsigned int managed_local_ports_count;
     u16 reserved_local_ports[PHANTUN_MAX_MANAGED_PORTS];

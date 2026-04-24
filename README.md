@@ -40,7 +40,7 @@ Short version: **same broad wire shape, different enough behavior that you shoul
 | **Inbound raw UDP policy** | Ownership handled by TUN topology | Selector-matched raw inbound UDP is dropped on non-loopback ingress |
 | **Liveness / keepalive** | No matching kernel-module keepalive behavior here | TCP-like keepalive ACKs plus missed-keepalive teardown |
 | **Protocol compatibility** | Phantun contract | Mixed Phantun / `phantun-dkms` use is **untested and likely not seamless** |
-| **Address family** | IPv4 and IPv6 | **IPv4 only** right now |
+| **Address family** | IPv4 and IPv6 | IPv4 and IPv6, with `ip_families=both|ipv4|ipv6` selection |
 
 ## What still feels like Phantun
 
@@ -119,6 +119,10 @@ sudo modprobe phantun managed_local_ports=51820
 sudo modprobe phantun managed_remote_peers=198.51.100.20:51820
 ```
 
+```bash
+sudo modprobe phantun managed_remote_peers='[2001:db8::20]:51820'
+```
+
 ### Require both local port and remote peer
 
 ```bash
@@ -134,7 +138,7 @@ The module only touches traffic that matches one or both selector lists.
 | Selector | Meaning | Typical use |
 |---|---|---|
 | `managed_local_ports` | Own this local UDP/TCP port | "Translate my local WireGuard listen port" |
-| `managed_remote_peers` | Own this exact remote `IPv4:port` | "Translate only traffic for this peer" |
+| `managed_remote_peers` | Own this exact remote `IPv4:port` or `[IPv6]:port` | "Translate only traffic for this peer" |
 
 Rules:
 
@@ -142,13 +146,15 @@ Rules:
 - If you configure **both**, **both must match**.
 - Selector ownership applies only to **non-loopback** traffic.
 - Raw inbound UDP that matches the selectors is dropped on **non-loopback ingress** so traffic is not delivered both as raw UDP and translated UDP.
+- `ip_families=both|ipv4|ipv6` selects which IP families are translated; it defaults to `both`. On kernels without IPv6 support, default `both` degrades to IPv4-only with a warning, while explicit `ipv6` is rejected.
+- IPv6 `managed_remote_peers` entries must be bracketed, for example `[2001:db8::20]:51820`; unbracketed IPv6 endpoints are rejected as ambiguous.
 
 ### Selector modes
 
 | Mode | What you set | Tradeoff |
 |---|---|---|
 | **Local-only** | `managed_local_ports` | Easiest and closest to Phantun's **server-side selector model**: own traffic by local service port. |
-| **Peer-only** | `managed_remote_peers` | Closest to Phantun's **client-side selector model**: own traffic by chosen remote peer. Inbound TCP ownership becomes broad for that remote `IPv4:port`, so use only when that peer is dedicated to this translator. |
+| **Peer-only** | `managed_remote_peers` | Closest to Phantun's **client-side selector model**: own traffic by chosen remote peer. Inbound TCP ownership becomes broad for that remote `IPv4:port` or `[IPv6]:port`, so use only when that peer is dedicated to this translator. |
 | **Intersection** | Both | Most explicit and usually safest. |
 
 ### Optional local TCP reservation for local-only mode
@@ -159,7 +165,7 @@ That matters in **local-only** mode (`managed_local_ports` set, `managed_remote_
 
 For a WireGuard-server-style deployment, this means `managed_local_ports=51820` alone can shadow another TCP listener on port `51820` even though the listener started successfully. If that same host or namespace also runs user-space Phantun on `127.0.0.1:51820`, the default behavior is still safe because loopback traffic is ignored.
 
-`managed_remote_peers` narrows ownership to an exact remote `IPv4:port`, so unrelated listeners on the same local port are not broadly shadowed in the same way. That is why `reserved_local_ports` is only honored in pure local-only mode.
+`managed_remote_peers` narrows ownership to an exact remote `IPv4:port` or `[IPv6]:port`, so unrelated listeners on the same local port are not broadly shadowed in the same way. That is why `reserved_local_ports` is only honored in pure local-only mode.
 
 `reserved_local_ports` is optional and defaults to empty. The special values `off` and empty input both disable it.
 
@@ -174,8 +180,8 @@ Rules and trade-offs:
 
 - only honored when `managed_local_ports` is set and `managed_remote_peers` is empty
 - reservation is attempted in **every network namespace where phantun attaches**
-- reservation uses a wildcard kernel bind on `0.0.0.0:<port>`
-- wildcard reservation also blocks `127.0.0.1:<port>` in that namespace
+- reservation uses wildcard kernel binds on enabled families: `0.0.0.0:<port>` for IPv4 and `[::]:<port>` for IPv6
+- wildcard reservation also blocks loopback listeners on the same port in that namespace
 - if a port is already occupied, the module stays active and logs that truthfully instead of failing the load
 
 Use `reserved_local_ports` only when you want `phantun-dkms` to proactively claim those fake-TCP ports and you are willing to give up loopback TCP coexistence on those same ports in the affected namespace(s). If you want a local WireGuard server and a user-space Phantun process to share the host by using `127.0.0.1:<port>`, keep this parameter unset.
@@ -188,12 +194,13 @@ Use `reserved_local_ports` only when you want `phantun-dkms` to proactively clai
 | Parameter | Type | Default | Meaning |
 |---|---|---:|---|
 | `managed_local_ports` | integer array, max 16 | empty | Local ports the module owns. For WireGuard, usually the local listen port. |
-| `managed_remote_peers` | string array, max 16 | empty | Exact peers in `x.y.z.w:p` form. |
+| `managed_remote_peers` | string array, max 16 | empty | Exact peers in `x.y.z.w:p` or `[IPv6]:p` form. |
+| `ip_families` | string | `both` | Enabled translation families: `both`, `ipv4`, or `ipv6`. |
 
 Validation rules:
 
 - `managed_local_ports`: `1..65535`
-- `managed_remote_peers`: valid `IPv4:port`
+- `managed_remote_peers`: valid `IPv4:port` or bracketed `[IPv6]:port`
 - at least one selector list required
 
 ### Optional local TCP reservation
@@ -327,7 +334,7 @@ cat /sys/module/phantun/stats/rst_sent
 
 ## Limits and current status
 
-- **IPv4 only** today.
+- IPv4 and IPv6 are supported, with `ip_families=both|ipv4|ipv6` selecting active translation families.
 - Linux kernel compatibility: from `5.10` to `7.0`.
 - Mixed **Phantun** / **`phantun-dkms`** deployments are **untested** and should be treated as **likely non-seamless**.
 - **No FIN close state machine**.

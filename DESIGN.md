@@ -23,7 +23,7 @@ For installation, everyday configuration, examples, stats, MTU guidance, and ope
 
 ### Non-goals
 
-- IPv6 in v1
+- removing the separate IPv4/IPv6 family split in packet-boundary helpers
 - user-space Phantun interoperability guarantees
 - eBPF as the primary implementation
 - xtables target as the core data plane
@@ -109,28 +109,30 @@ A packet must satisfy **every configured selector**.
 | Selector | Purpose |
 |---|---|
 | `managed_local_ports` | Local UDP/TCP ports the translator owns |
-| `managed_remote_peers` | Exact remote `IPv4:port` peers the translator owns |
+| `managed_remote_peers` | Exact remote `IPv4:port` or `[IPv6]:port` peers the translator owns |
 
 Selector modes:
 
 | Mode | Outbound match | Inbound fake-TCP match |
 |---|---|---|
 | Local-only | local source port | local destination port |
-| Peer-only | remote destination `IPv4:UDP port` | remote source `IPv4:TCP port` |
+| Peer-only | remote destination `IPv4/IPv6:UDP port` | remote source `IPv4/IPv6:TCP port` |
 | Intersection | both must match | both must match |
 
 Constraints:
 
 - at least one selector list must be non-empty
 - selector ownership applies only to **non-loopback** traffic
-- inbound selector ownership applies only after confirming the destination IPv4 is locally delivered to the current host/netns; forwarded traffic is never translator-owned
+- inbound selector ownership applies only after confirming the destination address is locally delivered to the current host/netns; forwarded traffic is never translator-owned
 - outbound UDP routed to loopback stays UDP
 - inbound fake TCP arriving on loopback is ignored by the module
 - raw inbound UDP arriving on loopback is not subject to selector-owned drop
 
+- `ip_families=both|ipv4|ipv6` gates which netfilter families are registered; default `both` registers both families when kernel IPv6 support is available
+- IPv6 `managed_remote_peers` entries must use bracketed `[IPv6]:port` syntax; unbracketed IPv6 is rejected
 Peer-only caveat:
 
-- inbound TCP ownership becomes broad for that remote `IPv4:port`
+- inbound TCP ownership becomes broad for that remote `IPv4:port` or `[IPv6]:port`
 - use peer-only mode only when that remote peer is dedicated to this translator
 
 ### 4.3 Optional local TCP reservation guard
@@ -140,7 +142,7 @@ Local-only mode selects inbound fake TCP by destination port, but selector owner
 Rules:
 
 - effective only when `managed_local_ports` is set and `managed_remote_peers` is empty
-- during `phantun_net_init()`, the module attempts a wildcard `0.0.0.0:port` kernel bind for each effective reserved port in that netns
+- during `phantun_net_init()`, the module attempts wildcard TCP binds for each effective reserved port and enabled family in that netns (`0.0.0.0:port`, `[::]:port`)
 - those sockets stay bound until `phantun_net_exit()`
 - bind failures are logged and do not disable interception in that namespace
 - wildcard bind intentionally blocks loopback listeners on the same port too
@@ -159,13 +161,14 @@ Reason:
 - reinjected translated UDP enters after `PRE_ROUTING`, so translated traffic is not black-holed by this drop rule
 ## 5. Flow identity and conflict handling
 
-### 5.1 Canonical flow key
+### 5.1 Local-oriented endpoint identity
 
-A flow is keyed by a canonical IPv4 4-tuple:
+A flow is keyed by the packet-boundary local/remote endpoint pair, including address family:
 
-- compare `(ip, port)` lexicographically
-- store smaller endpoint first
-- store larger endpoint second
+- `local` is always this host/netns endpoint
+- `remote` is always the peer endpoint
+- family + address bytes + ports are matched directly
+- outbound UDP and inbound fake TCP therefore land in the same flow without canonical tuple sorting
 
 The flow still stores oriented local/remote addresses and role.
 The canonical key exists only for lookup and collision prevention.
@@ -377,7 +380,7 @@ The translator must tolerate loss of handshake-path packets within retry budget:
 |---|---|
 | Hook | `NF_INET_LOCAL_OUT` |
 | Target priority | after initial `LOCAL_OUT` conntrack classification (`-199` in current design target) |
-| Match | IPv4 UDP, non-loopback egress, selector-matched tuple |
+| Match | IPv4 or IPv6 UDP, non-loopback egress, selector-matched tuple |
 
 Behavior:
 
@@ -393,7 +396,7 @@ Behavior:
 |---|---|
 | Hook | `NF_INET_PRE_ROUTING` |
 | Target priority | before conntrack and before real TCP processing |
-| Match | IPv4 TCP, selector-matched existing flow or eligible new responder `SYN`, locally delivered in the current host/netns, non-loopback ingress |
+| Match | IPv4 or IPv6 TCP, selector-matched existing flow or eligible new responder `SYN`, locally delivered in the current host/netns, non-loopback ingress |
 
 Behavior:
 
@@ -408,7 +411,7 @@ Behavior:
 |---|---|
 | Hook | `NF_INET_PRE_ROUTING` |
 | Target priority | before conntrack and before local UDP processing (`-400` in current design target) |
-| Match | IPv4 UDP, selector-matched tuple, locally delivered in the current host/netns, non-loopback ingress |
+| Match | IPv4 or IPv6 UDP, selector-matched tuple, locally delivered in the current host/netns, non-loopback ingress |
 
 Behavior:
 
@@ -436,9 +439,9 @@ Result:
 For module-generated fake-TCP packets:
 
 - build a new TCP skb
-- set IPv4/TCP headers and checksums explicitly
+- set IPv4/TCP or IPv6/TCP headers and checksums explicitly for the active family
 - clear conntrack association before injection
-- transmit via normal local output path (`ip_local_out` style)
+- transmit via the normal family-specific local output path (`ip_local_out` / `ip6_local_out` style)
 
 Because `LOCAL_OUT` steals UDP, not TCP, module-generated fake TCP does not need a complex self-bypass path.
 
@@ -449,7 +452,7 @@ Chosen policy:
 
 - cache last successful routed egress device used for fake-TCP transmission
 - if that device goes `GOING_DOWN`, `DOWN`, or is unregistered: invalidate flow immediately
-- if the exact local IPv4 address bound into the flow tuple is removed: invalidate flow immediately
+- if the exact local IPv4 or IPv6 address bound into the flow tuple is removed: invalidate flow immediately
 - invalidation is silent local teardown; do not fabricate `RST` from a path or source identity that no longer exists
 - next outbound UDP may create a fresh generation normally
 
@@ -470,6 +473,7 @@ Design constraints:
 - up to 16 `managed_local_ports`
 - up to 16 `managed_remote_peers`
 - at least one selector list must be non-empty
+- `ip_families` is one of `both`, `ipv4`, `ipv6`; default `both`
 
 Future control plane direction:
 

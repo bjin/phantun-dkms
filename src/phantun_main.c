@@ -11,6 +11,7 @@
 #include <linux/netdevice.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
+#include <linux/netfilter_ipv6.h>
 #include <linux/random.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
@@ -20,6 +21,11 @@
 #include <net/netfilter/nf_conntrack_core.h>
 #include <net/netns/generic.h>
 #include <net/route.h>
+#if IS_ENABLED(CONFIG_IPV6)
+#include <net/addrconf.h>
+#include <net/ipv6.h>
+#include <net/sock.h>
+#endif
 
 #include "phantun_compat.h" // IWYU pragma: keep
 #if PHANTUN_HAVE_BASE64_DECODE
@@ -46,6 +52,7 @@ static int managed_local_ports_count;
 static char *managed_remote_peers[PHANTUN_MAX_MANAGED_PEERS];
 static int managed_remote_peers_count;
 static char *reserved_local_ports;
+static char *ip_families = "both";
 static char *handshake_request;
 static char *handshake_response;
 static unsigned int handshake_timeout_ms = PHANTUN_DEFAULT_HANDSHAKE_TIMEOUT_MS;
@@ -61,12 +68,16 @@ module_param_array_named(managed_local_ports, managed_local_ports, uint, &manage
 MODULE_PARM_DESC(managed_local_ports, "Comma-separated local UDP/TCP ports managed by phantun");
 module_param_array_named(managed_remote_peers, managed_remote_peers, charp,
                          &managed_remote_peers_count, 0444);
-MODULE_PARM_DESC(managed_remote_peers, "Comma-separated remote IPv4:port peers managed by phantun");
+MODULE_PARM_DESC(
+    managed_remote_peers,
+    "Comma-separated remote IPv4:port or bracketed [IPv6]:port peers managed by phantun");
 module_param(reserved_local_ports, charp, 0444);
 MODULE_PARM_DESC(reserved_local_ports,
                  "Optional local-only TCP reservation set: empty or 'off' disables, "
                  "comma-separated ports reserve up to 16 managed_local_ports entries, and 'all' "
                  "reserves every managed_local_ports entry");
+module_param(ip_families, charp, 0444);
+MODULE_PARM_DESC(ip_families, "IP families to translate: both, ipv4, or ipv6");
 module_param(handshake_request, charp, 0444);
 MODULE_PARM_DESC(handshake_request,
                  "Optional initiator control payload sent as the first fake-TCP payload (plain "
@@ -102,11 +113,17 @@ static void *phantun_alloc_req;
 static void *phantun_alloc_resp;
 static unsigned int phantun_net_id;
 static struct notifier_block phantun_inetaddr_nb;
+#if IS_ENABLED(CONFIG_IPV6)
+static struct notifier_block phantun_inet6addr_nb;
+#endif
 
 struct phantun_net {
     struct pht_flow_table flows;
     struct notifier_block netdev_nb;
-    struct socket *reserved_local_socks[PHANTUN_MAX_MANAGED_PORTS];
+    struct socket *reserved_local_socks_v4[PHANTUN_MAX_MANAGED_PORTS];
+#if IS_ENABLED(CONFIG_IPV6)
+    struct socket *reserved_local_socks_v6[PHANTUN_MAX_MANAGED_PORTS];
+#endif
 };
 
 static unsigned int phantun_netns_id(const struct net *net) { return net ? net->ns.inum : 0; }
@@ -165,7 +182,14 @@ static int phantun_inetaddr_event(struct notifier_block *nb, unsigned long event
     if (!flows)
         return NOTIFY_DONE;
 
-    invalidated = pht_flow_invalidate_local_addr(flows, ifa->ifa_local);
+    {
+        struct pht_addr addr = {
+            .family = AF_INET,
+            .v4 = ifa->ifa_local,
+        };
+
+        invalidated = pht_flow_invalidate_local_addr(flows, &addr);
+    }
     if (invalidated)
         pht_pr_info("invalidated %u flow(s) after removing local IPv4 %pI4 on %s\n", invalidated,
                     &ifa->ifa_local, dev->name);
@@ -173,11 +197,41 @@ static int phantun_inetaddr_event(struct notifier_block *nb, unsigned long event
     return NOTIFY_DONE;
 }
 
+#if IS_ENABLED(CONFIG_IPV6)
+static int phantun_inet6addr_event(struct notifier_block *nb, unsigned long event, void *ptr) {
+    struct inet6_ifaddr *ifa = ptr;
+    struct net_device *dev;
+    struct pht_flow_table *flows;
+    struct pht_addr addr;
+    unsigned int invalidated;
+
+    if (event != NETDEV_DOWN || !ifa || !ifa->idev || !ifa->idev->dev)
+        return NOTIFY_DONE;
+
+    dev = ifa->idev->dev;
+    flows = phantun_net_flows(dev_net(dev));
+    if (!flows)
+        return NOTIFY_DONE;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.family = AF_INET6;
+    addr.v6 = ifa->addr;
+    invalidated = pht_flow_invalidate_local_addr(flows, &addr);
+    if (invalidated)
+        pht_pr_info("invalidated %u flow(s) after removing local IPv6 %pI6c on %s\n", invalidated,
+                    &ifa->addr, dev->name);
+
+    return NOTIFY_DONE;
+}
+#endif
+
 static int phantun_parse_managed_remote_peer(const char *peer,
                                              struct pht_managed_peer *parsed_peer) {
-    char buf[32];
-    char *colon;
-    u8 parsed_addr[4];
+    char buf[80];
+    char *host;
+    char *port;
+    char *end;
+    u8 parsed_addr[sizeof(struct in6_addr)];
     unsigned int port_host;
 
     if (!peer || !*peer || !parsed_peer)
@@ -185,19 +239,33 @@ static int phantun_parse_managed_remote_peer(const char *peer,
     if (strscpy(buf, peer, sizeof(buf)) < 0)
         return -EINVAL;
 
-    colon = strrchr(buf, ':');
-    if (!colon)
-        return -EINVAL;
-    *colon = '\0';
-    colon++;
-    if (!*buf || !*colon)
-        return -EINVAL;
-    if (!in4_pton(buf, -1, parsed_addr, -1, NULL))
-        return -EINVAL;
-    if (kstrtouint(colon, 10, &port_host) || !port_host || port_host > U16_MAX)
-        return -EINVAL;
+    memset(parsed_peer, 0, sizeof(*parsed_peer));
+    if (buf[0] == '[') {
+        host = buf + 1;
+        end = strchr(host, ']');
+        if (!end || end[1] != ':' || !end[2])
+            return -EINVAL;
+        *end = '\0';
+        port = end + 2;
+        if (!*host || !in6_pton(host, -1, parsed_addr, -1, NULL))
+            return -EINVAL;
+        parsed_peer->addr.family = AF_INET6;
+        memcpy(&parsed_peer->addr.v6, parsed_addr, sizeof(parsed_peer->addr.v6));
+    } else {
+        host = buf;
+        port = strrchr(buf, ':');
+        if (!port || port != strchr(buf, ':'))
+            return -EINVAL;
+        *port = '\0';
+        port++;
+        if (!*host || !*port || !in4_pton(host, -1, parsed_addr, -1, NULL))
+            return -EINVAL;
+        parsed_peer->addr.family = AF_INET;
+        memcpy(&parsed_peer->addr.v4, parsed_addr, sizeof(parsed_peer->addr.v4));
+    }
 
-    memcpy(&parsed_peer->addr, parsed_addr, sizeof(parsed_addr));
+    if (kstrtouint(port, 10, &port_host) || !port_host || port_host > U16_MAX)
+        return -EINVAL;
     parsed_peer->port = htons((u16)port_host);
     return 0;
 }
@@ -343,12 +411,16 @@ static void phantun_release_reserved_local_tcp_ports(struct phantun_net *pnet) {
     if (!pnet)
         return;
 
-    for (i = 0; i < ARRAY_SIZE(pnet->reserved_local_socks); i++)
-        phantun_release_reserved_local_tcp_socket(&pnet->reserved_local_socks[i]);
+    for (i = 0; i < ARRAY_SIZE(pnet->reserved_local_socks_v4); i++)
+        phantun_release_reserved_local_tcp_socket(&pnet->reserved_local_socks_v4[i]);
+#if IS_ENABLED(CONFIG_IPV6)
+    for (i = 0; i < ARRAY_SIZE(pnet->reserved_local_socks_v6); i++)
+        phantun_release_reserved_local_tcp_socket(&pnet->reserved_local_socks_v6[i]);
+#endif
 }
 
-static void phantun_reserve_local_tcp_port(struct phantun_net *pnet, struct net *net,
-                                           unsigned int slot, u16 port) {
+static void phantun_reserve_local_tcp_port_v4(struct phantun_net *pnet, struct net *net,
+                                              unsigned int slot, u16 port) {
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = htonl(INADDR_ANY),
@@ -378,14 +450,58 @@ static void phantun_reserve_local_tcp_port(struct phantun_net *pnet, struct net 
         return;
     }
 
-    pnet->reserved_local_socks[slot] = sock;
+    pnet->reserved_local_socks_v4[slot] = sock;
 }
+
+#if IS_ENABLED(CONFIG_IPV6)
+static void phantun_reserve_local_tcp_port_v6(struct phantun_net *pnet, struct net *net,
+                                              unsigned int slot, u16 port) {
+    struct sockaddr_in6 addr = {
+        .sin6_family = AF_INET6,
+        .sin6_addr = IN6ADDR_ANY_INIT,
+        .sin6_port = htons(port),
+    };
+    struct socket *sock = NULL;
+    int ret;
+
+    ret = sock_create_kern(net, AF_INET6, SOCK_STREAM, IPPROTO_TCP, &sock);
+    if (ret) {
+        pht_pr_warn(
+            "failed to create IPv6 reservation socket for local TCP port %u in netns %u: %d\n",
+            port, phantun_netns_id(net), ret);
+        return;
+    }
+
+    sock->sk->sk_ipv6only = true;
+
+    ret = KERNEL_BIND_COMPAT(sock, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret) {
+        if (ret == -EADDRINUSE)
+            pht_pr_info(
+                "local IPv6 TCP port %u is already occupied in netns %u, leaving it unreserved\n",
+                port, phantun_netns_id(net));
+        else
+            pht_pr_warn("failed to reserve local IPv6 TCP port %u in netns %u: %d\n", port,
+                        phantun_netns_id(net), ret);
+        sock_release(sock);
+        return;
+    }
+
+    pnet->reserved_local_socks_v6[slot] = sock;
+}
+#endif
 
 static void phantun_reserve_configured_local_tcp_ports(struct phantun_net *pnet, struct net *net) {
     unsigned int i;
 
-    for (i = 0; i < phantun_cfg.reserved_local_ports_count; i++)
-        phantun_reserve_local_tcp_port(pnet, net, i, phantun_cfg.reserved_local_ports[i]);
+    for (i = 0; i < phantun_cfg.reserved_local_ports_count; i++) {
+        if (phantun_cfg.enabled_families & PHT_FAMILY_IPV4)
+            phantun_reserve_local_tcp_port_v4(pnet, net, i, phantun_cfg.reserved_local_ports[i]);
+#if IS_ENABLED(CONFIG_IPV6)
+        if (phantun_cfg.enabled_families & PHT_FAMILY_IPV6)
+            phantun_reserve_local_tcp_port_v6(pnet, net, i, phantun_cfg.reserved_local_ports[i]);
+#endif
+    }
 }
 
 static void phantun_account_udp_queue_result(bool queued) {
@@ -421,8 +537,21 @@ static bool phantun_pre_routing_uses_loopback_dev(const struct sk_buff *skb,
  * selectors, otherwise a router deployment will spuriously reset or drop
  * forwarded traffic.
  */
-static bool phantun_pre_routing_targets_local_host(const struct net *net, __be32 addr) {
-    return net && inet_addr_type_table((struct net *)net, addr, RT_TABLE_LOCAL) == RTN_LOCAL;
+static bool phantun_pre_routing_targets_local_host(const struct net *net,
+                                                   const struct pht_addr *addr) {
+    if (!net || !addr)
+        return false;
+
+    switch (addr->family) {
+    case AF_INET:
+        return inet_addr_type_table((struct net *)net, addr->v4, RT_TABLE_LOCAL) == RTN_LOCAL;
+#if IS_ENABLED(CONFIG_IPV6)
+    case AF_INET6:
+        return ipv6_chk_addr((struct net *)net, &addr->v6, NULL, 0);
+#endif
+    default:
+        return false;
+    }
 }
 
 static bool phantun_local_port_allowed(__be16 port) {
@@ -439,14 +568,30 @@ static bool phantun_local_port_allowed(__be16 port) {
     return false;
 }
 
-static bool phantun_remote_peer_allowed(__be32 addr, __be16 port) {
+static bool phantun_addr_equal(const struct pht_addr *a, const struct pht_addr *b) {
+    if (!a || !b || a->family != b->family)
+        return false;
+
+    switch (a->family) {
+    case AF_INET:
+        return a->v4 == b->v4;
+#if IS_ENABLED(CONFIG_IPV6)
+    case AF_INET6:
+        return ipv6_addr_equal(&a->v6, &b->v6);
+#endif
+    default:
+        return false;
+    }
+}
+
+static bool phantun_remote_peer_allowed(const struct pht_addr *addr, __be16 port) {
     unsigned int i;
 
     if (!phantun_cfg.managed_remote_peers_count)
         return true;
 
     for (i = 0; i < phantun_cfg.managed_remote_peers_count; i++) {
-        if (phantun_cfg.managed_remote_peers[i].addr == addr &&
+        if (phantun_addr_equal(&phantun_cfg.managed_remote_peers[i].addr, addr) &&
             phantun_cfg.managed_remote_peers[i].port == port)
             return true;
     }
@@ -454,25 +599,128 @@ static bool phantun_remote_peer_allowed(__be32 addr, __be16 port) {
     return false;
 }
 
-static bool phantun_selectors_allow(__be16 local_port, __be32 remote_addr, __be16 remote_port) {
+static bool phantun_selectors_allow(__be16 local_port, const struct pht_addr *remote_addr,
+                                    __be16 remote_port) {
     return phantun_local_port_allowed(local_port) &&
            phantun_remote_peer_allowed(remote_addr, remote_port);
 }
 
 static void phantun_fill_udp_endpoint_pair(const struct pht_l4_view *view,
-                                           struct pht_ipv4_endpoint_pair *ep) {
-    ep->local_addr = view->iph->saddr;
-    ep->remote_addr = view->iph->daddr;
+                                           struct pht_endpoint_pair *ep) {
+    memset(ep, 0, sizeof(*ep));
     ep->local_port = view->udp->source;
     ep->remote_port = view->udp->dest;
+    if (view->family == AF_INET) {
+        ep->local_addr.family = AF_INET;
+        ep->local_addr.v4 = view->iph->saddr;
+        ep->remote_addr.family = AF_INET;
+        ep->remote_addr.v4 = view->iph->daddr;
+    } else {
+        ep->local_addr.family = AF_INET6;
+        ep->local_addr.v6 = view->ip6h->saddr;
+        ep->remote_addr.family = AF_INET6;
+        ep->remote_addr.v6 = view->ip6h->daddr;
+    }
 }
 
 static void phantun_fill_tcp_endpoint_pair(const struct pht_l4_view *view,
-                                           struct pht_ipv4_endpoint_pair *ep) {
-    ep->local_addr = view->iph->daddr;
-    ep->remote_addr = view->iph->saddr;
+                                           struct pht_endpoint_pair *ep) {
+    memset(ep, 0, sizeof(*ep));
     ep->local_port = view->tcp->dest;
     ep->remote_port = view->tcp->source;
+    if (view->family == AF_INET) {
+        ep->local_addr.family = AF_INET;
+        ep->local_addr.v4 = view->iph->daddr;
+        ep->remote_addr.family = AF_INET;
+        ep->remote_addr.v4 = view->iph->saddr;
+    } else {
+        ep->local_addr.family = AF_INET6;
+        ep->local_addr.v6 = view->ip6h->daddr;
+        ep->remote_addr.family = AF_INET6;
+        ep->remote_addr.v6 = view->ip6h->saddr;
+    }
+}
+
+#if IS_ENABLED(CONFIG_IPV6)
+static void phantun_fill_endpoint_scope_ifindex(struct pht_endpoint_pair *ep,
+                                                const struct net_device *dev) {
+    if (!ep || !dev || ep->remote_addr.family != AF_INET6)
+        return;
+
+    ep->scope_ifindex = (int)ipv6_iface_scope_id(&ep->remote_addr.v6, dev->ifindex);
+}
+#else
+static void phantun_fill_endpoint_scope_ifindex(struct pht_endpoint_pair *ep,
+                                                const struct net_device *dev) {}
+#endif
+
+static bool phantun_family_enabled(u8 family) {
+    if (family == AF_INET)
+        return !!(phantun_cfg.enabled_families & PHT_FAMILY_IPV4);
+    if (family == AF_INET6)
+        return !!(phantun_cfg.enabled_families & PHT_FAMILY_IPV6);
+    return false;
+}
+
+static int phantun_parse_udp_skb(struct sk_buff *skb, struct pht_l4_view *view) {
+    int ret;
+
+    if (ntohs(skb->protocol) == ETH_P_IP)
+        return pht_parse_ipv4_udp(skb, view);
+    if (ntohs(skb->protocol) == ETH_P_IPV6)
+        return pht_parse_ipv6_udp(skb, view);
+
+    ret = pht_parse_ipv4_udp(skb, view);
+    if (!ret)
+        return 0;
+    return pht_parse_ipv6_udp(skb, view);
+}
+
+static int phantun_parse_tcp_skb(struct sk_buff *skb, struct pht_l4_view *view) {
+    int ret;
+
+    if (ntohs(skb->protocol) == ETH_P_IP)
+        return pht_parse_ipv4_tcp(skb, view);
+    if (ntohs(skb->protocol) == ETH_P_IPV6)
+        return pht_parse_ipv6_tcp(skb, view);
+
+    ret = pht_parse_ipv4_tcp(skb, view);
+    if (!ret)
+        return 0;
+    return pht_parse_ipv6_tcp(skb, view);
+}
+
+static int phantun_validate_tcp_checksums(const struct sk_buff *skb,
+                                          const struct pht_l4_view *view) {
+    if (view->family == AF_INET)
+        return pht_validate_ipv4_tcp_checksums(skb, view);
+    if (view->family == AF_INET6)
+        return pht_validate_ipv6_tcp_checksums(skb, view);
+    return -EINVAL;
+}
+
+static void phantun_view_remote_addr(const struct pht_l4_view *view, bool tcp,
+                                     struct pht_addr *addr) {
+    memset(addr, 0, sizeof(*addr));
+    if (view->family == AF_INET) {
+        addr->family = AF_INET;
+        addr->v4 = tcp ? view->iph->saddr : view->iph->daddr;
+    } else {
+        addr->family = AF_INET6;
+        addr->v6 = tcp ? view->ip6h->saddr : view->ip6h->daddr;
+    }
+}
+
+static void phantun_view_local_addr(const struct pht_l4_view *view, bool tcp,
+                                    struct pht_addr *addr) {
+    memset(addr, 0, sizeof(*addr));
+    if (view->family == AF_INET) {
+        addr->family = AF_INET;
+        addr->v4 = tcp ? view->iph->daddr : view->iph->saddr;
+    } else {
+        addr->family = AF_INET6;
+        addr->v6 = tcp ? view->ip6h->daddr : view->ip6h->saddr;
+    }
 }
 
 static u32 phantun_random_aligned_seq(void) { return (get_random_u32() / 4095U) * 4095U; }
@@ -637,19 +885,19 @@ static bool phantun_response_enabled(void) {
 }
 
 static int phantun_send_flow_rst(struct pht_flow *flow, struct net *net) {
-    struct pht_ipv4_endpoint_pair ep;
+    struct pht_endpoint_pair ep;
     u32 seq;
     u32 ack;
     int ifindex;
     int ret;
 
     spin_lock_bh(&flow->lock);
-    ep = flow->oriented;
+    ep = flow->endpoints;
     seq = flow->seq;
     ack = flow->ack;
     spin_unlock_bh(&flow->lock);
 
-    ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_RST, NULL, 0, &ifindex);
+    ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_RST, NULL, 0, &ifindex);
     if (!ret) {
         pht_flow_set_egress_ifindex(flow, ifindex);
         pht_stats_inc(PHT_STAT_RST_SENT);
@@ -657,8 +905,7 @@ static int phantun_send_flow_rst(struct pht_flow *flow, struct net *net) {
     return ret;
 }
 
-static int phantun_send_established_udp(struct pht_flow *flow,
-                                        const struct pht_ipv4_endpoint_pair *ep,
+static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_endpoint_pair *ep,
                                         const struct pht_l4_view *view, const struct sk_buff *skb,
                                         struct net *net) {
     u32 seq;
@@ -696,8 +943,8 @@ static int phantun_send_established_udp(struct pht_flow *flow,
     flow->seq += view->payload_len;
     spin_unlock_bh(&flow->lock);
 
-    ret = pht_emit_fake_tcp_v4(net, ep, seq, ack, PHT_TCP_FLAG_ACK, payload, view->payload_len,
-                               &ifindex);
+    ret = pht_emit_fake_tcp(net, ep, seq, ack, PHT_TCP_FLAG_ACK, payload, view->payload_len,
+                            &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
         if (flow->state == PHT_FLOW_STATE_ESTABLISHED) {
@@ -721,40 +968,39 @@ static int phantun_send_established_udp(struct pht_flow *flow,
 }
 
 static int phantun_send_synack(struct pht_flow *flow, struct net *net) {
-    struct pht_ipv4_endpoint_pair ep;
+    struct pht_endpoint_pair ep;
     u32 seq;
     u32 ack;
     int ifindex;
     int ret;
 
     spin_lock_bh(&flow->lock);
-    ep = flow->oriented;
+    ep = flow->endpoints;
     seq = flow->local_isn;
     ack = flow->peer_syn_next;
     spin_unlock_bh(&flow->lock);
 
-    ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_SYN | PHT_TCP_FLAG_ACK, NULL, 0,
-                               &ifindex);
+    ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_SYN | PHT_TCP_FLAG_ACK, NULL, 0,
+                            &ifindex);
     if (!ret)
         pht_flow_set_egress_ifindex(flow, ifindex);
     return ret;
 }
 
-static int phantun_send_rstack(struct net *net, const struct pht_ipv4_endpoint_pair *ep,
+static int phantun_send_rstack(struct net *net, const struct pht_endpoint_pair *ep,
                                const struct pht_l4_view *view, bool force_zero_seq) {
     u32 seq = force_zero_seq ? 0 : ntohl(view->tcp->ack_seq);
     u32 ack = ntohl(view->tcp->seq) + phantun_tcp_seq_advance(view->tcp, view->payload_len);
     int ret;
 
-    ret =
-        pht_emit_fake_tcp_v4(net, ep, seq, ack, PHT_TCP_FLAG_RST | PHT_TCP_FLAG_ACK, NULL, 0, NULL);
+    ret = pht_emit_fake_tcp(net, ep, seq, ack, PHT_TCP_FLAG_RST | PHT_TCP_FLAG_ACK, NULL, 0, NULL);
     if (!ret)
         pht_stats_inc(PHT_STAT_RST_SENT);
     return ret;
 }
 
 static int phantun_send_handshake_request(struct pht_flow *flow, struct net *net) {
-    struct pht_ipv4_endpoint_pair ep;
+    struct pht_endpoint_pair ep;
     u32 seq;
     u32 ack;
     size_t req_len = phantun_cfg.handshake_request_len;
@@ -762,13 +1008,13 @@ static int phantun_send_handshake_request(struct pht_flow *flow, struct net *net
     int ret;
 
     spin_lock_bh(&flow->lock);
-    ep = flow->oriented;
+    ep = flow->endpoints;
     seq = flow->local_isn + 1;
     ack = flow->ack;
     spin_unlock_bh(&flow->lock);
 
-    ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, phantun_cfg.handshake_request,
-                               req_len, &ifindex);
+    ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, phantun_cfg.handshake_request,
+                            req_len, &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
         flow->seq = seq + req_len;
@@ -782,7 +1028,7 @@ static int phantun_send_handshake_request(struct pht_flow *flow, struct net *net
 }
 
 static int phantun_send_handshake_response(struct pht_flow *flow, struct net *net) {
-    struct pht_ipv4_endpoint_pair ep;
+    struct pht_endpoint_pair ep;
     u32 seq;
     u32 ack;
     size_t resp_len = phantun_cfg.handshake_response_len;
@@ -790,13 +1036,13 @@ static int phantun_send_handshake_response(struct pht_flow *flow, struct net *ne
     int ret;
 
     spin_lock_bh(&flow->lock);
-    ep = flow->oriented;
+    ep = flow->endpoints;
     seq = flow->local_isn + 1;
     ack = flow->ack;
     spin_unlock_bh(&flow->lock);
 
-    ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, phantun_cfg.handshake_response,
-                               resp_len, &ifindex);
+    ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, phantun_cfg.handshake_response,
+                            resp_len, &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
         flow->seq = seq + resp_len;
@@ -810,19 +1056,19 @@ static int phantun_send_handshake_response(struct pht_flow *flow, struct net *ne
 }
 
 static int phantun_send_idle_ack(struct pht_flow *flow, struct net *net) {
-    struct pht_ipv4_endpoint_pair ep;
+    struct pht_endpoint_pair ep;
     u32 seq;
     u32 ack;
     int ifindex;
     int ret;
 
     spin_lock_bh(&flow->lock);
-    ep = flow->oriented;
+    ep = flow->endpoints;
     seq = flow->seq;
     ack = flow->ack;
     spin_unlock_bh(&flow->lock);
 
-    ret = pht_emit_fake_tcp_v4(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, NULL, 0, &ifindex);
+    ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, NULL, 0, &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
         flow->last_ack = ack;
@@ -836,20 +1082,21 @@ static int phantun_send_idle_ack(struct pht_flow *flow, struct net *net) {
 static int phantun_flush_queued_udp(struct pht_flow *flow, struct net *net) {
     struct sk_buff *queued_skb;
     struct pht_l4_view qview;
-    struct pht_ipv4_endpoint_pair qep;
+    struct pht_endpoint_pair qep;
     int ret;
 
     queued_skb = pht_flow_take_queued_skb(flow);
     if (!queued_skb)
         return 0;
 
-    ret = pht_parse_ipv4_udp(queued_skb, &qview);
+    ret = phantun_parse_udp_skb(queued_skb, &qview);
     if (ret) {
         kfree_skb(queued_skb);
         return ret;
     }
 
     phantun_fill_udp_endpoint_pair(&qview, &qep);
+    qep.scope_ifindex = flow->endpoints.scope_ifindex;
     ret = phantun_send_established_udp(flow, &qep, &qview, queued_skb, net);
     if (ret)
         pht_flow_set_queued_skb(flow, queued_skb);
@@ -858,11 +1105,15 @@ static int phantun_flush_queued_udp(struct pht_flow *flow, struct net *net) {
     return ret;
 }
 
-static bool phantun_payload_exceeds_udp_reinject_limit(unsigned int payload_len) {
-    return payload_len > PHT_V4_MAX_UDP_PAYLOAD_LEN;
+static bool phantun_payload_exceeds_udp_reinject_limit(const struct pht_l4_view *view) {
+    if (view->family == AF_INET)
+        return view->payload_len > PHT_V4_MAX_UDP_PAYLOAD_LEN;
+    if (view->family == AF_INET6)
+        return view->payload_len > PHT_V6_MAX_UDP_PAYLOAD_LEN;
+    return true;
 }
 
-static int phantun_reinject_inbound_payload(const struct pht_ipv4_endpoint_pair *ep,
+static int phantun_reinject_inbound_payload(const struct pht_endpoint_pair *ep,
                                             const struct sk_buff *skb,
                                             const struct pht_l4_view *view,
                                             struct net_device *dev) {
@@ -878,7 +1129,7 @@ static int phantun_reinject_inbound_payload(const struct pht_ipv4_endpoint_pair 
 
     ret = pht_copy_l4_payload(skb, view, payload, view->payload_len);
     if (!ret)
-        ret = pht_reinject_udp_payload_v4(dev, ep, payload, view->payload_len);
+        ret = pht_reinject_udp_payload(dev, ep, payload, view->payload_len);
     kfree(payload);
     return ret;
 }
@@ -908,7 +1159,7 @@ static void phantun_note_inbound_payload(struct pht_flow *flow, const struct pht
 }
 
 static int phantun_finalize_established_rx(struct pht_flow *flow,
-                                           const struct pht_ipv4_endpoint_pair *ep,
+                                           const struct pht_endpoint_pair *ep,
                                            const struct sk_buff *skb,
                                            const struct pht_l4_view *view, struct net *net,
                                            struct net_device *dev, bool reinject_payload,
@@ -921,7 +1172,7 @@ static int phantun_finalize_established_rx(struct pht_flow *flow,
      * packet budget, so reject it before any ACK/liveness state is refreshed
      * or any large atomic allocation is attempted.
      */
-    if (view->payload_len && phantun_payload_exceeds_udp_reinject_limit(view->payload_len)) {
+    if (view->payload_len && phantun_payload_exceeds_udp_reinject_limit(view)) {
         pht_stats_inc(PHT_STAT_OVERSIZED_PAYLOADS_DROPPED);
         return -EMSGSIZE;
     }
@@ -971,7 +1222,8 @@ static int phantun_confirm_outbound_udp_conntrack(struct sk_buff *skb) {
 static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
                                       const struct nf_hook_state *state) {
     struct pht_l4_view view;
-    struct pht_ipv4_endpoint_pair ep;
+    struct pht_endpoint_pair ep;
+    struct pht_addr remote_addr;
     struct pht_flow_table *flows;
     struct pht_flow *flow;
     struct pht_flow *new_flow;
@@ -989,14 +1241,17 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
     if (!flows)
         return NF_ACCEPT;
 
-    ret = pht_parse_ipv4_udp(skb, &view);
+    ret = phantun_parse_udp_skb(skb, &view);
     if (ret)
+        return NF_ACCEPT;
+    if (!phantun_family_enabled(view.family))
         return NF_ACCEPT;
 
     if (phantun_local_out_uses_loopback_dev(skb, state))
         return NF_ACCEPT;
 
-    if (!phantun_selectors_allow(view.udp->source, view.iph->daddr, view.udp->dest))
+    phantun_view_remote_addr(&view, false, &remote_addr);
+    if (!phantun_selectors_allow(view.udp->source, &remote_addr, view.udp->dest))
         return NF_ACCEPT;
 
     ret = phantun_confirm_outbound_udp_conntrack(skb);
@@ -1007,9 +1262,10 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
     }
 
     phantun_fill_udp_endpoint_pair(&view, &ep);
+    phantun_fill_endpoint_scope_ifindex(&ep, state->out ? state->out : skb->dev);
 
 retry_lookup:
-    flow = pht_flow_lookup_oriented(flows, &ep);
+    flow = pht_flow_lookup(flows, &ep);
     if (flow) {
         spin_lock_bh(&flow->lock);
         state_now = flow->state;
@@ -1117,8 +1373,7 @@ retry_lookup:
     {
         int ifindex;
 
-        ret =
-            pht_emit_fake_tcp_v4(state->net, &ep, init_seq, 0, PHT_TCP_FLAG_SYN, NULL, 0, &ifindex);
+        ret = pht_emit_fake_tcp(state->net, &ep, init_seq, 0, PHT_TCP_FLAG_SYN, NULL, 0, &ifindex);
         if (!ret)
             pht_flow_set_egress_ifindex(new_flow, ifindex);
     }
@@ -1149,6 +1404,8 @@ static unsigned int phantun_pre_routing_segment_gso(void *priv, struct sk_buff *
 
     if (!skb_is_gso(skb) || !skb_is_gso_tcp(skb))
         return NF_ACCEPT;
+    if (ntohs(skb->protocol) == ETH_P_IPV6)
+        features = NETIF_F_SG | NETIF_F_IPV6_CSUM;
 
     segs = __skb_gso_segment(skb, features, false);
     if (IS_ERR_OR_NULL(segs)) {
@@ -1179,6 +1436,8 @@ static unsigned int phantun_pre_routing_segment_gso(void *priv, struct sk_buff *
 static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb,
                                                  const struct nf_hook_state *state) {
     struct pht_l4_view view;
+    struct pht_addr local_addr;
+    struct pht_addr remote_addr;
     int ret;
 
     if (!state || !skb)
@@ -1192,14 +1451,18 @@ static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb
     if (phantun_pre_routing_uses_loopback_dev(skb, state))
         return NF_ACCEPT;
 
-    ret = pht_parse_ipv4_udp(skb, &view);
+    ret = phantun_parse_udp_skb(skb, &view);
     if (ret)
         return NF_ACCEPT;
-
-    if (!phantun_pre_routing_targets_local_host(state->net, view.iph->daddr))
+    if (!phantun_family_enabled(view.family))
         return NF_ACCEPT;
 
-    if (!phantun_selectors_allow(view.udp->dest, view.iph->saddr, view.udp->source))
+    phantun_view_local_addr(&view, true, &local_addr);
+    if (!phantun_pre_routing_targets_local_host(state->net, &local_addr))
+        return NF_ACCEPT;
+
+    phantun_view_remote_addr(&view, true, &remote_addr);
+    if (!phantun_selectors_allow(view.udp->dest, &remote_addr, view.udp->source))
         return NF_ACCEPT;
 
     pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
@@ -1214,7 +1477,9 @@ static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb
 static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                                         const struct nf_hook_state *state) {
     struct pht_l4_view view;
-    struct pht_ipv4_endpoint_pair ep;
+    struct pht_endpoint_pair ep;
+    struct pht_addr local_addr;
+    struct pht_addr remote_addr;
     struct pht_flow_table *flows;
     struct pht_flow *flow;
     struct pht_flow *new_flow;
@@ -1244,28 +1509,33 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     if (!flows)
         return NF_DROP;
 
-    ret = pht_parse_ipv4_tcp(skb, &view);
+    ret = phantun_parse_tcp_skb(skb, &view);
     if (ret)
         return NF_ACCEPT;
-
-    if (!phantun_pre_routing_targets_local_host(state->net, view.iph->daddr))
+    if (!phantun_family_enabled(view.family))
         return NF_ACCEPT;
 
-    if (!phantun_selectors_allow(view.tcp->dest, view.iph->saddr, view.tcp->source))
+    phantun_view_local_addr(&view, true, &local_addr);
+    if (!phantun_pre_routing_targets_local_host(state->net, &local_addr))
+        return NF_ACCEPT;
+
+    phantun_view_remote_addr(&view, true, &remote_addr);
+    if (!phantun_selectors_allow(view.tcp->dest, &remote_addr, view.tcp->source))
         return NF_ACCEPT;
 
     ret = phantun_pre_routing_segment_gso(priv, skb, state);
     if (ret != NF_ACCEPT)
         return ret;
 
-    ret = pht_validate_ipv4_tcp_checksums(skb, &view);
+    ret = phantun_validate_tcp_checksums(skb, &view);
     if (ret)
         return NF_DROP;
 
     phantun_fill_tcp_endpoint_pair(&view, &ep);
     in_dev = state->in ? state->in : skb->dev;
+    phantun_fill_endpoint_scope_ifindex(&ep, in_dev);
 
-    flow = pht_flow_lookup_oriented(flows, &ep);
+    flow = pht_flow_lookup(flows, &ep);
     if (flow) {
         spin_lock_bh(&flow->lock);
         state_now = flow->state;
@@ -1703,7 +1973,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     return NF_DROP;
 }
 
-static struct nf_hook_ops phantun_nf_ops[] = {
+static struct nf_hook_ops phantun_nf_ops_v4[] = {
     {
         .hook = phantun_local_out,
         .pf = NFPROTO_IPV4,
@@ -1726,6 +1996,29 @@ static struct nf_hook_ops phantun_nf_ops[] = {
         .priority = PHANTUN_PRE_ROUTING_PRIORITY,
     },
 };
+
+#if IS_ENABLED(CONFIG_IPV6)
+static struct nf_hook_ops phantun_nf_ops_v6[] = {
+    {
+        .hook = phantun_local_out,
+        .pf = NFPROTO_IPV6,
+        .hooknum = NF_INET_LOCAL_OUT,
+        .priority = PHANTUN_LOCAL_OUT_PRIORITY,
+    },
+    {
+        .hook = phantun_pre_routing_udp_drop,
+        .pf = NFPROTO_IPV6,
+        .hooknum = NF_INET_PRE_ROUTING,
+        .priority = PHANTUN_PRE_ROUTING_PRIORITY,
+    },
+    {
+        .hook = phantun_pre_routing,
+        .pf = NFPROTO_IPV6,
+        .hooknum = NF_INET_PRE_ROUTING,
+        .priority = PHANTUN_PRE_ROUTING_PRIORITY,
+    },
+};
+#endif
 
 static int __net_init phantun_net_init(struct net *net) {
     struct phantun_net *pnet = net_generic(net, phantun_net_id);
@@ -1752,17 +2045,37 @@ static int __net_init phantun_net_init(struct net *net) {
 
     phantun_reserve_configured_local_tcp_ports(pnet, net);
 
-    ret = nf_register_net_hooks(net, phantun_nf_ops, ARRAY_SIZE(phantun_nf_ops));
-    if (ret) {
-        pht_pr_err("failed to register netfilter hooks: %d\n", ret);
-        phantun_release_reserved_local_tcp_ports(pnet);
-        unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
-        pht_flow_table_destroy(flows);
-        return ret;
+    if (phantun_cfg.enabled_families & PHT_FAMILY_IPV4) {
+        ret = nf_register_net_hooks(net, phantun_nf_ops_v4, ARRAY_SIZE(phantun_nf_ops_v4));
+        if (ret) {
+            pht_pr_err("failed to register IPv4 netfilter hooks: %d\n", ret);
+            phantun_release_reserved_local_tcp_ports(pnet);
+            unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
+            pht_flow_table_destroy(flows);
+            return ret;
+        }
+        pht_pr_info(
+            "registered IPv4 LOCAL_OUT/PRE_ROUTING hooks and topology notifiers: netns %u\n",
+            phantun_netns_id(net));
     }
 
-    pht_pr_info("registered IPv4 LOCAL_OUT/PRE_ROUTING hooks and topology notifiers: netns %u\n",
-                phantun_netns_id(net));
+#if IS_ENABLED(CONFIG_IPV6)
+    if (phantun_cfg.enabled_families & PHT_FAMILY_IPV6) {
+        ret = nf_register_net_hooks(net, phantun_nf_ops_v6, ARRAY_SIZE(phantun_nf_ops_v6));
+        if (ret) {
+            pht_pr_err("failed to register IPv6 netfilter hooks: %d\n", ret);
+            if (phantun_cfg.enabled_families & PHT_FAMILY_IPV4)
+                nf_unregister_net_hooks(net, phantun_nf_ops_v4, ARRAY_SIZE(phantun_nf_ops_v4));
+            phantun_release_reserved_local_tcp_ports(pnet);
+            unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
+            pht_flow_table_destroy(flows);
+            return ret;
+        }
+        pht_pr_info(
+            "registered IPv6 LOCAL_OUT/PRE_ROUTING hooks and topology notifiers: netns %u\n",
+            phantun_netns_id(net));
+    }
+#endif
     return 0;
 }
 
@@ -1774,7 +2087,12 @@ static void __net_exit phantun_net_exit(struct net *net) {
         return;
 
     flows = &pnet->flows;
-    nf_unregister_net_hooks(net, phantun_nf_ops, ARRAY_SIZE(phantun_nf_ops));
+    if (phantun_cfg.enabled_families & PHT_FAMILY_IPV4)
+        nf_unregister_net_hooks(net, phantun_nf_ops_v4, ARRAY_SIZE(phantun_nf_ops_v4));
+#if IS_ENABLED(CONFIG_IPV6)
+    if (phantun_cfg.enabled_families & PHT_FAMILY_IPV6)
+        nf_unregister_net_hooks(net, phantun_nf_ops_v6, ARRAY_SIZE(phantun_nf_ops_v6));
+#endif
     unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
     pht_flow_table_destroy(flows);
     phantun_release_reserved_local_tcp_ports(pnet);
@@ -1789,13 +2107,48 @@ static struct pernet_operations phantun_pernet_ops = {
     .exit = phantun_net_exit,
 };
 
+static int phantun_parse_ip_families(unsigned int *families) {
+    if (!ip_families || strcmp(ip_families, "both") == 0) {
+#if IS_ENABLED(CONFIG_IPV6)
+        *families = PHT_FAMILY_IPV4 | PHT_FAMILY_IPV6;
+#else
+        *families = PHT_FAMILY_IPV4;
+        pht_pr_warn(
+            "ip_families=both requested but kernel IPv6 support is unavailable; using ipv4\n");
+#endif
+        return 0;
+    }
+
+    if (strcmp(ip_families, "ipv4") == 0) {
+        *families = PHT_FAMILY_IPV4;
+        return 0;
+    }
+
+    if (strcmp(ip_families, "ipv6") == 0) {
+#if IS_ENABLED(CONFIG_IPV6)
+        *families = PHT_FAMILY_IPV6;
+        return 0;
+#else
+        pht_pr_err("ip_families=ipv6 requires kernel IPv6 support\n");
+        return -EOPNOTSUPP;
+#endif
+    }
+
+    pht_pr_err("ip_families must be one of: both, ipv4, ipv6\n");
+    return -EINVAL;
+}
+
 static int phantun_validate_config(void) {
     u16 requested_ports[PHANTUN_MAX_MANAGED_PORTS];
     unsigned int requested_count;
     bool all_requested;
     unsigned int i;
     int ret;
+    unsigned int enabled_families;
 
+    ret = phantun_parse_ip_families(&enabled_families);
+    if (ret)
+        return ret;
     if (!managed_local_ports_count && !managed_remote_peers_count) {
         pht_pr_err("at least one selector entry is required\n");
         return -EINVAL;
@@ -1818,8 +2171,16 @@ static int phantun_validate_config(void) {
 
         ret = phantun_parse_managed_remote_peer(managed_remote_peers[i], &parsed_peer);
         if (ret) {
-            pht_pr_err("managed_remote_peers[%u] must be valid x.y.z.w:p\n", i);
+            pht_pr_err("managed_remote_peers[%u] must be valid x.y.z.w:p or [IPv6]:p\n", i);
             return ret;
+        }
+        if (parsed_peer.addr.family == AF_INET && !(enabled_families & PHT_FAMILY_IPV4)) {
+            pht_pr_err("managed_remote_peers[%u] is IPv4 but ip_families disables IPv4\n", i);
+            return -EINVAL;
+        }
+        if (parsed_peer.addr.family == AF_INET6 && !(enabled_families & PHT_FAMILY_IPV6)) {
+            pht_pr_err("managed_remote_peers[%u] is IPv6 but ip_families disables IPv6\n", i);
+            return -EINVAL;
         }
     }
 
@@ -1967,6 +2328,9 @@ static int phantun_snapshot_config(void) {
     int ret;
 
     memset(&phantun_cfg, 0, sizeof(phantun_cfg));
+    ret = phantun_parse_ip_families(&phantun_cfg.enabled_families);
+    if (ret)
+        return ret;
     phantun_cfg.managed_local_ports_count = managed_local_ports_count;
     for (i = 0; i < managed_local_ports_count; i++)
         phantun_cfg.managed_local_ports[i] = (u16)managed_local_ports[i];
@@ -2016,12 +2380,17 @@ static int phantun_snapshot_config(void) {
 static void phantun_log_config(void) {
     unsigned int i;
 
-    pht_pr_info("loading with %u managed local port(s), %u managed remote peer(s), %u reserved "
-                "local TCP port(s), "
+    pht_pr_info("loading with ip_families=%s effective=%s%s, %u managed local port(s), "
+                "%u managed remote peer(s), %u reserved local TCP port(s), "
                 "handshake_timeout_ms=%u, handshake_retries=%u, "
                 "keepalive_interval_sec=%u, keepalive_misses=%u, "
                 "hard_idle_timeout_sec=%u, reopen_guard_bytes=%u, half_open_limit=%u, "
                 "replacement_quarantine_ms=%u\n",
+                ip_families ? ip_families : "both",
+                phantun_cfg.enabled_families & PHT_FAMILY_IPV4 ? "ipv4" : "",
+                phantun_cfg.enabled_families == (PHT_FAMILY_IPV4 | PHT_FAMILY_IPV6) ? "+ipv6"
+                : phantun_cfg.enabled_families & PHT_FAMILY_IPV6                    ? "ipv6"
+                                                                                    : "",
                 phantun_cfg.managed_local_ports_count, phantun_cfg.managed_remote_peers_count,
                 phantun_cfg.reserved_local_ports_count, phantun_cfg.handshake_timeout_ms,
                 phantun_cfg.handshake_retries, phantun_cfg.keepalive_interval_sec,
@@ -2037,10 +2406,15 @@ static void phantun_log_config(void) {
     for (i = 0; i < phantun_cfg.reserved_local_ports_count; i++)
         pht_pr_info("effective_reserved_local_ports[%u]=%u\n", i,
                     phantun_cfg.reserved_local_ports[i]);
-    for (i = 0; i < phantun_cfg.managed_remote_peers_count; i++)
-        pht_pr_info("managed_remote_peers[%u]=%pI4:%u\n", i,
-                    &phantun_cfg.managed_remote_peers[i].addr,
-                    ntohs(phantun_cfg.managed_remote_peers[i].port));
+    for (i = 0; i < phantun_cfg.managed_remote_peers_count; i++) {
+        const struct pht_managed_peer *peer = &phantun_cfg.managed_remote_peers[i];
+
+        if (peer->addr.family == AF_INET)
+            pht_pr_info("managed_remote_peers[%u]=%pI4:%u\n", i, &peer->addr.v4, ntohs(peer->port));
+        else
+            pht_pr_info("managed_remote_peers[%u]=[%pI6c]:%u\n", i, &peer->addr.v6,
+                        ntohs(peer->port));
+    }
 }
 
 static int __init phantun_init(void) {
@@ -2070,9 +2444,21 @@ static int __init phantun_init(void) {
     ret = register_inetaddr_notifier(&phantun_inetaddr_nb);
     if (ret)
         goto err_pernet;
+#if IS_ENABLED(CONFIG_IPV6)
+    if (phantun_cfg.enabled_families & PHT_FAMILY_IPV6) {
+        phantun_inet6addr_nb.notifier_call = phantun_inet6addr_event;
+        ret = register_inet6addr_notifier(&phantun_inet6addr_nb);
+        if (ret)
+            goto err_inetaddr;
+    }
+#endif
 
     return 0;
 
+#if IS_ENABLED(CONFIG_IPV6)
+err_inetaddr:
+    unregister_inetaddr_notifier(&phantun_inetaddr_nb);
+#endif
 err_pernet:
     unregister_pernet_subsys(&phantun_pernet_ops);
 err_sysfs:
@@ -2084,6 +2470,10 @@ err_alloc:
 }
 
 static void __exit phantun_exit(void) {
+#if IS_ENABLED(CONFIG_IPV6)
+    if (phantun_cfg.enabled_families & PHT_FAMILY_IPV6)
+        unregister_inet6addr_notifier(&phantun_inet6addr_nb);
+#endif
     unregister_inetaddr_notifier(&phantun_inetaddr_nb);
     unregister_pernet_subsys(&phantun_pernet_ops);
     pht_stats_exit_sysfs();
