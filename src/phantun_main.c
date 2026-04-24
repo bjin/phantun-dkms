@@ -2380,41 +2380,38 @@ static int phantun_snapshot_config(void) {
 static void phantun_log_config(void) {
     unsigned int i;
 
-    pht_pr_info("loading with ip_families=%s effective=%s%s, %u managed local port(s), "
-                "%u managed remote peer(s), %u reserved local TCP port(s), "
-                "handshake_timeout_ms=%u, handshake_retries=%u, "
-                "keepalive_interval_sec=%u, keepalive_misses=%u, "
-                "hard_idle_timeout_sec=%u, reopen_guard_bytes=%u, half_open_limit=%u, "
-                "replacement_quarantine_ms=%u\n",
-                ip_families ? ip_families : "both",
-                phantun_cfg.enabled_families & PHT_FAMILY_IPV4 ? "ipv4" : "",
-                phantun_cfg.enabled_families == (PHT_FAMILY_IPV4 | PHT_FAMILY_IPV6) ? "+ipv6"
-                : phantun_cfg.enabled_families & PHT_FAMILY_IPV6                    ? "ipv6"
-                                                                                    : "",
-                phantun_cfg.managed_local_ports_count, phantun_cfg.managed_remote_peers_count,
-                phantun_cfg.reserved_local_ports_count, phantun_cfg.handshake_timeout_ms,
-                phantun_cfg.handshake_retries, phantun_cfg.keepalive_interval_sec,
-                phantun_cfg.keepalive_misses, phantun_cfg.hard_idle_timeout_sec,
-                phantun_cfg.reopen_guard_bytes, phantun_cfg.half_open_limit,
-                phantun_cfg.replacement_quarantine_ms);
+    pht_pr_info("loading with %u managed local port(s) and %u managed remote peers(s):\n",
+                phantun_cfg.managed_local_ports_count, phantun_cfg.managed_remote_peers_count);
 
-    pht_pr_info("reserved_local_ports=%s\n", reserved_local_ports && *reserved_local_ports
-                                                 ? reserved_local_ports
-                                                 : "<disabled>");
     for (i = 0; i < phantun_cfg.managed_local_ports_count; i++)
-        pht_pr_info("managed_local_ports[%u]=%u\n", i, phantun_cfg.managed_local_ports[i]);
-    for (i = 0; i < phantun_cfg.reserved_local_ports_count; i++)
-        pht_pr_info("effective_reserved_local_ports[%u]=%u\n", i,
-                    phantun_cfg.reserved_local_ports[i]);
+        pht_pr_info("  managed_local_ports[%u] = %u\n", i, phantun_cfg.managed_local_ports[i]);
+
     for (i = 0; i < phantun_cfg.managed_remote_peers_count; i++) {
         const struct pht_managed_peer *peer = &phantun_cfg.managed_remote_peers[i];
 
         if (peer->addr.family == AF_INET)
-            pht_pr_info("managed_remote_peers[%u]=%pI4:%u\n", i, &peer->addr.v4, ntohs(peer->port));
+            pht_pr_info("  managed_remote_peers[%u] = %pI4:%u\n", i, &peer->addr.v4,
+                        ntohs(peer->port));
         else
-            pht_pr_info("managed_remote_peers[%u]=[%pI6c]:%u\n", i, &peer->addr.v6,
+            pht_pr_info("  managed_remote_peers[%u] = [%pI6c]:%u\n", i, &peer->addr.v6,
                         ntohs(peer->port));
     }
+
+    if (phantun_cfg.managed_local_ports_count && !phantun_cfg.managed_remote_peers_count) {
+        pht_pr_info("  reserved_local_ports = %s\n", reserved_local_ports && *reserved_local_ports
+                                                         ? reserved_local_ports
+                                                         : "<disabled>");
+    }
+
+    pht_pr_info("  ip_families = %s\n", ip_families ? ip_families : "both");
+    pht_pr_info("  handshake_timeout_ms = %u\n", phantun_cfg.handshake_timeout_ms);
+    pht_pr_info("  handshake_retries = %u\n", phantun_cfg.handshake_retries);
+    pht_pr_info("  keepalive_interval_sec = %u\n", phantun_cfg.keepalive_interval_sec);
+    pht_pr_info("  keepalive_misses = %u\n", phantun_cfg.keepalive_misses);
+    pht_pr_info("  hard_idle_timeout_sec = %u\n", phantun_cfg.hard_idle_timeout_sec);
+    pht_pr_info("  reopen_guard_bytes = %u\n", phantun_cfg.reopen_guard_bytes);
+    pht_pr_info("  half_open_limit = %u\n", phantun_cfg.half_open_limit);
+    pht_pr_info("  replacement_quarantine_ms = %u\n", phantun_cfg.replacement_quarantine_ms);
 }
 
 static int __init phantun_init(void) {
