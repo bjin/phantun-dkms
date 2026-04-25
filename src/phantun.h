@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Copyright (C) 2026 Bin Jin. All Rights Reserved.
 #ifndef PHANTUN_H
 #define PHANTUN_H
 

@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Copyright (C) 2026 Bin Jin. All Rights Reserved.
 #include <linux/atomic.h>
 #include <linux/kernel.h>
 #include <linux/kobject.h>
