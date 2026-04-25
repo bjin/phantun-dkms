@@ -4,7 +4,7 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 
 ## Layout
 - `src/phantun_main.c`: module entry, config, netfilter hooks, protocol state machine
-- `src/phantun_packet.[ch]`: IPv4/TCP/UDP parsing, packet build, checksum, tx/reinject helpers
+- `src/phantun_packet.[ch]`: IPv4/IPv6/TCP/UDP parsing, packet build, checksum, tx/reinject helpers
 - `src/phantun_flow.[ch]`: flow table, timers, retries, queued skb handling
 - `Kbuild`, `Makefile`, `dkms.conf`: external module build / DKMS
 - `prepare-kernels.py`: CLI to download/verify Ubuntu mainline kernels for matrix testing
@@ -25,7 +25,6 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 - Run: `pytest tests [-v] [--kernel host|<ver>]`
 
 ## Important reminders
-- This project is IPv4-only for now.
 - Managed traffic is intercepted in netfilter `LOCAL_OUT` and `PRE_ROUTING`.
 - Fake TCP is strict: 3-way handshake, seq/ack accounting, no FIN, RST on error.
 - First payloads are mandatory control payloads and are never delivered to the UDP app.
