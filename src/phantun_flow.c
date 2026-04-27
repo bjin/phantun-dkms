@@ -303,7 +303,8 @@ static void pht_flow_detach_all(struct pht_flow_table *table, struct list_head *
 /* GC also drives keepalive/liveness policy. On liveness failure, preserve the
  * single queued outbound UDP skb by reinjecting it through LOCAL_OUT so the
  * next pass can reopen the tuple instead of silently dropping the caller's
- * trigger packet.
+ * trigger packet. The matching RST is sent later, after the flow is detached
+ * and no bucket or flow lock is held.
  */
 static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list_head *expired,
                                        struct sk_buff_head *reinject_list) {
@@ -340,8 +341,8 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
                     flow->hard_expired = true;
                 } else if (liveness_failed) {
                     expired_flow = true;
+                    flow->liveness_failed = flow->state == PHT_FLOW_STATE_ESTABLISHED;
                     flow->state = PHT_FLOW_STATE_DEAD;
-                    flow->liveness_failed = true;
                     is_liveness_failure = true;
                 } else if (table->keepalive_interval_jiffies > 0 &&
                            time_after_eq(now, flow->last_inbound_jiffies +
@@ -408,7 +409,14 @@ static void pht_flow_gc_worker(struct work_struct *work) {
 
     pht_flow_gc_detach_expired(table, &expired, &reinject_list);
     list_for_each_entry_safe(flow, tmp, &expired, gc_node) {
+        bool send_liveness_rst;
+
         list_del_init(&flow->gc_node);
+        spin_lock_bh(&flow->lock);
+        send_liveness_rst = flow->liveness_failed;
+        spin_unlock_bh(&flow->lock);
+        if (send_liveness_rst)
+            pht_flow_send_local_rst(flow);
         pht_flow_shutdown_retransmit_sync(flow);
         pht_flow_put(flow);
     }

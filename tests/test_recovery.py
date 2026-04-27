@@ -74,7 +74,7 @@ def test_liveness_timeout_recovers(phantun_module, vm):
         },
     )
     keepalive_probe = None
-
+    drop_probe = None
     try:
         time.sleep(0.2)
         client_result_1 = run_netns_scenario(
@@ -106,81 +106,42 @@ def test_liveness_timeout_recovers(phantun_module, vm):
             ],
         )
         baseline_rst = keepalive_probe.packets(vm, "liveness_rst")
-        vm.run(["ip", "netns", "exec", NS_A, "nft", "add", "table", "inet", "filter"])
-        vm.run(
+        baseline_rst_sent = read_module_stats(vm)["rst_sent"]
+        drop_probe = make_netns_ingress_drop_probe(
+            vm,
+            NS_A,
+            VETH_A,
             [
-                "ip",
-                "netns",
-                "exec",
-                NS_A,
-                "nft",
-                "add",
-                "chain",
-                "inet",
-                "filter",
-                "output",
-                "{ type filter hook output priority 10; policy accept; }",
-            ]
-        )
-        vm.run(
-            [
-                "ip",
-                "netns",
-                "exec",
-                NS_A,
-                "nft",
-                "add",
-                "rule",
-                "inet",
-                "filter",
-                "output",
-                "drop",
-            ]
-        )
-        vm.run(
-            [
-                "ip",
-                "netns",
-                "exec",
-                NS_A,
-                "nft",
-                "add",
-                "chain",
-                "inet",
-                "filter",
-                "input",
-                "{ type filter hook input priority 10; policy accept; }",
-            ]
-        )
-        vm.run(
-            [
-                "ip",
-                "netns",
-                "exec",
-                NS_A,
-                "nft",
-                "add",
-                "rule",
-                "inet",
-                "filter",
-                "input",
-                "drop",
-            ]
+                {
+                    "src_addr": NS_ADDR_B,
+                    "dst_addr": NS_ADDR_A,
+                    "src_port": dst_port,
+                    "dst_port": src_port,
+                    "comment": "drop_inbound_fake_tcp",
+                }
+            ],
         )
 
-        # The 2s liveness deadline is driven by delayed GC work. Under nested
-        # virtualization the first GC run after we start dropping traffic may
-        # already arrive after the deadline, so a silent teardown with zero
-        # keepalive probes is valid. Wait comfortably past the deadline and
-        # assert only the externally visible contract: no local RST before
-        # recovery.
-        time.sleep(6.0)
+        # The 2s liveness deadline is driven by delayed GC work. Poll for the
+        # contract change instead of sleeping a fixed interval: once local
+        # liveness fails, the old generation should emit at least one RST before
+        # recovery opens a replacement generation.
+        deadline = time.time() + 8.0
+        rst_packets = 0
+        while time.time() < deadline:
+            rst_packets = keepalive_probe.packets(vm, "liveness_rst") - baseline_rst
+            if rst_packets > 0:
+                break
+            time.sleep(0.1)
 
-        rst_packets = keepalive_probe.packets(vm, "liveness_rst") - baseline_rst
-        if rst_packets != 0:
-            pytest.fail(f"expected silent liveness teardown without local RST, got {rst_packets}")
+        if rst_packets <= 0:
+            pytest.fail("expected local RST after liveness teardown, got none")
+        rst_sent = read_module_stats(vm)["rst_sent"] - baseline_rst_sent
+        if rst_sent <= 0:
+            pytest.fail(f"expected rst_sent to increase after liveness teardown, got {rst_sent}")
 
-        vm.run(["ip", "netns", "exec", NS_A, "nft", "flush", "ruleset"])
+        drop_probe.cleanup(vm)
+        drop_probe = None
 
         client_result_2 = run_netns_scenario(
             vm,
@@ -204,6 +165,8 @@ def test_liveness_timeout_recovers(phantun_module, vm):
     finally:
         if keepalive_probe is not None:
             keepalive_probe.cleanup(vm)
+        if drop_probe is not None:
+            drop_probe.cleanup(vm)
         vm.run(["ip", "netns", "exec", NS_A, "nft", "flush", "ruleset"], check=False)
 
 
@@ -272,6 +235,10 @@ def test_liveness_reinitiates_flow_with_queued_packet(phantun_module, vm):
 
         if not success:
             pytest.fail(f"expected flow to be re-initiated 2 times due to liveness, got {flows_created_2}")
+
+        rst_sent = stats_after_liveness["rst_sent"] - initial_stats["rst_sent"]
+        if rst_sent != 0:
+            pytest.fail(f"half-open liveness reinitiation must not emit RST before retry exhaustion, got {rst_sent}")
     finally:
         probe_b.cleanup(vm)
         vm.run(["ip", "netns", "exec", NS_A, "nft", "flush", "ruleset"], check=False)
@@ -866,6 +833,7 @@ def assert_flow_recreated_after_local_topology_change(vm, change_steps, label, s
         baseline_syn = reconnect_probe.packets(vm, "reconnect_syn")
         if baseline_syn == 0:
             pytest.fail(f"expected initial SYN before {label}, got {baseline_syn}")
+        baseline_rst_sent = read_module_stats(vm)["rst_sent"]
 
         for step in change_steps:
             vm.run(step)
@@ -873,6 +841,12 @@ def assert_flow_recreated_after_local_topology_change(vm, change_steps, label, s
             wait_for_guest_condition(vm, settle_cmd, timeout=5, description=f"{label} settle")
         else:
             time.sleep(0.2)
+        rst_sent_after_change = read_module_stats(vm)["rst_sent"]
+        if rst_sent_after_change != baseline_rst_sent:
+            pytest.fail(
+                f"topology invalidation must stay silent for {label}: "
+                f"rst_sent before={baseline_rst_sent} after={rst_sent_after_change}"
+            )
 
         second = run_netns_scenario(
             vm,

@@ -107,8 +107,12 @@ struct pht_flow {
     bool retransmit_armed;
     bool quarantine_prev_active;
     bool half_open_tracked;
-    /* Latched GC reason for the generation that just died. */
+    /* Latched GC reason for hard-idle teardown. */
     bool hard_expired;
+    /* Latched post-detach action: established liveness teardown should send
+     * best-effort RST. Half-open liveness teardown keeps the existing no-RST
+     * reinitiation path.
+     */
     bool liveness_failed;
 };
 

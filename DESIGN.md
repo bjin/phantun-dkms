@@ -281,7 +281,8 @@ Behavior:
 - normal UDP ↔ fake-TCP translation follows
 - accepted inbound packet refreshes liveness suspicion, including pure `ACK` and handshake-response acknowledgement traffic
 - after `keepalive_interval_sec` without valid inbound traffic: send pure `ACK` keepalive
-- after `keepalive_misses * keepalive_interval_sec` without valid inbound traffic: destroy local state silently
+- after `keepalive_misses * keepalive_interval_sec` without valid inbound traffic: send a best-effort `RST` if the stored route/source identity can still transmit, then destroy local state
+  - if RST emission fails, destroy local state silently
   - if one outbound UDP skb is already queued, create fresh `SYN_SENT`, carry that skb, send `SYN`
   - otherwise wait for future outbound UDP
 
@@ -338,7 +339,7 @@ Behavior:
 - `ack` tracks peer `seq + payload_len`
 - if injected responder `handshake_response` still awaits acknowledgement, responder UDP follows the one-skb queue/drop rule until release
 - accepted inbound packet refreshes liveness suspicion
-- keepalive and silent idle teardown use the same policy as initiator-established flows
+- keepalive, liveness failure, and hard idle teardown use the same policy as initiator-established flows
 
 Inbound flag priority matches initiator-established handling:
 
@@ -366,6 +367,8 @@ Peer-only mode keeps this rule: if a packet from a managed remote peer does not 
 - inbound packets failing TCP checksum validation
 - packets from immediately previous generation while quarantine is active
 - shaping-payload loss, duplication, delay, or reordering
+- established liveness failure falls back to silent teardown only when best-effort `RST` emission cannot route or transmit
+- topology-driven invalidation and hard idle expiry: local teardown without `RST`
 
 ### 7.3 Handshake loss tolerance
 
@@ -458,6 +461,7 @@ Chosen policy:
 - if that device goes `GOING_DOWN`, `DOWN`, or is unregistered: invalidate flow immediately
 - if the exact local IPv4 or IPv6 address bound into the flow tuple is removed: invalidate flow immediately
 - invalidation is silent local teardown; do not fabricate `RST` from a path or source identity that no longer exists
+- this is intentionally stricter than established liveness failure: topology invalidation must not fabricate `RST` from a path or source identity known to be stale
 - next outbound UDP may create a fresh generation normally
 
 Intentionally **not** done in v1:
