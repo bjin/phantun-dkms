@@ -58,6 +58,7 @@ jobs:
           - v6.18.21
           - v6.19.11
           - v7.0
+          - v7.1-rc1
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
