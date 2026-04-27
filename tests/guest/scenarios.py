@@ -10,11 +10,21 @@ from pathlib import Path
 TIMEOUT_SEC = 5
 
 
-def _socket(bind_addr, bind_port, timeout=None):
+def _scope_id(scope_dev):
+    return socket.if_nametoindex(scope_dev) if scope_dev else 0
+
+
+def _addr_tuple(addr, port, scope_dev=None):
+    if ":" in addr:
+        return (addr, port, 0, _scope_id(scope_dev))
+    return (addr, port)
+
+
+def _socket(bind_addr, bind_port, timeout=None, bind_scope_dev=None):
     family = socket.AF_INET6 if ":" in bind_addr else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_DGRAM)
     sock.settimeout(timeout if timeout is not None else TIMEOUT_SEC)
-    sock.bind((bind_addr, bind_port))
+    sock.bind(_addr_tuple(bind_addr, bind_port, bind_scope_dev))
     return sock
 
 
@@ -35,10 +45,15 @@ def ping_server(config):
 
 
 def ping_client(config):
-    with _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec")) as sock:
+    with _socket(
+        config["bind_addr"],
+        config["bind_port"],
+        config.get("timeout_sec"),
+        config.get("bind_scope_dev"),
+    ) as sock:
         sock.sendto(
             config.get("payload", "ping").encode(),
-            (config["target_addr"], config["target_port"]),
+            _addr_tuple(config["target_addr"], config["target_port"], config.get("target_scope_dev")),
         )
         reply, addr = sock.recvfrom(2048)
         _emit(
@@ -98,16 +113,29 @@ def recv_many(config):
 def send_many(config):
     payloads = config["payloads"]
     delay_ms = config.get("delay_ms", 0)
+    allow_send_errors = config.get("allow_send_errors", False)
+    errors = []
 
-    with _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec")) as sock:
+    with _socket(
+        config["bind_addr"],
+        config["bind_port"],
+        config.get("timeout_sec"),
+        config.get("bind_scope_dev"),
+    ) as sock:
+        target = _addr_tuple(config["target_addr"], config["target_port"], config.get("target_scope_dev"))
         for payload in payloads:
-            sock.sendto(payload.encode(), (config["target_addr"], config["target_port"]))
+            try:
+                sock.sendto(payload.encode(), target)
+            except OSError as exc:
+                if not allow_send_errors:
+                    raise
+                errors.append({"payload": payload, "errno": exc.errno, "error": str(exc)})
             if delay_ms:
                 import time
 
                 time.sleep(delay_ms / 1000.0)
 
-    _emit({"sent": payloads})
+    _emit({"sent": payloads, "errors": errors})
 
 
 def recv_many_reply(config):

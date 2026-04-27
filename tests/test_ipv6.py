@@ -15,6 +15,7 @@ from helpers import (
     PORTS_A,
     PORTS_B,
     VETH_A,
+    VETH_B,
     assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
@@ -27,6 +28,7 @@ from helpers import (
     run_guest_scenario,
     run_in_netns,
     run_netns_scenario,
+    read_module_stat,
     spawn_netns_scenario,
 )
 from test_wireguard import (
@@ -49,6 +51,11 @@ PORT_A = 2222
 PORT_B = 3333
 WG6_MTU = 1408
 WG6_PING_PAYLOAD = 1360
+
+DEPRECATED6_ADDR_A = "fd00:200::10"
+DEPRECATED6_ADDR_B = "fd00:200::20"
+LINKLOCAL6_ADDR_A = "fe80::a"
+LINKLOCAL6_ADDR_B = "fe80::b"
 
 
 def wg_endpoint(addr, port):
@@ -187,6 +194,110 @@ def test_ipv6_managed_remote_peers_bracketed_peer(phantun_module, vm):
     finally:
         vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
         phantun_module.unload()
+
+
+def test_ipv6_deprecated_global_addresses_are_preserved(phantun_module, vm):
+    load_ipv6_module(phantun_module)
+    ensure_netns_topology(vm, with_ipv6=True)
+    require_nft_or_skip(vm)
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    run_in_netns(
+        vm,
+        NS_A,
+        [
+            "ip",
+            "-6",
+            "addr",
+            "add",
+            f"{DEPRECATED6_ADDR_A}/128",
+            "dev",
+            VETH_A,
+            "preferred_lft",
+            "0",
+            "valid_lft",
+            "forever",
+            "nodad",
+        ],
+    )
+    run_in_netns(
+        vm,
+        NS_B,
+        [
+            "ip",
+            "-6",
+            "addr",
+            "add",
+            f"{DEPRECATED6_ADDR_B}/128",
+            "dev",
+            VETH_B,
+            "preferred_lft",
+            "0",
+            "valid_lft",
+            "forever",
+            "nodad",
+        ],
+    )
+    run_in_netns(vm, NS_A, ["ip", "-6", "route", "add", f"{DEPRECATED6_ADDR_B}/128", "dev", VETH_A])
+    run_in_netns(vm, NS_B, ["ip", "-6", "route", "add", f"{DEPRECATED6_ADDR_A}/128", "dev", VETH_B])
+
+    probe_a = make_netns_output_probe(vm, NS_A, [(DEPRECATED6_ADDR_A, src_port, DEPRECATED6_ADDR_B, dst_port)])
+    probe_b = make_netns_output_probe(vm, NS_B, [(DEPRECATED6_ADDR_B, dst_port, DEPRECATED6_ADDR_A, src_port)])
+    try:
+        run_ping_pong(vm, DEPRECATED6_ADDR_A, DEPRECATED6_ADDR_B, src_port, dst_port)
+        assert probe_a.packets(vm, probe_comment("tcp", DEPRECATED6_ADDR_A, src_port, DEPRECATED6_ADDR_B, dst_port)) > 0
+        assert probe_b.packets(vm, probe_comment("tcp", DEPRECATED6_ADDR_B, dst_port, DEPRECATED6_ADDR_A, src_port)) > 0
+        assert (
+            probe_a.packets(vm, probe_comment("udp", DEPRECATED6_ADDR_A, src_port, DEPRECATED6_ADDR_B, dst_port)) == 0
+        )
+        assert (
+            probe_b.packets(vm, probe_comment("udp", DEPRECATED6_ADDR_B, dst_port, DEPRECATED6_ADDR_A, src_port)) == 0
+        )
+    finally:
+        probe_a.cleanup(vm)
+        probe_b.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_ipv6_link_local_endpoints_are_rejected(phantun_module, vm):
+    load_ipv6_module(phantun_module)
+    ensure_netns_topology(vm, with_ipv6=True)
+    require_nft_or_skip(vm)
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    run_in_netns(vm, NS_A, ["ip", "-6", "addr", "add", f"{LINKLOCAL6_ADDR_A}/64", "dev", VETH_A, "nodad"])
+    run_in_netns(vm, NS_B, ["ip", "-6", "addr", "add", f"{LINKLOCAL6_ADDR_B}/64", "dev", VETH_B, "nodad"])
+    probe_a = make_netns_output_probe(vm, NS_A, [(LINKLOCAL6_ADDR_A, src_port, LINKLOCAL6_ADDR_B, dst_port)])
+    dropped_before = read_module_stat(vm, "udp_packets_dropped")
+
+    try:
+        result = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": LINKLOCAL6_ADDR_A,
+                "bind_port": src_port,
+                "bind_scope_dev": VETH_A,
+                "target_addr": LINKLOCAL6_ADDR_B,
+                "target_port": dst_port,
+                "target_scope_dev": VETH_A,
+                "payloads": ["link-local"],
+                "allow_send_errors": True,
+            },
+            timeout=10,
+        )
+        assert_completed(result, "link-local send")
+        dropped_after = read_module_stat(vm, "udp_packets_dropped")
+        if dropped_after <= dropped_before:
+            pytest.fail("link-local endpoint send did not increment the translated UDP drop counter")
+        assert probe_a.packets(vm, probe_comment("udp", LINKLOCAL6_ADDR_A, src_port, LINKLOCAL6_ADDR_B, dst_port)) == 0
+        assert probe_a.packets(vm, probe_comment("tcp", LINKLOCAL6_ADDR_A, src_port, LINKLOCAL6_ADDR_B, dst_port)) == 0
+    finally:
+        probe_a.cleanup(vm)
+        cleanup_netns_topology(vm)
 
 
 def test_ip_families_can_disable_one_family(phantun_module, vm):

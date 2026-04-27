@@ -8,6 +8,8 @@ from helpers import (
     NS_ADDR_A,
     NS_ADDR_B,
     NS_B,
+    VETH_A,
+    VETH_B,
     NetnsNftProbe,
     PORTS_A,
     PORTS_B,
@@ -17,6 +19,7 @@ from helpers import (
     make_netns_output_probe,
     parse_guest_json,
     probe_comment,
+    read_module_stat,
     require_guest_command,
     run_in_netns,
     run_netns_scenario,
@@ -24,6 +27,8 @@ from helpers import (
 )
 
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
+SECONDARY_ADDR_A = "10.200.0.10"
+SECONDARY_ADDR_B = "10.200.0.20"
 
 
 def load_netns_module(phantun_module):
@@ -211,6 +216,79 @@ def test_netns_ping_pong_uses_tcp_output_only(phantun_module, vm):
             pytest.fail(f"raw UDP escaped LOCAL_OUT in netns: ns_a={udp_a}, ns_b={udp_b}")
         if tcp_a == 0 or tcp_b == 0:
             pytest.fail(f"expected translated TCP on both netns output paths, got ns_a={tcp_a}, ns_b={tcp_b}")
+    finally:
+        probe_a.cleanup(vm)
+        probe_b.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_netns_ipv4_secondary_addresses_are_preserved_and_removed_flows_invalidate(phantun_module, vm):
+    load_netns_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    run_in_netns(vm, NS_A, ["ip", "addr", "add", f"{SECONDARY_ADDR_A}/32", "dev", VETH_A])
+    run_in_netns(vm, NS_B, ["ip", "addr", "add", f"{SECONDARY_ADDR_B}/32", "dev", VETH_B])
+    run_in_netns(vm, NS_A, ["ip", "route", "add", f"{SECONDARY_ADDR_B}/32", "dev", VETH_A])
+    run_in_netns(vm, NS_B, ["ip", "route", "add", f"{SECONDARY_ADDR_A}/32", "dev", VETH_B])
+
+    probe_a = make_netns_output_probe(vm, NS_A, [(SECONDARY_ADDR_A, src_port, SECONDARY_ADDR_B, dst_port)])
+    probe_b = make_netns_output_probe(vm, NS_B, [(SECONDARY_ADDR_B, dst_port, SECONDARY_ADDR_A, src_port)])
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "ping_server",
+        {
+            "bind_addr": SECONDARY_ADDR_B,
+            "bind_port": dst_port,
+            "reply": "pong",
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            {
+                "bind_addr": SECONDARY_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": SECONDARY_ADDR_B,
+                "target_port": dst_port,
+                "payload": "ping",
+            },
+            timeout=10,
+        )
+        server_result = server.communicate(timeout=10)
+
+        assert_completed(client_result, "secondary-address ping client")
+        assert_completed(server_result, "secondary-address ping server")
+        server_data = parse_guest_json(server_result.stdout, "secondary-address ping server stdout")
+        client_data = parse_guest_json(client_result.stdout, "secondary-address ping client stdout")
+        assert server_data.get("peer") == [SECONDARY_ADDR_A, src_port]
+        assert client_data.get("peer") == [SECONDARY_ADDR_B, dst_port]
+        assert probe_a.packets(vm, probe_comment("tcp", SECONDARY_ADDR_A, src_port, SECONDARY_ADDR_B, dst_port)) > 0
+        assert probe_b.packets(vm, probe_comment("tcp", SECONDARY_ADDR_B, dst_port, SECONDARY_ADDR_A, src_port)) > 0
+        assert probe_a.packets(vm, probe_comment("udp", SECONDARY_ADDR_A, src_port, SECONDARY_ADDR_B, dst_port)) == 0
+        assert probe_b.packets(vm, probe_comment("udp", SECONDARY_ADDR_B, dst_port, SECONDARY_ADDR_A, src_port)) == 0
+
+        flows_before_remove = read_module_stat(vm, "flows_current")
+        if flows_before_remove < 1:
+            pytest.fail("expected at least one current flow before removing the secondary local address")
+        run_in_netns(vm, NS_A, ["ip", "addr", "del", f"{SECONDARY_ADDR_A}/32", "dev", VETH_A])
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if read_module_stat(vm, "flows_current") <= flows_before_remove - 1:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("removing the exact secondary local IPv4 address did not invalidate its flow")
     finally:
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)

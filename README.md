@@ -149,6 +149,8 @@ Rules:
 - Raw inbound UDP that matches the selectors is dropped on **non-loopback ingress** so traffic is not delivered both as raw UDP and translated UDP.
 - `ip_families=both|ipv4|ipv6` selects which IP families are translated; it defaults to `both`. On kernels without IPv6 support, default `both` degrades to IPv4-only with a warning, while explicit `ipv6` is rejected.
 - IPv6 `managed_remote_peers` entries must be bracketed, for example `[2001:db8::20]:51820`; unbracketed IPv6 endpoints are rejected as ambiguous.
+- `managed_remote_peers` is exact-address matching. If a remote host rotates its public source address, including IPv6 privacy-address rotation, update the configured peer address or use `managed_local_ports` for server-like endpoints that should accept any remote address on the owned local port.
+- IPv6 link-local endpoint addresses are not supported. Selector-matched traffic with a link-local local or remote endpoint is rejected instead of translated.
 
 ### Selector modes
 

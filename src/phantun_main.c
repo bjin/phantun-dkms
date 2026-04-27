@@ -656,6 +656,26 @@ static void phantun_fill_endpoint_scope_ifindex(struct pht_endpoint_pair *ep,
                                                 const struct net_device *dev) {}
 #endif
 
+static bool phantun_addr_unsupported_for_endpoint(const struct pht_addr *addr) {
+#if IS_ENABLED(CONFIG_IPV6)
+    if (addr && addr->family == AF_INET6 && (ipv6_addr_type(&addr->v6) & IPV6_ADDR_LINKLOCAL))
+        return true;
+#endif
+
+    return false;
+}
+
+static bool phantun_endpoint_uses_unsupported_addr(const struct pht_endpoint_pair *ep) {
+    return ep && (phantun_addr_unsupported_for_endpoint(&ep->local_addr) ||
+                  phantun_addr_unsupported_for_endpoint(&ep->remote_addr));
+}
+
+static bool phantun_addr_pair_uses_unsupported_addr(const struct pht_addr *local_addr,
+                                                    const struct pht_addr *remote_addr) {
+    return phantun_addr_unsupported_for_endpoint(local_addr) ||
+           phantun_addr_unsupported_for_endpoint(remote_addr);
+}
+
 static bool phantun_family_enabled(u8 family) {
     if (family == AF_INET)
         return !!(phantun_cfg.enabled_families & PHT_FAMILY_IPV4);
@@ -1256,15 +1276,20 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
     if (!phantun_selectors_allow(view.udp->source, &remote_addr, view.udp->dest))
         return NF_ACCEPT;
 
+    phantun_fill_udp_endpoint_pair(&view, &ep);
+    phantun_fill_endpoint_scope_ifindex(&ep, state->out ? state->out : skb->dev);
+    if (phantun_endpoint_uses_unsupported_addr(&ep)) {
+        pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+        pht_pr_warn_rl("rejecting outbound UDP with unsupported endpoint address\n");
+        return NF_DROP;
+    }
+
     ret = phantun_confirm_outbound_udp_conntrack(skb);
     if (ret) {
         pht_pr_warn_rl("failed to confirm outbound UDP conntrack before translation: %d\n", ret);
         kfree_skb(skb);
         return NF_STOLEN;
     }
-
-    phantun_fill_udp_endpoint_pair(&view, &ep);
-    phantun_fill_endpoint_scope_ifindex(&ep, state->out ? state->out : skb->dev);
 
 retry_lookup:
     flow = pht_flow_lookup(flows, &ep);
@@ -1467,6 +1492,13 @@ static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb
     if (!phantun_selectors_allow(view.udp->dest, &remote_addr, view.udp->source))
         return NF_ACCEPT;
 
+    if (phantun_addr_pair_uses_unsupported_addr(&local_addr, &remote_addr)) {
+        pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+        pht_pr_warn_rl("dropping inbound UDP with unsupported endpoint address\n");
+        kfree_skb(skb);
+        return NF_STOLEN;
+    }
+
     pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
     kfree_skb(skb);
     return NF_STOLEN;
@@ -1525,6 +1557,14 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     if (!phantun_selectors_allow(view.tcp->dest, &remote_addr, view.tcp->source))
         return NF_ACCEPT;
 
+    phantun_fill_tcp_endpoint_pair(&view, &ep);
+    in_dev = state->in ? state->in : skb->dev;
+    phantun_fill_endpoint_scope_ifindex(&ep, in_dev);
+    if (phantun_endpoint_uses_unsupported_addr(&ep)) {
+        pht_pr_warn_rl("rejecting inbound fake-TCP with unsupported endpoint address\n");
+        return NF_DROP;
+    }
+
     ret = phantun_pre_routing_segment_gso(priv, skb, state);
     if (ret != NF_ACCEPT)
         return ret;
@@ -1532,10 +1572,6 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     ret = phantun_validate_tcp_checksums(skb, &view);
     if (ret)
         return NF_DROP;
-
-    phantun_fill_tcp_endpoint_pair(&view, &ep);
-    in_dev = state->in ? state->in : skb->dev;
-    phantun_fill_endpoint_scope_ifindex(&ep, in_dev);
 
     flow = pht_flow_lookup(flows, &ep);
     if (flow) {

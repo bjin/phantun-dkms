@@ -130,6 +130,8 @@ Constraints:
 
 - `ip_families=both|ipv4|ipv6` gates which netfilter families are registered; default `both` registers both families when kernel IPv6 support is available
 - IPv6 `managed_remote_peers` entries must use bracketed `[IPv6]:port` syntax; unbracketed IPv6 is rejected
+- `managed_remote_peers` is exact-address matching; remote privacy-address rotation is a new remote endpoint and requires config update unless local-port selection is used instead
+- IPv6 link-local endpoint addresses are intentionally unsupported and rejected until scoped link-local flow identity, validation, and invalidation are implemented consistently
 Peer-only caveat:
 
 - inbound TCP ownership becomes broad for that remote `IPv4:port` or `[IPv6]:port`
@@ -170,6 +172,8 @@ A flow is keyed by the packet-boundary local/remote endpoint pair, including add
 - family + address bytes + ports are matched directly
 - outbound UDP and inbound fake TCP therefore land in the same flow without canonical tuple sorting
 
+- IPv4 secondary addresses and IPv6 global temporary/deprecated addresses remain distinct endpoint identities; translated fake-TCP packet headers and route lookups use the exact stored local address rather than substituting another local address
+- IPv6 link-local addresses are rejected for both local and remote endpoint positions because current scope handling is not a complete scoped-link-local contract
 The flow still stores oriented local/remote addresses and role.
 The canonical key exists only for lookup and collision prevention.
 
@@ -461,6 +465,7 @@ Intentionally **not** done in v1:
 - no invalidation on generic FIB/default-gateway churn
 - no invalidation because some other address on the device changed
 
+- no invalidation on IPv6 address deprecation or temporary-address flag changes; flows are invalidated only when the exact local address is removed
 Reason: every outbound send already performs a fresh route lookup using the fixed flow tuple; broad routing churn would add false positives without clear benefit.
 
 ## 10. Configuration surface
