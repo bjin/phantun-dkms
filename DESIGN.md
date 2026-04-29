@@ -432,14 +432,15 @@ For inbound established fake-TCP data:
 
 - build a new UDP skb using the oriented tuple
 - preserve original UDP source/destination IPs and ports
-- route for local input
-- inject directly into post-`PRE_ROUTING` local-delivery path (`ip_route_input` + `dst_input` style)
+- inject through the original ingress device with `netif_rx()` so receive processing uses that device's network namespace
+- require the original ingress device namespace to match the netfilter hook namespace before reinjecting
+- mark reinjected UDP so the module's raw-UDP drop hook exempts the manufactured skb on its second `PRE_ROUTING` pass
 
 Result:
 
 - local UDP sockets, including kernel WireGuard and `wireguard-go`, receive data as normal UDP
-- later local inbound firewall and delivery hooks still run
-- translated UDP avoids the raw-UDP drop hook because reinjection occurs after `PRE_ROUTING`
+- later inbound firewall and delivery hooks still run in the same netns as the intercepted fake-TCP packet
+- translated UDP avoids the raw-UDP drop hook because the reinjection mark is consumed by that hook
 
 ### 8.5 Generated fake-TCP transmission
 

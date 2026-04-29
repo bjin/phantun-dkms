@@ -1137,13 +1137,20 @@ static bool phantun_payload_exceeds_udp_reinject_limit(const struct pht_l4_view 
 
 static int phantun_reinject_inbound_payload(const struct pht_endpoint_pair *ep,
                                             const struct sk_buff *skb,
-                                            const struct pht_l4_view *view,
+                                            const struct pht_l4_view *view, struct net *net,
                                             struct net_device *dev) {
     void *payload;
     int ret;
 
     if (!view->payload_len)
         return 0;
+
+    /* netif_rx() derives receive namespace from skb->dev.  PRE_ROUTING
+     * should hand us an ingress device from state->net; make that contract
+     * explicit before manufacturing a UDP packet for local delivery.
+     */
+    if (!net || !dev || dev_net(dev) != net)
+        return -EINVAL;
 
     payload = kmalloc(view->payload_len, GFP_ATOMIC);
     if (!payload)
@@ -1202,7 +1209,7 @@ static int phantun_finalize_established_rx(struct pht_flow *flow,
     phantun_refresh_inbound_progress(flow, view, &allow_flush);
 
     if (reinject_payload) {
-        ret = phantun_reinject_inbound_payload(ep, skb, view, dev);
+        ret = phantun_reinject_inbound_payload(ep, skb, view, net, dev);
         if (ret)
             return ret;
     }
