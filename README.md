@@ -108,6 +108,43 @@ make dkms-rpm
 * Fedora/RHEL/Rocky: Download and install the `.rpm` file from [latest release](https://github.com/bjin/phantun-dkms/releases/latest)
 * Other Distributions: Extract `.tar.gz` dkms tarball from [latest release](https://github.com/bjin/phantun-dkms/releases/latest) to `/usr/src/phantun-0.x.y`, and run `dkms add` manually
 
+### Install on NixOS from the flake
+
+Add the flake input:
+
+```nix
+inputs.phantun-dkms = {
+  url = "github:bjin/phantun-dkms";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+Then import the NixOS module and configure the kernel parameters with typed options:
+
+```nix
+{
+  imports = [ inputs.phantun-dkms.nixosModules.default ];
+
+  services.phantun = {
+    enable = true;
+    loadOnBoot = true;
+    managedRemotePeers = [
+      "198.51.100.20:51820"
+      "[2001:db8::20]:51820"
+    ];
+    handshakeRequest = "hello";
+    handshakeResponse = "base64:d29ybGQ=";
+    keepaliveIntervalSec = 15;
+    keepaliveMisses = 3;
+  };
+}
+```
+
+`loadOnBoot = false` leaves the package and generated modprobe configuration available for manual `modprobe phantun`, but does not add `phantun` to `boot.kernelModules`.
+
+The `nixpkgs.follows` line makes this module use the consumer flake's `nixpkgs` input instead of keeping a second transitive `nixpkgs` pinned by this repository.
+
+
 ### Simplest load: own one local UDP port
 
 ```bash
