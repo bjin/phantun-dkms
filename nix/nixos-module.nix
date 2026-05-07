@@ -87,12 +87,12 @@ let
   validPort = port: port >= 1 && port <= 65535;
 
   validPortList =
-    value: value == null || (value != [ ] && builtins.length value <= 16 && lib.all validPort value);
+    value: value == null || (value != [ ] && builtins.length value <= 64 && lib.all validPort value);
 
   validStringList =
     value:
     value == null
-    || (value != [ ] && builtins.length value <= 16 && lib.all (entry: entry != "") value);
+    || (value != [ ] && builtins.length value <= 64 && lib.all (entry: entry != "") value);
 
   validRawFragment = fragment: fragment != "" && !hasWhitespace fragment;
 
@@ -290,18 +290,18 @@ in
       assertions = [
         {
           assertion = validPortList cfg.managedLocalPorts;
-          message = "services.phantun.managedLocalPorts must be null or a non-empty list of at most 16 ports in the range 1..65535.";
+          message = "services.phantun.managedLocalPorts must be null or a non-empty list of at most 64 ports in the range 1..65535.";
         }
         {
           assertion = validStringList cfg.managedRemotePeers;
-          message = "services.phantun.managedRemotePeers must be null or a non-empty list of at most 16 non-empty strings.";
+          message = "services.phantun.managedRemotePeers must be null or a non-empty list of at most 64 non-empty strings.";
         }
         {
           assertion =
             cfg.reservedLocalPorts == null
             || !builtins.isList cfg.reservedLocalPorts
             || validPortList cfg.reservedLocalPorts;
-          message = "services.phantun.reservedLocalPorts list form must be non-empty, contain at most 16 ports, and each port must be in the range 1..65535.";
+          message = "services.phantun.reservedLocalPorts list form must be non-empty, contain at most 64 ports, and each port must be in the range 1..65535.";
         }
         {
           assertion =
