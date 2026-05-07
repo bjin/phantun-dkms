@@ -480,8 +480,8 @@ README owns user-facing parameter documentation.
 
 Design constraints:
 
-- up to 16 `managed_local_ports`
-- up to 16 `managed_remote_peers`
+- up to 64 `managed_local_ports`
+- up to 64 `managed_remote_peers`
 - at least one selector list must be non-empty
 - `ip_families` is one of `both`, `ipv4`, `ipv6`; default `both`
 

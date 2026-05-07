@@ -76,7 +76,7 @@ MODULE_PARM_DESC(
 module_param(reserved_local_ports, charp, 0444);
 MODULE_PARM_DESC(reserved_local_ports,
                  "Optional local-only TCP reservation set: empty or 'off' disables, "
-                 "comma-separated ports reserve up to 16 managed_local_ports entries, and 'all' "
+                 "comma-separated ports reserve up to 64 managed_local_ports entries, and 'all' "
                  "reserves every managed_local_ports entry");
 module_param(ip_families, charp, 0444);
 MODULE_PARM_DESC(ip_families, "IP families to translate: both, ipv4, or ipv6");

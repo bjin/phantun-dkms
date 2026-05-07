@@ -213,7 +213,7 @@ For a WireGuard-server-style deployment, this means `managed_local_ports=51820` 
 |---|---|
 | empty / omitted | disabled (default) |
 | `off` | disabled |
-| comma-separated ports (max 16) | reserve only the listed ports that also appear in `managed_local_ports` |
+| comma-separated ports (max 64) | reserve only the listed ports that also appear in `managed_local_ports` |
 | `all` | reserve every effective `managed_local_ports` entry |
 
 Rules and trade-offs:
@@ -233,8 +233,8 @@ Use `reserved_local_ports` only when you want `phantun-dkms` to proactively clai
 
 | Parameter | Type | Default | Meaning |
 |---|---|---:|---|
-| `managed_local_ports` | integer array, max 16 | empty | Local ports the module owns. For WireGuard, usually the local listen port. |
-| `managed_remote_peers` | string array, max 16 | empty | Exact peers in `x.y.z.w:p` or `[IPv6]:p` form. |
+| `managed_local_ports` | integer array, max 64 | empty | Local ports the module owns. For WireGuard, usually the local listen port. |
+| `managed_remote_peers` | string array, max 64 | empty | Exact peers in `x.y.z.w:p` or `[IPv6]:p` form. |
 | `ip_families` | string | `both` | Enabled translation families: `both`, `ipv4`, or `ipv6`. |
 
 Validation rules:
@@ -247,7 +247,7 @@ Validation rules:
 
 | Parameter | Type | Default | Meaning |
 |---|---|---:|---|
-| `reserved_local_ports` | string | empty | Optional local-only TCP reservation set. Empty or `off` disables it, `all` reserves every `managed_local_ports` entry, and a comma-separated list of up to 16 ports reserves only the listed `managed_local_ports` subset. Ignored unless `managed_local_ports` is set and `managed_remote_peers` is empty. |
+| `reserved_local_ports` | string | empty | Optional local-only TCP reservation set. Empty or `off` disables it, `all` reserves every `managed_local_ports` entry, and a comma-separated list of up to 64 ports reserves only the listed `managed_local_ports` subset. Ignored unless `managed_local_ports` is set and `managed_remote_peers` is empty. |
 ### Optional timing and behavior
 
 | Parameter | Default | Meaning |
