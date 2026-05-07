@@ -9,3 +9,4 @@ CompileFlags:
     - -mrecord-mcount
     - -fno-allow-store-data-races
     - -fzero-init-padding-bits=all
+    - -fdiagnostics-show-context=2
