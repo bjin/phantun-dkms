@@ -33,27 +33,29 @@ This script:
 
 ### Test against host kernel (default)
 ```bash
-pytest tests
+pytest
 ```
+The pytest configuration in `pyproject.toml` limits default collection to `tests/`, so bare `pytest` does not recurse into prepared kernel trees or build artifacts.
+
 ### Test against all prepared kernels
 ```bash
-pytest tests --all-kernels
+pytest --all-kernels
 ```
 
 ### Test against a specific cached kernel
 ```bash
-pytest tests --kernel v6.19.1
+pytest --kernel v6.19.1
 ```
 
 ### Test against multiple kernels (Matrix)
 ```bash
-pytest tests --kernel host --kernel v6.19.1
+pytest --kernel host --kernel v6.19.1
 ```
 
 ### Debugging
 To see real-time output (including module load logs and VM setup):
 ```bash
-pytest -s tests
+pytest -s
 ```
 Logs are automatically saved to `~/.cache/logs/phantun_tests/YYYYMMDD_HHMMSS/`.
 

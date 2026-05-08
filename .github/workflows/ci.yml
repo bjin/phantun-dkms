@@ -81,7 +81,7 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           which vng
           vng --version
-          pytest -vv tests --kernel ${{ matrix.kernel }}
+          pytest -vv --kernel ${{ matrix.kernel }}
 
       - name: Upload test logs on failure
         if: failure()

@@ -25,7 +25,7 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 - Integration tests use `pytest` + `virtme-ng` (COW snapshots).
 - Read `TESTING.md` before adding or changing tests.
 - Prepare kernels: `python prepare-kernels.py <ver>`
-- Run: `pytest tests [-v] [--kernel host|<ver>]`
+- Run: `pytest [-v] [--kernel host|<ver>]`
 
 ## Important reminders
 - Managed traffic is intercepted in netfilter `LOCAL_OUT` and `PRE_ROUTING`.
