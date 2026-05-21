@@ -25,6 +25,28 @@
 #include "phantun_packet.h"
 #include "phantun_stats.h"
 
+unsigned int pht_fake_tcp_max_payload_len(u8 family) {
+    switch (family) {
+    case AF_INET:
+        return PHT_V4_MAX_TCP_PAYLOAD_LEN;
+    case AF_INET6:
+        return PHT_V6_MAX_TCP_PAYLOAD_LEN;
+    default:
+        return 0;
+    }
+}
+
+unsigned int pht_udp_max_payload_len(u8 family) {
+    switch (family) {
+    case AF_INET:
+        return PHT_V4_MAX_UDP_PAYLOAD_LEN;
+    case AF_INET6:
+        return PHT_V6_MAX_UDP_PAYLOAD_LEN;
+    default:
+        return 0;
+    }
+}
+
 static int pht_parse_ipv4_l4(struct sk_buff *skb, u8 protocol, unsigned int min_l4_len,
                              struct pht_l4_view *view) {
     struct iphdr *iph;
@@ -324,13 +346,17 @@ void pht_udp_v4_complete(struct iphdr *iph, struct udphdr *uh, u16 udp_len) {
 }
 
 static struct sk_buff *pht_alloc_l3_skb(unsigned int l4_len, size_t payload_len) {
+    unsigned int max_payload;
     unsigned int total_len;
     struct sk_buff *skb;
 
-    total_len = sizeof(struct iphdr) + l4_len + payload_len;
-    if (total_len > PHT_V4_MAX_PACKET_LEN)
+    if (l4_len > PHT_V4_MAX_PACKET_LEN - sizeof(struct iphdr))
+        return NULL;
+    max_payload = PHT_V4_MAX_PACKET_LEN - sizeof(struct iphdr) - l4_len;
+    if (payload_len > max_payload)
         return NULL;
 
+    total_len = sizeof(struct iphdr) + l4_len + (unsigned int)payload_len;
     skb = alloc_skb(LL_MAX_HEADER + total_len, GFP_ATOMIC);
     if (!skb)
         return NULL;
@@ -362,6 +388,8 @@ struct sk_buff *pht_build_fake_tcp_v4(const struct pht_endpoint_pair *ep, u32 se
     if (ep->local_addr.family != AF_INET || ep->remote_addr.family != AF_INET)
         return NULL;
     if (payload_len && !payload)
+        return NULL;
+    if (payload_len > pht_fake_tcp_max_payload_len(AF_INET))
         return NULL;
 
     add_wscale = !!(flags & PHT_TCP_FLAG_SYN);
@@ -446,6 +474,8 @@ struct sk_buff *pht_build_udp_v4(const struct pht_endpoint_pair *ep, const void 
         return NULL;
     if (payload_len && !payload)
         return NULL;
+    if (payload_len > pht_udp_max_payload_len(AF_INET))
+        return NULL;
 
     udp_len = sizeof(*uh) + payload_len;
     skb = pht_alloc_l3_skb(sizeof(*uh), payload_len);
@@ -509,6 +539,9 @@ int pht_emit_fake_tcp_v4(struct net *net, const struct pht_endpoint_pair *ep, u3
                          u8 flags, const void *payload, size_t payload_len, int *out_ifindex) {
     struct sk_buff *skb;
 
+    if (payload_len > pht_fake_tcp_max_payload_len(AF_INET))
+        return -EMSGSIZE;
+
     skb = pht_build_fake_tcp_v4(ep, seq, ack, flags, payload, payload_len);
     if (!skb)
         return -ENOMEM;
@@ -542,6 +575,9 @@ int pht_reinject_udp_payload_v4(struct net_device *dev, const struct pht_endpoin
                                 const void *payload, size_t payload_len) {
     struct sk_buff *skb;
 
+    if (payload_len > pht_udp_max_payload_len(AF_INET))
+        return -EMSGSIZE;
+
     skb = pht_build_udp_v4(ep, payload, payload_len);
     if (!skb)
         return -ENOMEM;
@@ -574,13 +610,17 @@ void pht_udp_v6_complete(struct ipv6hdr *ip6h, struct udphdr *uh, u16 udp_len) {
 }
 
 static struct sk_buff *pht_alloc_l3_skb_v6(unsigned int l4_len, size_t payload_len) {
+    unsigned int max_payload;
     unsigned int total_len;
     struct sk_buff *skb;
 
-    total_len = sizeof(struct ipv6hdr) + l4_len + payload_len;
-    if (total_len > PHT_V6_MAX_PACKET_LEN)
+    if (l4_len > PHT_V6_MAX_PACKET_LEN - sizeof(struct ipv6hdr))
+        return NULL;
+    max_payload = PHT_V6_MAX_PACKET_LEN - sizeof(struct ipv6hdr) - l4_len;
+    if (payload_len > max_payload)
         return NULL;
 
+    total_len = sizeof(struct ipv6hdr) + l4_len + (unsigned int)payload_len;
     skb = alloc_skb(LL_MAX_HEADER + total_len, GFP_ATOMIC);
     if (!skb)
         return NULL;
@@ -612,6 +652,8 @@ struct sk_buff *pht_build_fake_tcp_v6(const struct pht_endpoint_pair *ep, u32 se
     if (ep->local_addr.family != AF_INET6 || ep->remote_addr.family != AF_INET6)
         return NULL;
     if (payload_len && !payload)
+        return NULL;
+    if (payload_len > pht_fake_tcp_max_payload_len(AF_INET6))
         return NULL;
 
     add_wscale = !!(flags & PHT_TCP_FLAG_SYN);
@@ -668,6 +710,8 @@ struct sk_buff *pht_build_udp_v6(const struct pht_endpoint_pair *ep, const void 
     if (ep->local_addr.family != AF_INET6 || ep->remote_addr.family != AF_INET6)
         return NULL;
     if (payload_len && !payload)
+        return NULL;
+    if (payload_len > pht_udp_max_payload_len(AF_INET6))
         return NULL;
 
     udp_len = sizeof(*uh) + payload_len;
@@ -737,6 +781,9 @@ int pht_emit_fake_tcp_v6(struct net *net, const struct pht_endpoint_pair *ep, u3
                          u8 flags, const void *payload, size_t payload_len, int *out_ifindex) {
     struct sk_buff *skb;
 
+    if (payload_len > pht_fake_tcp_max_payload_len(AF_INET6))
+        return -EMSGSIZE;
+
     skb = pht_build_fake_tcp_v6(ep, seq, ack, flags, payload, payload_len);
     if (!skb)
         return -ENOMEM;
@@ -765,6 +812,9 @@ int pht_reinject_udp_v6(struct sk_buff *skb, struct net_device *dev) {
 int pht_reinject_udp_payload_v6(struct net_device *dev, const struct pht_endpoint_pair *ep,
                                 const void *payload, size_t payload_len) {
     struct sk_buff *skb;
+
+    if (payload_len > pht_udp_max_payload_len(AF_INET6))
+        return -EMSGSIZE;
 
     skb = pht_build_udp_v6(ep, payload, payload_len);
     if (!skb)

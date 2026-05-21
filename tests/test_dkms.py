@@ -23,6 +23,15 @@ def assert_modprobe_rejected(result, context):
         pytest.fail(f"unexpected modprobe output for {context}: stdout={result.stdout!r}, stderr={result.stderr!r}")
 
 
+def assert_modprobe_rejected_oversized_payload(result, context):
+    if result.returncode == 0:
+        pytest.fail(f"modprobe unexpectedly accepted {context}")
+
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    if "Invalid argument" not in output and "No space left on device" not in output:
+        pytest.fail(f"unexpected modprobe output for {context}: stdout={result.stdout!r}, stderr={result.stderr!r}")
+
+
 def run_tcp_bind_probe(vm, bind_addr, bind_port):
     result = run_guest_scenario(
         vm,
@@ -143,6 +152,49 @@ def test_module_rejects_too_large_reopen_guard(phantun_module, vm):
         lsmod = vm.run(["lsmod"])
         if "phantun" in lsmod.stdout:
             pytest.fail("phantun module should not remain loaded after invalid reopen_guard_bytes")
+    finally:
+        vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
+
+
+def test_module_rejects_oversized_handshake_request(phantun_module, vm):
+    phantun_module.unload()
+    payload = "A" * 1500
+    vm.run(
+        "echo 'options phantun managed_local_ports=1234 handshake_request="
+        + payload
+        + "' > /etc/modprobe.d/phantun.conf"
+    )
+    try:
+        res = vm.run(["modprobe", "phantun"], check=False)
+        assert_modprobe_rejected_oversized_payload(res, "oversized handshake_request")
+    finally:
+        vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
+
+
+def test_module_rejects_oversized_handshake_response(phantun_module, vm):
+    phantun_module.unload()
+    payload = "B" * 1500
+    vm.run(
+        "echo 'options phantun managed_local_ports=1234 handshake_request=req handshake_response="
+        + payload
+        + "' > /etc/modprobe.d/phantun.conf"
+    )
+    try:
+        res = vm.run(["modprobe", "phantun"], check=False)
+        assert_modprobe_rejected_oversized_payload(res, "oversized handshake_response")
+    finally:
+        vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
+
+
+def test_module_rejects_oversized_second_timer_param(phantun_module, vm):
+    phantun_module.unload()
+    vm.run(
+        "echo 'options phantun managed_local_ports=1234 keepalive_interval_sec=4294968' "
+        "> /etc/modprobe.d/phantun.conf"
+    )
+    try:
+        res = vm.run(["modprobe", "phantun"], check=False)
+        assert_modprobe_rejected(res, "oversized keepalive_interval_sec")
     finally:
         vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
 

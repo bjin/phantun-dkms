@@ -5,6 +5,7 @@
 #include <linux/inet.h>
 #include <linux/inetdevice.h>
 #include <linux/init.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -936,6 +937,12 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
     int ifindex;
     int ret;
 
+    if (view->payload_len > pht_fake_tcp_max_payload_len(view->family)) {
+        pht_stats_inc(PHT_STAT_OVERSIZED_PAYLOADS_DROPPED);
+        pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+        return -EMSGSIZE;
+    }
+
     if (view->payload_len) {
         payload = kmalloc(view->payload_len, GFP_ATOMIC);
         if (!payload)
@@ -1101,11 +1108,14 @@ static int phantun_send_idle_ack(struct pht_flow *flow, struct net *net) {
     return ret;
 }
 
-static int phantun_flush_queued_udp(struct pht_flow *flow, struct net *net) {
+static int phantun_flush_queued_udp(struct pht_flow *flow, struct net *net, bool *emitted_payload) {
     struct sk_buff *queued_skb;
     struct pht_l4_view qview;
     struct pht_endpoint_pair qep;
     int ret;
+
+    if (emitted_payload)
+        *emitted_payload = false;
 
     queued_skb = pht_flow_take_queued_skb(flow);
     if (!queued_skb)
@@ -1120,11 +1130,16 @@ static int phantun_flush_queued_udp(struct pht_flow *flow, struct net *net) {
     phantun_fill_udp_endpoint_pair(&qview, &qep);
     qep.scope_ifindex = flow->endpoints.scope_ifindex;
     ret = phantun_send_established_udp(flow, &qep, &qview, queued_skb, net);
-    if (ret)
+    if (ret && ret != -EMSGSIZE) {
         pht_flow_set_queued_skb(flow, queued_skb);
-    else
-        kfree_skb(queued_skb);
-    return ret;
+        return ret;
+    }
+
+    if (!ret && emitted_payload)
+        *emitted_payload = true;
+
+    kfree_skb(queued_skb);
+    return 0;
 }
 
 static bool phantun_payload_exceeds_udp_reinject_limit(const struct pht_l4_view *view) {
@@ -1215,7 +1230,7 @@ static int phantun_finalize_established_rx(struct pht_flow *flow,
     }
 
     if (allow_flush) {
-        ret = phantun_flush_queued_udp(flow, net);
+        ret = phantun_flush_queued_udp(flow, net, NULL);
         if (ret)
             return ret;
     }
@@ -1327,7 +1342,7 @@ retry_lookup:
             }
 
             ret = phantun_send_established_udp(flow, &ep, &view, skb, state->net);
-            if (ret) {
+            if (ret && ret != -EMSGSIZE) {
                 pht_pr_warn("failed to emit fake-TCP payload for established flow: %d\n", ret);
                 phantun_send_flow_rst(flow, state->net);
                 pht_flow_remove(flow);
@@ -1773,9 +1788,13 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
             pht_flow_touch_inbound(flow);
             pht_flow_update_state(flow, PHT_FLOW_STATE_ESTABLISHED);
-            ret = phantun_flush_queued_udp(flow, state->net);
-            if (!ret && !had_queued && !phantun_request_enabled())
-                ret = phantun_send_idle_ack(flow, state->net);
+            {
+                bool flushed_payload = false;
+
+                ret = phantun_flush_queued_udp(flow, state->net, &flushed_payload);
+                if (!ret && !phantun_request_enabled() && (!had_queued || !flushed_payload))
+                    ret = phantun_send_idle_ack(flow, state->net);
+            }
             if (ret) {
                 pht_pr_warn("failed to finalize initiator open: %d\n", ret);
                 pht_flow_remove(flow);
@@ -1883,7 +1902,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
             /* The responder transitions to ESTABLISHED. We must flush any
              * queued UDP data. */
-            ret = phantun_flush_queued_udp(flow, state->net);
+            ret = phantun_flush_queued_udp(flow, state->net, NULL);
             if (ret) {
                 pht_pr_warn("failed to flush responder queue: %d\n", ret);
                 pht_flow_remove(flow);
@@ -1997,7 +2016,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         if (view.payload_len == 0) {
             pht_flow_touch_inbound(flow);
             if (response_unblocked) {
-                ret = phantun_flush_queued_udp(flow, state->net);
+                ret = phantun_flush_queued_udp(flow, state->net, NULL);
                 if (ret) {
                     pht_pr_warn("failed to flush responder queue: %d\n", ret);
                     pht_flow_remove(flow);
@@ -2188,6 +2207,33 @@ static int phantun_parse_ip_families(unsigned int *families) {
     return -EINVAL;
 }
 
+static unsigned int phantun_enabled_fake_tcp_payload_limit(unsigned int enabled_families) {
+    if (enabled_families & PHT_FAMILY_IPV6)
+        return pht_fake_tcp_max_payload_len(AF_INET6);
+    if (enabled_families & PHT_FAMILY_IPV4)
+        return pht_fake_tcp_max_payload_len(AF_INET);
+    return 0;
+}
+
+static int phantun_validate_second_param(const char *name, unsigned int value) {
+    if (value > UINT_MAX / 1000U) {
+        pht_pr_err("%s is too large; maximum is %u seconds\n", name, UINT_MAX / 1000U);
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static int phantun_validate_keepalive_jiffies(void) {
+    unsigned long interval;
+
+    interval = msecs_to_jiffies(keepalive_interval_sec * 1000U);
+    if (interval && keepalive_misses > LONG_MAX / interval) {
+        pht_pr_err("keepalive_interval_sec * keepalive_misses exceeds signed jiffies range\n");
+        return -EINVAL;
+    }
+    return 0;
+}
+
 static int phantun_validate_config(void) {
     u16 requested_ports[PHANTUN_MAX_MANAGED_PORTS];
     unsigned int requested_count;
@@ -2248,16 +2294,25 @@ static int phantun_validate_config(void) {
         pht_pr_err("keepalive_interval_sec must be greater than zero\n");
         return -EINVAL;
     }
+    ret = phantun_validate_second_param("keepalive_interval_sec", keepalive_interval_sec);
+    if (ret)
+        return ret;
 
     if (!keepalive_misses) {
         pht_pr_err("keepalive_misses must be greater than zero\n");
         return -EINVAL;
     }
+    ret = phantun_validate_keepalive_jiffies();
+    if (ret)
+        return ret;
 
     if (!hard_idle_timeout_sec) {
         pht_pr_err("hard_idle_timeout_sec must be greater than zero\n");
         return -EINVAL;
     }
+    ret = phantun_validate_second_param("hard_idle_timeout_sec", hard_idle_timeout_sec);
+    if (ret)
+        return ret;
 
     if (reopen_guard_bytes >= 0x80000000U) {
         pht_pr_err("reopen_guard_bytes must be smaller than 2147483648\n");
@@ -2373,6 +2428,29 @@ static int phantun_parse_payload_param(const char *raw_str, void **out_buf, unsi
     return 0;
 }
 
+static int phantun_validate_handshake_payload_lengths(const struct phantun_config *cfg) {
+    unsigned int limit;
+
+    if (!cfg)
+        return -EINVAL;
+
+    limit = phantun_enabled_fake_tcp_payload_limit(cfg->enabled_families);
+    if (!limit)
+        return -EINVAL;
+
+    if (cfg->handshake_request_len > limit) {
+        pht_pr_err("handshake_request length %u exceeds fake-TCP payload limit %u\n",
+                   cfg->handshake_request_len, limit);
+        return -EINVAL;
+    }
+    if (cfg->handshake_response_len > limit) {
+        pht_pr_err("handshake_response length %u exceeds fake-TCP payload limit %u\n",
+                   cfg->handshake_response_len, limit);
+        return -EINVAL;
+    }
+    return 0;
+}
+
 static int phantun_snapshot_config(void) {
     unsigned int i;
     int ret;
@@ -2415,6 +2493,15 @@ static int phantun_snapshot_config(void) {
         return ret;
     }
     phantun_cfg.handshake_response = phantun_alloc_resp;
+    ret = phantun_validate_handshake_payload_lengths(&phantun_cfg);
+    if (ret) {
+        kfree(phantun_alloc_resp);
+        phantun_alloc_resp = NULL;
+        kfree(phantun_alloc_req);
+        phantun_alloc_req = NULL;
+        return ret;
+    }
+
     phantun_cfg.handshake_timeout_ms = handshake_timeout_ms;
     phantun_cfg.handshake_retries = handshake_retries;
     phantun_cfg.keepalive_interval_sec = keepalive_interval_sec;

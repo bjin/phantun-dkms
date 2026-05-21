@@ -69,6 +69,9 @@ struct pht_l4_view {
     unsigned int payload_len;
 };
 
+unsigned int pht_fake_tcp_max_payload_len(u8 family);
+unsigned int pht_udp_max_payload_len(u8 family);
+
 int pht_parse_ipv4_udp(struct sk_buff *skb, struct pht_l4_view *view);
 int pht_parse_ipv4_tcp(struct sk_buff *skb, struct pht_l4_view *view);
 int pht_validate_ipv4_tcp_checksums(const struct sk_buff *skb, const struct pht_l4_view *view);

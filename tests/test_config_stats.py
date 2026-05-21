@@ -146,6 +146,63 @@ def test_sysfs_stats_exist_and_increment(phantun_module, vm):
         pytest.fail(f"expected at least one shaping payload drop, got {stats!r}")
 
 
+def test_oversized_outbound_udp_is_dropped_without_tearing_down_flow(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    oversized_payload = "X" * 1470
+    baseline_stats = read_module_stats(vm)
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+            "timeout_sec": 20,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        client = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["first", oversized_payload, "second"],
+                "delay_ms": 300,
+            },
+            timeout=20,
+        )
+        server_result = server.communicate(timeout=20)
+        assert_completed(client, "oversized outbound UDP client")
+        assert_completed(server_result, "oversized outbound UDP server")
+
+        server_data = parse_guest_json(server_result.stdout, "oversized outbound UDP server stdout")
+        if [entry["message"] for entry in server_data.get("received", [])] != ["first", "second"]:
+            pytest.fail(f"oversized outbound UDP was delivered or flow did not recover: {server_data!r}")
+
+        stats = read_module_stats(vm)
+        if stats["oversized_payloads_dropped"] != baseline_stats["oversized_payloads_dropped"] + 1:
+            pytest.fail(f"expected one oversized outbound drop: before={baseline_stats!r} after={stats!r}")
+        if stats["udp_packets_dropped"] != baseline_stats["udp_packets_dropped"] + 1:
+            pytest.fail(f"expected one outbound UDP drop: before={baseline_stats!r} after={stats!r}")
+        if stats["rst_sent"] != baseline_stats["rst_sent"]:
+            pytest.fail(
+                f"oversized outbound UDP must not tear down flow with RST: before={baseline_stats!r} after={stats!r}"
+            )
+    finally:
+        cleanup_netns_topology(vm)
+
+
 def test_managed_remote_peers_filter_blocks_unmatched_remote_peer(phantun_module, vm):
     phantun_module.load(
         managed_local_ports=MANAGED_LOCAL_PORTS,
