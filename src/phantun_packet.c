@@ -343,6 +343,8 @@ void pht_udp_v4_complete(struct iphdr *iph, struct udphdr *uh, u16 udp_len) {
     uh->check = 0;
     uh->check = csum_tcpudp_magic(iph->saddr, iph->daddr, udp_len, IPPROTO_UDP,
                                   csum_partial(uh, udp_len, 0));
+    if (!uh->check)
+        uh->check = CSUM_MANGLED_0;
 }
 
 static struct sk_buff *pht_alloc_l3_skb(unsigned int l4_len, size_t payload_len) {

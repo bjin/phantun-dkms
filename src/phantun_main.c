@@ -1991,8 +1991,9 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
         spin_lock_bh(&flow->lock);
         if (flow->response_pending_ack) {
-            if (view.tcp->ack && ntohl(view.tcp->ack_seq) >=
-                                     flow->local_isn + 1 + phantun_cfg.handshake_response_len) {
+            if (view.tcp->ack &&
+                phantun_seq_after_eq(ntohl(view.tcp->ack_seq),
+                                     flow->local_isn + 1 + phantun_cfg.handshake_response_len)) {
                 flow->response_pending_ack = false;
                 response_unblocked = true;
             } else if (view.payload_len > 0) {
