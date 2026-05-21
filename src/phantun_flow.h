@@ -60,8 +60,15 @@ struct pht_flow {
      * rollback happen in wire order. This supplements, not replaces, @lock.
      */
     spinlock_t tx_lock;
+    /* hnode owns the table reference while hashed. gc_node is process-context
+     * teardown owned by the GC/destroy path. keepalive_node carries a temporary
+     * ref while GC drops bucket locks to transmit. finalize_node transfers the
+     * table reference to process context for blocking timer shutdown.
+     */
     struct hlist_node hnode;
     struct list_head gc_node;
+    struct list_head keepalive_node;
+    struct list_head finalize_node;
     struct timer_list retransmit_timer;
     struct pht_flow_table *table;
     struct pht_endpoint_pair endpoints;
@@ -114,6 +121,10 @@ struct pht_flow {
      * reinitiation path.
      */
     bool liveness_failed;
+    /* Protected by @lock; consumed by finalize_work before dropping the
+     * table/finalizer-owned reference.
+     */
+    bool finalize_send_rst;
 };
 
 struct pht_flow_bucket {
@@ -124,6 +135,13 @@ struct pht_flow_bucket {
 struct pht_flow_table {
     struct pht_flow_bucket buckets[PHT_FLOW_BUCKETS];
     struct delayed_work gc_work;
+    /* Packet hooks detach by unhashing immediately, then queue the former
+     * table reference here so timer_shutdown_sync() runs only from workqueue
+     * context.
+     */
+    struct work_struct finalize_work;
+    struct list_head finalize_list;
+    spinlock_t finalize_lock;
     unsigned long keepalive_interval_jiffies;
     unsigned long hard_idle_timeout_jiffies;
     unsigned long handshake_timeout_jiffies;

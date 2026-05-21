@@ -63,6 +63,101 @@ def wait_for_half_open_drain(vm, baseline_stats, expected_rst, timeout=15):
     )
 
 
+def wait_for_flows_current(vm, expected, timeout=10):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        stats = read_module_stats(vm)
+        if stats["flows_current"] == expected:
+            return stats
+        time.sleep(0.1)
+
+    pytest.fail(f"flows_current did not reach {expected}: current={stats!r}")
+
+
+def test_initial_syn_emit_failure_releases_flow_slot_and_queue(phantun_module, vm):
+    load_loss_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    baseline_stats = read_module_stats(vm)
+    probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "src_port": src_port,
+                "dst_addr": NS_ADDR_B,
+                "dst_port": dst_port,
+                "flags_expr": "syn",
+                "action": "drop",
+                "comment": "drop_initial_syn_local_emit",
+            }
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "timeout_sec": 10,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        first = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["must-not-leak"],
+            },
+        )
+        assert_completed(first, "initial SYN local emit failure sender")
+        if probe.packets(vm, "drop_initial_syn_local_emit") <= 0:
+            pytest.fail("expected nft OUTPUT rule to drop the locally emitted SYN")
+
+        stats_after_failure = wait_for_flows_current(vm, baseline_stats["flows_current"])
+        if stats_after_failure["udp_packets_dropped"] <= baseline_stats["udp_packets_dropped"]:
+            pytest.fail(f"expected failed initial SYN emit to count a UDP drop: {stats_after_failure!r}")
+
+        probe.cleanup(vm)
+        second = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["fresh-flow"],
+            },
+        )
+        assert_completed(second, "fresh flow sender after failed SYN")
+        server_result = server.communicate(timeout=15)
+        assert_completed(server_result, "fresh flow receiver after failed SYN")
+        server_data = parse_guest_json(server_result.stdout, "fresh flow receiver stdout")
+        if received_messages(server_data) != ["fresh-flow"]:
+            pytest.fail(f"failed initial SYN retained or delivered queued skb: {server_data!r}")
+    finally:
+        probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
 def test_syn_loss_is_retried(phantun_module, vm):
     load_loss_module(phantun_module)
     ensure_netns_topology(vm)

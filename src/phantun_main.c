@@ -1414,9 +1414,12 @@ retry_lookup:
     if (ret) {
         pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
         pht_pr_warn("failed to emit fake-TCP SYN: %d\n", ret);
-        pht_flow_remove(new_flow);
+        pht_flow_detach(new_flow);
+        pht_flow_put(new_flow);
         return NF_STOLEN;
     }
+
+    pht_flow_put(new_flow);
 
     return NF_STOLEN;
 }
@@ -1644,8 +1647,9 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         ret = phantun_send_synack(new_flow, state->net);
         if (ret) {
             pht_pr_warn("failed to emit SYN|ACK: %d\n", ret);
-            pht_flow_remove(new_flow);
+            pht_flow_detach(new_flow);
         }
+        pht_flow_put(new_flow);
         return NF_DROP;
     }
 
@@ -1734,8 +1738,9 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             ret = phantun_send_synack(new_flow, state->net);
             if (ret) {
                 pht_pr_warn("failed to emit SYN|ACK after collision handoff: %d\n", ret);
-                pht_flow_remove(new_flow);
+                pht_flow_detach(new_flow);
             }
+            pht_flow_put(new_flow);
             return NF_DROP;
         }
 

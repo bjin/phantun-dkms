@@ -133,8 +133,10 @@ static int pht_flow_retransmit_now(struct pht_flow *flow) {
     }
 }
 
-static bool pht_flow_unhash(struct pht_flow *flow);
+static bool pht_flow_unhash_and_queue_finalize(struct pht_flow *flow, bool send_rst);
+static void pht_flow_queue_finalize(struct pht_flow *flow, bool send_rst);
 
+static void pht_flow_finalize_worker(struct work_struct *work);
 static void pht_flow_gc_worker(struct work_struct *work);
 static void pht_flow_untrack_half_open(struct pht_flow *flow);
 
@@ -159,14 +161,12 @@ static void pht_flow_retransmit_timer(struct timer_list *timer) {
         bool removed;
 
         flow->state = PHT_FLOW_STATE_DEAD;
+        flow->finalize_send_rst = true;
         flow->retransmit_armed = false;
         spin_unlock_bh(&flow->lock);
 
         pht_flow_untrack_half_open(flow);
-        removed = pht_flow_unhash(flow);
-        pht_flow_send_local_rst(flow);
-        if (removed)
-            pht_flow_put(flow);
+        removed = pht_flow_unhash_and_queue_finalize(flow, true);
         pht_flow_put(flow);
         return;
     }
@@ -238,6 +238,71 @@ static void pht_flow_untrack_half_open(struct pht_flow *flow) {
     spin_unlock_bh(&flow->table->half_open_lock);
 }
 
+/* Detach callers have already made the flow unreachable from the hash table.
+ * Queue the former table reference here; callers keep and release any lookup
+ * reference separately. Coalescing is safe because all finalization requests
+ * require the same timer shutdown/free path, and send_rst is latched.
+ */
+static void pht_flow_queue_finalize(struct pht_flow *flow, bool send_rst) {
+    struct pht_flow_table *table;
+    bool queue = false;
+
+    if (!flow || !flow->table)
+        return;
+
+    table = flow->table;
+    spin_lock_bh(&flow->lock);
+    flow->finalize_send_rst |= send_rst;
+    spin_unlock_bh(&flow->lock);
+
+    spin_lock_bh(&table->finalize_lock);
+    if (list_empty(&flow->finalize_node)) {
+        list_add_tail(&flow->finalize_node, &table->finalize_list);
+        queue = true;
+    }
+    spin_unlock_bh(&table->finalize_lock);
+
+    if (queue)
+        queue_work(system_wq, &table->finalize_work);
+}
+
+/* Runs only from process context (GC, destroy, or finalize_work). */
+static void pht_flow_finalize_one(struct pht_flow *flow) {
+    bool send_rst;
+
+    if (!flow)
+        return;
+
+    spin_lock_bh(&flow->lock);
+    send_rst = flow->finalize_send_rst;
+    flow->finalize_send_rst = false;
+    spin_unlock_bh(&flow->lock);
+
+    if (send_rst)
+        pht_flow_send_local_rst(flow);
+    pht_flow_shutdown_retransmit_sync(flow);
+    pht_flow_put(flow);
+}
+
+static void pht_flow_finalize_worker(struct work_struct *work) {
+    struct pht_flow_table *table = container_of(work, struct pht_flow_table, finalize_work);
+
+    for (;;) {
+        struct pht_flow *flow;
+
+        spin_lock_bh(&table->finalize_lock);
+        if (list_empty(&table->finalize_list)) {
+            spin_unlock_bh(&table->finalize_lock);
+            return;
+        }
+        flow = list_first_entry(&table->finalize_list, struct pht_flow, finalize_node);
+        list_del_init(&flow->finalize_node);
+        spin_unlock_bh(&table->finalize_lock);
+
+        pht_flow_finalize_one(flow);
+    }
+}
+
 int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
                         const struct phantun_config *cfg) {
     unsigned int i;
@@ -251,6 +316,8 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
         INIT_HLIST_HEAD(&table->buckets[i].head);
     }
     spin_lock_init(&table->half_open_lock);
+    spin_lock_init(&table->finalize_lock);
+    INIT_LIST_HEAD(&table->finalize_list);
 
     table->handshake_timeout_jiffies = msecs_to_jiffies(cfg->handshake_timeout_ms);
     table->keepalive_interval_jiffies = msecs_to_jiffies(cfg->keepalive_interval_sec * 1000U);
@@ -272,6 +339,7 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
     table->net = net;
     table->cfg = cfg;
     INIT_DELAYED_WORK(&table->gc_work, pht_flow_gc_worker);
+    INIT_WORK(&table->finalize_work, pht_flow_finalize_worker);
     schedule_delayed_work(&table->gc_work, table->gc_interval_jiffies);
     return 0;
 }
@@ -307,6 +375,7 @@ static void pht_flow_detach_all(struct pht_flow_table *table, struct list_head *
  * and no bucket or flow lock is held.
  */
 static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list_head *expired,
+                                       struct list_head *keepalives,
                                        struct sk_buff_head *reinject_list) {
     unsigned int i;
     unsigned long now = jiffies;
@@ -344,7 +413,8 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
                     flow->liveness_failed = flow->state == PHT_FLOW_STATE_ESTABLISHED;
                     flow->state = PHT_FLOW_STATE_DEAD;
                     is_liveness_failure = true;
-                } else if (table->keepalive_interval_jiffies > 0 &&
+                } else if (flow->state == PHT_FLOW_STATE_ESTABLISHED &&
+                           table->keepalive_interval_jiffies > 0 &&
                            time_after_eq(now, flow->last_inbound_jiffies +
                                                   table->keepalive_interval_jiffies *
                                                       (flow->keepalives_sent + 1))) {
@@ -369,17 +439,8 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
             }
 
             if (send_keepalive && !expired_flow && !is_liveness_failure) {
-                int ifindex;
-                int ret;
-
-                spin_lock(&flow->lock);
-                if (flow->table && flow->table->net) {
-                    ret = pht_emit_fake_tcp(flow->table->net, &flow->endpoints, flow->seq,
-                                            flow->ack, PHT_TCP_FLAG_ACK, NULL, 0, &ifindex);
-                    if (!ret)
-                        flow->egress_ifindex = ifindex;
-                }
-                spin_unlock(&flow->lock);
+                pht_flow_get(flow);
+                list_add_tail(&flow->keepalive_node, keepalives);
             }
 
             if (!expired_flow)
@@ -396,10 +457,50 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
     return found;
 }
 
+/* Keepalive candidates are collected with a temporary ref while bucket locks
+ * are held, then transmitted here lockless. The revalidation after emit avoids
+ * writing route state into a detached/replaced generation.
+ */
+static void pht_flow_emit_keepalives(struct pht_flow_table *table, struct list_head *keepalives) {
+    while (!list_empty(keepalives)) {
+        struct pht_endpoint_pair ep;
+        struct pht_flow *flow = list_first_entry(keepalives, struct pht_flow, keepalive_node);
+        u32 seq;
+        u32 ack;
+        int ifindex;
+        int ret;
+        bool live;
+
+        list_del_init(&flow->keepalive_node);
+
+        spin_lock_bh(&flow->lock);
+        live = flow->state == PHT_FLOW_STATE_ESTABLISHED && flow->table == table;
+        if (live) {
+            ep = flow->endpoints;
+            seq = flow->seq;
+            ack = flow->ack;
+        }
+        spin_unlock_bh(&flow->lock);
+
+        if (live && table->net) {
+            ret = pht_emit_fake_tcp(table->net, &ep, seq, ack, PHT_TCP_FLAG_ACK, NULL, 0, &ifindex);
+            if (!ret) {
+                spin_lock_bh(&flow->lock);
+                if (flow->state == PHT_FLOW_STATE_ESTABLISHED && flow->table == table)
+                    flow->egress_ifindex = ifindex;
+                spin_unlock_bh(&flow->lock);
+            }
+        }
+
+        pht_flow_put(flow);
+    }
+}
+
 static void pht_flow_gc_worker(struct work_struct *work) {
     struct pht_flow_table *table =
         container_of(to_delayed_work(work), struct pht_flow_table, gc_work);
     LIST_HEAD(expired);
+    LIST_HEAD(keepalives);
     struct sk_buff_head reinject_list;
     struct sk_buff *skb;
     struct pht_flow *flow;
@@ -407,18 +508,17 @@ static void pht_flow_gc_worker(struct work_struct *work) {
 
     __skb_queue_head_init(&reinject_list);
 
-    pht_flow_gc_detach_expired(table, &expired, &reinject_list);
+    pht_flow_gc_detach_expired(table, &expired, &keepalives, &reinject_list);
+    pht_flow_emit_keepalives(table, &keepalives);
     list_for_each_entry_safe(flow, tmp, &expired, gc_node) {
         bool send_liveness_rst;
 
         list_del_init(&flow->gc_node);
         spin_lock_bh(&flow->lock);
         send_liveness_rst = flow->liveness_failed;
+        flow->finalize_send_rst |= send_liveness_rst;
         spin_unlock_bh(&flow->lock);
-        if (send_liveness_rst)
-            pht_flow_send_local_rst(flow);
-        pht_flow_shutdown_retransmit_sync(flow);
-        pht_flow_put(flow);
+        pht_flow_finalize_one(flow);
     }
 
     while ((skb = __skb_dequeue(&reinject_list)) != NULL) {
@@ -454,14 +554,23 @@ void pht_flow_table_destroy(struct pht_flow_table *table) {
         return;
 
     cancel_delayed_work_sync(&table->gc_work);
+    flush_work(&table->finalize_work);
     pht_flow_detach_all(table, &expired);
 
     list_for_each_entry_safe(flow, tmp, &expired, gc_node) {
         list_del_init(&flow->gc_node);
-        pht_flow_send_local_rst(flow);
-        pht_flow_shutdown_retransmit_sync(flow);
-        pht_flow_put(flow);
+        spin_lock_bh(&flow->lock);
+        flow->finalize_send_rst = true;
+        spin_unlock_bh(&flow->lock);
+        pht_flow_finalize_one(flow);
     }
+
+    /* A retransmit callback can race the first flush and queue finalization
+     * while destroy is detaching still-hashed flows. The loop above has shut
+     * those timers down, so a second flush drains the last table-owned refs
+     * before netns storage can disappear.
+     */
+    flush_work(&table->finalize_work);
 }
 
 void pht_flow_get(struct pht_flow *flow) { refcount_inc(&flow->refs); }
@@ -510,6 +619,8 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table, const struct pht_
     spin_lock_init(&flow->tx_lock);
     INIT_HLIST_NODE(&flow->hnode);
     INIT_LIST_HEAD(&flow->gc_node);
+    INIT_LIST_HEAD(&flow->keepalive_node);
+    INIT_LIST_HEAD(&flow->finalize_node);
     timer_setup(&flow->retransmit_timer, pht_flow_retransmit_timer, 0);
     flow->table = table;
     flow->endpoints = *ep;
@@ -525,7 +636,7 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table, const struct pht_
     return flow;
 }
 
-static bool pht_flow_unhash(struct pht_flow *flow) {
+static bool pht_flow_unhash_and_queue_finalize(struct pht_flow *flow, bool send_rst) {
     struct pht_flow_bucket *bucket;
     u32 idx;
     bool removed = false;
@@ -538,12 +649,11 @@ static bool pht_flow_unhash(struct pht_flow *flow) {
     spin_lock_bh(&bucket->lock);
     if (!hlist_unhashed(&flow->hnode)) {
         hlist_del_init(&flow->hnode);
+        pht_stats_dec(PHT_STAT_FLOWS_CURRENT);
+        pht_flow_queue_finalize(flow, send_rst);
         removed = true;
     }
     spin_unlock_bh(&bucket->lock);
-
-    if (removed)
-        pht_stats_dec(PHT_STAT_FLOWS_CURRENT);
 
     return removed;
 }
@@ -579,6 +689,12 @@ int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow) {
         flow->half_open_tracked = true;
         spin_unlock(&table->half_open_lock);
     }
+    /*
+     * The creator keeps its own reference across the post-insert first
+     * transmit. The table takes a distinct ref before publishing so a
+     * concurrent lookup/detach cannot free the flow out from under the creator.
+     */
+    pht_flow_get(flow);
     hlist_add_head(&flow->hnode, &bucket->head);
     spin_unlock_bh(&bucket->lock);
 
@@ -590,14 +706,12 @@ int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow) {
     return 0;
 }
 
-/* Idempotent detach: once a flow leaves the table, mark it DEAD before timer
- * shutdown so no later retransmit callback can truthfully keep the generation
- * alive. After unhash, drop the table-owned reference exactly once; the caller
- * still owns its own reference and decides when to release it.
+/* Idempotent detach: once a flow leaves the table, mark it DEAD immediately
+ * so later lookups cannot use the generation. The table-owned reference is
+ * transferred to finalize_work because timer_shutdown_sync() may block and
+ * packet hooks must not sleep.
  */
 void pht_flow_detach(struct pht_flow *flow) {
-    bool removed;
-
     if (!flow || !flow->table)
         return;
 
@@ -606,12 +720,7 @@ void pht_flow_detach(struct pht_flow *flow) {
     spin_unlock_bh(&flow->lock);
     pht_flow_untrack_half_open(flow);
 
-    removed = pht_flow_unhash(flow);
-    if (!removed)
-        return;
-
-    pht_flow_shutdown_retransmit_sync(flow);
-    pht_flow_put(flow);
+    pht_flow_unhash_and_queue_finalize(flow, false);
 }
 
 /* Local teardown is intentionally idempotent: mark the flow dead and stop
@@ -739,7 +848,6 @@ void pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state) {
 
 void pht_flow_arm_retransmit(struct pht_flow *flow) {
     unsigned long when;
-    bool take_ref = false;
 
     if (!flow || !flow->table)
         return;
@@ -750,16 +858,13 @@ void pht_flow_arm_retransmit(struct pht_flow *flow) {
         return;
     }
     if (!flow->retransmit_armed) {
+        pht_flow_get(flow);
         flow->retransmit_armed = true;
-        take_ref = true;
     }
     when = jiffies + flow->table->handshake_timeout_jiffies;
     flow->retransmit_at_jiffies = when;
-    spin_unlock_bh(&flow->lock);
-
-    if (take_ref)
-        pht_flow_get(flow);
     mod_timer(&flow->retransmit_timer, when);
+    spin_unlock_bh(&flow->lock);
 }
 
 void pht_flow_cancel_retransmit(struct pht_flow *flow) {
