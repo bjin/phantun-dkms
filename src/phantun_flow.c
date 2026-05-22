@@ -158,15 +158,13 @@ static void pht_flow_retransmit_timer(struct timer_list *timer) {
     }
 
     if (flow->retries_done >= flow->max_retries) {
-        bool removed;
-
         flow->state = PHT_FLOW_STATE_DEAD;
         flow->finalize_send_rst = true;
         flow->retransmit_armed = false;
         spin_unlock_bh(&flow->lock);
 
         pht_flow_untrack_half_open(flow);
-        removed = pht_flow_unhash_and_queue_finalize(flow, true);
+        pht_flow_unhash_and_queue_finalize(flow, true);
         pht_flow_put(flow);
         return;
     }
@@ -695,11 +693,11 @@ int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow) {
      * concurrent lookup/detach cannot free the flow out from under the creator.
      */
     pht_flow_get(flow);
+    pht_stats_inc(PHT_STAT_FLOWS_CURRENT);
     hlist_add_head(&flow->hnode, &bucket->head);
     spin_unlock_bh(&bucket->lock);
 
     pht_stats_inc(PHT_STAT_FLOWS_CREATED);
-    pht_stats_inc(PHT_STAT_FLOWS_CURRENT);
     if (pht_flow_state_is_half_open(flow->state))
         pht_flow_arm_retransmit(flow);
 
@@ -911,7 +909,6 @@ pht_flow_invalidate_matching(struct pht_flow_table *table,
                              bool (*matches_locked)(const struct pht_flow *flow,
                                                     const struct pht_flow_invalidate_match *match),
                              const struct pht_flow_invalidate_match *match) {
-    LIST_HEAD(expired);
     unsigned int count = 0;
     unsigned int i;
 
@@ -938,18 +935,10 @@ pht_flow_invalidate_matching(struct pht_flow_table *table,
             pht_flow_untrack_half_open(flow);
             hlist_del_init(&flow->hnode);
             pht_stats_dec(PHT_STAT_FLOWS_CURRENT);
-            list_add_tail(&flow->gc_node, &expired);
+            pht_flow_queue_finalize(flow, false);
             count++;
         }
         spin_unlock_bh(&bucket->lock);
-    }
-
-    while (!list_empty(&expired)) {
-        struct pht_flow *flow = list_first_entry(&expired, struct pht_flow, gc_node);
-
-        list_del_init(&flow->gc_node);
-        pht_flow_cancel_retransmit(flow);
-        pht_flow_put(flow);
     }
 
     return count;

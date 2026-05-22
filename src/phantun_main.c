@@ -871,6 +871,16 @@ static bool phantun_tcp_is_bare_syn(const struct pht_l4_view *view) {
            !view->tcp->psh && !view->tcp->urg && view->payload_len == 0;
 }
 
+/* The responder's final handshake step may carry payload and PSH. Keep this
+ * aligned with opener validation: control flags that consume sequence space or
+ * require unsupported semantics must not complete SYN_RCVD just by guessing the
+ * right ACK number.
+ */
+static bool phantun_tcp_is_syn_rcvd_final_ack(const struct pht_l4_view *view, u32 expected_ack) {
+    return view && view->tcp->ack && ntohl(view->tcp->ack_seq) == expected_ack && !view->tcp->syn &&
+           !view->tcp->rst && !view->tcp->fin && !view->tcp->urg;
+}
+
 static bool phantun_tcp_syn_is_aligned(const struct pht_l4_view *view) {
     return view && ntohl(view->tcp->seq) % 4095U == 0;
 }
@@ -1826,7 +1836,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
      * the exact final ACK can complete the handshake.
      */
     if (state_now == PHT_FLOW_STATE_SYN_RCVD) {
-        if (!view.tcp->ack || ntohl(view.tcp->ack_seq) != expected_ack) {
+        if (!phantun_tcp_is_syn_rcvd_final_ack(&view, expected_ack)) {
             if (phantun_flow_should_drop_quarantined_packet(flow, &view)) {
                 pht_flow_put(flow);
                 return NF_DROP;

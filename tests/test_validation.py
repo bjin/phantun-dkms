@@ -512,6 +512,114 @@ def test_bad_final_ack_payload_is_rejected_with_rstack(phantun_module, vm):
         cleanup_netns_topology(vm)
 
 
+@pytest.mark.parametrize(
+    ("flags", "tag"),
+    (
+        ("syn|ack", "synack"),
+        ("ack|urg", "ackurg"),
+        ("ack|fin", "ackfin"),
+    ),
+)
+def test_unsupported_final_ack_flags_are_rejected_with_rstack(phantun_module, vm, flags, tag):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    drop_synack = make_netns_prerouting_flag_drop_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": f"drop_{tag}_synack",
+            }
+        ],
+    )
+    synack_capture = spawn_ready_capture(
+        vm,
+        NS_A,
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "payload": "",
+            "timeout_sec": 10,
+        },
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": f"unsupported_final_{tag}_rst",
+            }
+        ],
+    )
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn",
+                "seq": 4095,
+            },
+        )
+        synack_result = synack_capture.communicate(timeout=10)
+        assert_completed(synack_result, f"{tag} final-ACK SYN|ACK capture")
+        synack_data = parse_guest_json(synack_result.stdout, f"{tag} final-ACK SYN|ACK stdout")
+        baseline_rst = rst_probe.packets(vm, f"unsupported_final_{tag}_rst")
+
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": flags,
+                "seq": 4096,
+                "ack": synack_data["seq"] + 1,
+            },
+        )
+        time.sleep(0.2)
+
+        stats_after = read_module_stats(vm)
+        if rst_probe.packets(vm, f"unsupported_final_{tag}_rst") <= baseline_rst:
+            pytest.fail(f"expected RST|ACK for unsupported final ACK flags {flags!r}")
+        if stats_after["flows_established"] != baseline_stats["flows_established"]:
+            pytest.fail(
+                f"unsupported final ACK flags must not establish flow: before={baseline_stats!r} after={stats_after!r}"
+            )
+    finally:
+        drop_synack.cleanup(vm)
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
 def test_fragmented_syn_is_rejected_without_creating_flow(phantun_module, vm):
     phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
