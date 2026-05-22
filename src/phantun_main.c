@@ -1124,6 +1124,12 @@ static int phantun_flush_queued_udp(struct pht_flow *flow, struct net *net, bool
         return ret;
     }
 
+    if (!qview.payload_len) {
+        pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+        kfree_skb(queued_skb);
+        return 0;
+    }
+
     phantun_fill_udp_endpoint_pair(&qview, &qep);
     qep.scope_ifindex = flow->endpoints.scope_ifindex;
     ret = phantun_send_established_udp(flow, &qep, &qview, queued_skb, net);
@@ -1291,6 +1297,16 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
         pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
         pht_pr_warn_rl("rejecting outbound UDP with unsupported endpoint address\n");
         return NF_DROP;
+    }
+
+    if (!view.payload_len) {
+        /* Zero-payload fake-TCP ACKs are control/liveness frames, so the
+         * current wire protocol has no lossless representation for an empty
+         * UDP datagram.
+         */
+        pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+        kfree_skb(skb);
+        return NF_STOLEN;
     }
 
     ret = phantun_confirm_outbound_udp_conntrack(skb);

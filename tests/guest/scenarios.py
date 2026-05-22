@@ -110,6 +110,29 @@ def recv_many(config):
     _emit({"received": received})
 
 
+def recv_until_timeout(config):
+    received = []
+    target_count = config.get("count", 1)
+    timed_out = False
+
+    with _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec")) as sock:
+        while len(received) < target_count:
+            try:
+                data, addr = sock.recvfrom(2048)
+            except socket.timeout:
+                timed_out = True
+                break
+
+            received.append(
+                {
+                    "message": data.decode(),
+                    "peer": [addr[0], addr[1]],
+                }
+            )
+
+    _emit({"received": received, "timed_out": timed_out})
+
+
 def send_many(config):
     payloads = config["payloads"]
     delay_ms = config.get("delay_ms", 0)
@@ -669,6 +692,7 @@ SCENARIOS = {
     "send_l2_tcp_packet": send_l2_tcp_packet,
     "capture_tcp_packet": capture_tcp_packet,
     "recv_many_reply": recv_many_reply,
+    "recv_until_timeout": recv_until_timeout,
     "send_many_recv": send_many_recv,
     "multi_server": multi_server,
     "multi_client": multi_client,

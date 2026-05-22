@@ -20,6 +20,7 @@ from helpers import (
     parse_guest_json,
     probe_comment,
     read_module_stat,
+    read_module_stats,
     require_guest_command,
     run_in_netns,
     run_netns_scenario,
@@ -219,6 +220,60 @@ def test_netns_ping_pong_uses_tcp_output_only(phantun_module, vm):
     finally:
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_zero_length_udp_is_dropped_without_flow(phantun_module, vm):
+    load_netns_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    receiver = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_until_timeout",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "timeout_sec": 1,
+        },
+    )
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        time.sleep(0.2)
+        sender = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": [""],
+            },
+        )
+        receiver_result = receiver.communicate(timeout=5)
+
+        assert_completed(sender, "zero-length UDP sender")
+        assert_completed(receiver_result, "zero-length UDP receiver")
+        received = parse_guest_json(receiver_result.stdout, "zero-length UDP receiver stdout")
+        if not received.get("timed_out") or received.get("received") != []:
+            pytest.fail(f"zero-length UDP should not be delivered: {received!r}")
+
+        stats_after = read_module_stats(vm)
+        if stats_after["flows_created"] != baseline_stats["flows_created"]:
+            pytest.fail(f"zero-length UDP must not create a flow: before={baseline_stats!r} after={stats_after!r}")
+        if stats_after["flows_current"] != baseline_stats["flows_current"]:
+            pytest.fail(f"zero-length UDP must not leave a flow: before={baseline_stats!r} after={stats_after!r}")
+        if stats_after["udp_packets_dropped"] != baseline_stats["udp_packets_dropped"] + 1:
+            pytest.fail(
+                f"zero-length UDP should increment drop stats once: before={baseline_stats!r} after={stats_after!r}"
+            )
+    finally:
         cleanup_netns_topology(vm)
 
 
