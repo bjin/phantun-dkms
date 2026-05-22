@@ -1283,6 +1283,7 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
     struct pht_flow_table *flows;
     struct pht_flow *flow;
     struct pht_flow *new_flow;
+    struct pht_flow *dead_flow = NULL;
     enum pht_flow_state state_now;
     u32 init_seq;
     u32 prev_seq = 0;
@@ -1373,16 +1374,18 @@ retry_lookup:
             return NF_STOLEN;
         }
 
-        /* DEAD still occupies the canonical slot until we unhash it. Drop
-         * that generation and retry so a fresh initiator flow can inherit
-         * the reopen guard from the old sequence space.
+        /* A hashed DEAD flow is only the allocation-failure tombstone from
+         * terminal teardown. Keep it visible until the guarded replacement is
+         * published, so competing openers always see a previous-generation
+         * sequence source or the new live flow.
          */
         if (state_now == PHT_FLOW_STATE_DEAD) {
+            spin_lock_bh(&flow->lock);
             prev_seq = flow->seq;
+            spin_unlock_bh(&flow->lock);
             has_prev_seq = true;
-            pht_flow_detach(flow);
-            pht_flow_put(flow);
-            goto retry_lookup;
+            dead_flow = flow;
+            goto create_initiator;
         }
 
         pht_flow_put(flow);
@@ -1390,10 +1393,16 @@ retry_lookup:
         return NF_STOLEN;
     }
 
+    if (!has_prev_seq)
+        has_prev_seq = pht_flow_lookup_retired_seq(flows, &ep, &prev_seq);
+
+create_initiator:
     new_flow = pht_flow_create(flows, &ep, PHT_FLOW_ROLE_INITIATOR, PHT_FLOW_STATE_SYN_SENT);
     if (IS_ERR(new_flow)) {
         pht_pr_warn("failed to create initiator flow: %ld\n", PTR_ERR(new_flow));
         kfree_skb(skb);
+        if (dead_flow)
+            pht_flow_put(dead_flow);
         return NF_STOLEN;
     }
 
@@ -1401,6 +1410,8 @@ retry_lookup:
         pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
         pht_pr_warn("failed to choose reopen ISN for new flow\n");
         pht_flow_put(new_flow);
+        if (dead_flow)
+            pht_flow_put(dead_flow);
         kfree_skb(skb);
         return NF_STOLEN;
     }
@@ -1414,19 +1425,28 @@ retry_lookup:
     spin_unlock_bh(&new_flow->lock);
     pht_flow_set_queued_skb(new_flow, skb);
 
-    ret = pht_flow_insert(flows, new_flow);
+    if (dead_flow)
+        ret = pht_flow_replace_dead(flows, dead_flow, new_flow);
+    else
+        ret = pht_flow_insert(flows, new_flow);
     /* Another CPU won the canonical-tuple race. Reuse its flow instead of
      * creating a parallel generation.
      */
-    if (ret == -EEXIST) {
+    if (ret == -EEXIST || (dead_flow && ret == -EAGAIN)) {
         skb = pht_flow_take_queued_skb(new_flow);
         pht_flow_put(new_flow);
+        if (dead_flow) {
+            pht_flow_put(dead_flow);
+            dead_flow = NULL;
+        }
         goto retry_lookup;
     }
     if (ret) {
         pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
         pht_pr_warn("failed to insert initiator flow: %d\n", ret);
         pht_flow_put(new_flow);
+        if (dead_flow)
+            pht_flow_put(dead_flow);
         return NF_STOLEN;
     }
     pht_stats_inc(PHT_STAT_UDP_PACKETS_QUEUED);
@@ -1443,10 +1463,14 @@ retry_lookup:
         pht_pr_warn("failed to emit fake-TCP SYN: %d\n", ret);
         pht_flow_detach(new_flow);
         pht_flow_put(new_flow);
+        if (dead_flow)
+            pht_flow_put(dead_flow);
         return NF_STOLEN;
     }
 
     pht_flow_put(new_flow);
+    if (dead_flow)
+        pht_flow_put(dead_flow);
 
     return NF_STOLEN;
 }
@@ -1554,6 +1578,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     struct pht_flow_table *flows;
     struct pht_flow *flow;
     struct pht_flow *new_flow;
+    struct pht_flow *dead_flow = NULL;
     struct sk_buff *queued_skb;
     enum pht_flow_state state_now;
     struct net_device *in_dev;
@@ -1617,20 +1642,27 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         spin_unlock_bh(&flow->lock);
 
         if (state_now == PHT_FLOW_STATE_DEAD) {
-            pht_flow_detach(flow);
-            pht_flow_put(flow);
+            /* Allocation-failure tombstone: keep it hashed as the previous
+             * sequence source unless this packet publishes a replacement SYN.
+             */
+            dead_flow = flow;
             flow = NULL;
         }
     }
 
     if (!flow) {
-        if (view.tcp->rst)
+        if (view.tcp->rst) {
+            if (dead_flow)
+                pht_flow_put(dead_flow);
             return NF_DROP;
+        }
 
         if (!phantun_tcp_is_bare_syn(&view)) {
             ret = phantun_send_rstack(state->net, &ep, &view, view.tcp->syn);
             if (ret)
                 pht_pr_warn_rl("failed to emit RST|ACK for unknown packet: %d\n", ret);
+            if (dead_flow)
+                pht_flow_put(dead_flow);
             return NF_DROP;
         }
 
@@ -1638,6 +1670,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             ret = phantun_send_rstack(state->net, &ep, &view, true);
             if (ret)
                 pht_pr_warn_rl("failed to emit RST|ACK for misaligned SYN: %d\n", ret);
+            if (dead_flow)
+                pht_flow_put(dead_flow);
             return NF_DROP;
         }
         /* Only a bare aligned SYN is allowed to create responder state for an
@@ -1647,6 +1681,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         new_flow = pht_flow_create(flows, &ep, PHT_FLOW_ROLE_RESPONDER, PHT_FLOW_STATE_SYN_RCVD);
         if (IS_ERR(new_flow)) {
             pht_pr_warn("failed to create responder flow: %ld\n", PTR_ERR(new_flow));
+            if (dead_flow)
+                pht_flow_put(dead_flow);
             return NF_DROP;
         }
 
@@ -1665,9 +1701,14 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             carry_quarantine = false;
         }
 
-        ret = pht_flow_insert(flows, new_flow);
+        if (dead_flow)
+            ret = pht_flow_replace_dead(flows, dead_flow, new_flow);
+        else
+            ret = pht_flow_insert(flows, new_flow);
         if (ret) {
             pht_flow_put(new_flow);
+            if (dead_flow)
+                pht_flow_put(dead_flow);
             return NF_DROP;
         }
 
@@ -1677,6 +1718,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             pht_flow_detach(new_flow);
         }
         pht_flow_put(new_flow);
+        if (dead_flow)
+            pht_flow_put(dead_flow);
         return NF_DROP;
     }
 

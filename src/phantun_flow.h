@@ -34,7 +34,10 @@ enum pht_flow_state {
     PHT_FLOW_STATE_SYN_RCVD,
     /* Three-way handshake complete; UDP <-> fake-TCP translation is live. */
     PHT_FLOW_STATE_ESTABLISHED,
-    /* Local tombstone while detach/GC drops ownership and outstanding refs. */
+    /* Terminal state. Normally unhashed immediately; hashed only as an
+     * allocation-failure fallback preserving previous-generation sequence
+     * metadata until atomic replacement or GC.
+     */
     PHT_FLOW_STATE_DEAD,
 };
 
@@ -130,6 +133,10 @@ struct pht_flow {
 struct pht_flow_bucket {
     spinlock_t lock;
     struct hlist_head head;
+    /* Same bucket lock protects bounded previous-generation sequence records
+     * used only for local reopen ISN selection after terminal teardown.
+     */
+    struct hlist_head retired_head;
 };
 
 struct pht_flow_table {
@@ -174,6 +181,10 @@ struct pht_flow *pht_flow_lookup(struct pht_flow_table *table, const struct pht_
 struct pht_flow *pht_flow_create(struct pht_flow_table *table, const struct pht_endpoint_pair *ep,
                                  enum pht_flow_role role, enum pht_flow_state state);
 int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow);
+bool pht_flow_lookup_retired_seq(struct pht_flow_table *table, const struct pht_endpoint_pair *ep,
+                                 u32 *prev_seq);
+int pht_flow_replace_dead(struct pht_flow_table *table, struct pht_flow *dead_flow,
+                          struct pht_flow *new_flow);
 void pht_flow_remove(struct pht_flow *flow);
 void pht_flow_detach(struct pht_flow *flow);
 

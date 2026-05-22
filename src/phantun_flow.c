@@ -20,6 +20,17 @@
 #include "phantun_packet.h"
 #include "phantun_stats.h"
 
+/* Terminal teardown normally frees the full flow immediately. This tiny
+ * per-bucket cache is the only state kept behind: enough for local reopen to
+ * choose an ISN outside the previous generation's sequence window.
+ */
+struct pht_retired_flow {
+    struct hlist_node hnode;
+    struct pht_endpoint_pair endpoints;
+    u32 prev_seq;
+    unsigned long expires_jiffies;
+};
+
 static u32 pht_addr_hash(const struct pht_addr *addr, u32 seed) {
     if (!addr)
         return seed;
@@ -236,6 +247,72 @@ static void pht_flow_untrack_half_open(struct pht_flow *flow) {
     spin_unlock_bh(&flow->table->half_open_lock);
 }
 
+static void pht_flow_retired_delete_locked(struct pht_flow_bucket *bucket,
+                                           const struct pht_endpoint_pair *ep) {
+    struct pht_retired_flow *retired;
+    struct hlist_node *tmp;
+
+    hlist_for_each_entry_safe(retired, tmp, &bucket->retired_head, hnode) {
+        if (ep && !pht_endpoint_pair_equal(&retired->endpoints, ep))
+            continue;
+
+        hlist_del(&retired->hnode);
+        kfree(retired);
+    }
+}
+
+static void pht_flow_retired_purge_expired_locked(struct pht_flow_bucket *bucket,
+                                                  unsigned long now) {
+    struct pht_retired_flow *retired;
+    struct hlist_node *tmp;
+
+    hlist_for_each_entry_safe(retired, tmp, &bucket->retired_head, hnode) {
+        if (!time_after_eq(now, retired->expires_jiffies))
+            continue;
+
+        hlist_del(&retired->hnode);
+        kfree(retired);
+    }
+}
+
+static void pht_flow_retired_purge_all(struct pht_flow_table *table) {
+    unsigned int i;
+
+    if (!table)
+        return;
+
+    for (i = 0; i < PHT_FLOW_BUCKETS; i++) {
+        struct pht_flow_bucket *bucket = &table->buckets[i];
+
+        spin_lock_bh(&bucket->lock);
+        pht_flow_retired_delete_locked(bucket, NULL);
+        spin_unlock_bh(&bucket->lock);
+    }
+}
+
+static void pht_flow_retired_publish_locked(struct pht_flow_bucket *bucket,
+                                            struct pht_retired_flow *record,
+                                            const struct pht_endpoint_pair *ep, u32 prev_seq,
+                                            unsigned long expires_jiffies) {
+    struct pht_retired_flow *retired;
+
+    hlist_for_each_entry(retired, &bucket->retired_head, hnode) {
+        if (!pht_endpoint_pair_equal(&retired->endpoints, ep))
+            continue;
+
+        retired->prev_seq = prev_seq;
+        retired->expires_jiffies = expires_jiffies;
+        kfree(record);
+        return;
+    }
+
+    record->endpoints = *ep;
+    record->prev_seq = prev_seq;
+    record->expires_jiffies = expires_jiffies;
+    INIT_HLIST_NODE(&record->hnode);
+    hlist_add_head(&record->hnode, &bucket->retired_head);
+}
+
 /* Detach callers have already made the flow unreachable from the hash table.
  * Queue the former table reference here; callers keep and release any lookup
  * reference separately. Coalescing is safe because all finalization requests
@@ -312,6 +389,7 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
     for (i = 0; i < PHT_FLOW_BUCKETS; i++) {
         spin_lock_init(&table->buckets[i].lock);
         INIT_HLIST_HEAD(&table->buckets[i].head);
+        INIT_HLIST_HEAD(&table->buckets[i].retired_head);
     }
     spin_lock_init(&table->half_open_lock);
     spin_lock_init(&table->finalize_lock);
@@ -385,6 +463,7 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
         struct hlist_node *tmp;
 
         spin_lock_bh(&bucket->lock);
+        pht_flow_retired_purge_expired_locked(bucket, now);
         hlist_for_each_entry_safe(flow, tmp, &bucket->head, hnode) {
             bool expired_flow = false;
             bool send_keepalive = false;
@@ -554,6 +633,7 @@ void pht_flow_table_destroy(struct pht_flow_table *table) {
     cancel_delayed_work_sync(&table->gc_work);
     flush_work(&table->finalize_work);
     pht_flow_detach_all(table, &expired);
+    pht_flow_retired_purge_all(table);
 
     list_for_each_entry_safe(flow, tmp, &expired, gc_node) {
         list_del_init(&flow->gc_node);
@@ -599,6 +679,35 @@ struct pht_flow *pht_flow_lookup(struct pht_flow_table *table, const struct pht_
     }
     spin_unlock_bh(&bucket->lock);
     return NULL;
+}
+
+bool pht_flow_lookup_retired_seq(struct pht_flow_table *table, const struct pht_endpoint_pair *ep,
+                                 u32 *prev_seq) {
+    struct pht_flow_bucket *bucket;
+    struct pht_retired_flow *retired;
+    unsigned long now = jiffies;
+    bool found = false;
+    u32 idx;
+
+    if (!table || !ep || !prev_seq)
+        return false;
+
+    idx = pht_flow_hash_key(table, ep);
+    bucket = &table->buckets[idx];
+
+    spin_lock_bh(&bucket->lock);
+    pht_flow_retired_purge_expired_locked(bucket, now);
+    hlist_for_each_entry(retired, &bucket->retired_head, hnode) {
+        if (!pht_endpoint_pair_equal(&retired->endpoints, ep))
+            continue;
+
+        *prev_seq = retired->prev_seq;
+        found = true;
+        break;
+    }
+    spin_unlock_bh(&bucket->lock);
+
+    return found;
 }
 
 struct pht_flow *pht_flow_create(struct pht_flow_table *table, const struct pht_endpoint_pair *ep,
@@ -656,16 +765,50 @@ static bool pht_flow_unhash_and_queue_finalize(struct pht_flow *flow, bool send_
     return removed;
 }
 
+static int pht_flow_admit_half_open_locked(struct pht_flow_table *table, struct pht_flow *flow) {
+    if (!pht_flow_state_is_half_open(flow->state) || flow->half_open_tracked)
+        return 0;
+
+    spin_lock(&table->half_open_lock);
+    if (table->half_open_current >= table->half_open_limit) {
+        spin_unlock(&table->half_open_lock);
+        pht_stats_inc(PHT_STAT_HALF_OPEN_REJECTED);
+        return -ENOSPC;
+    }
+
+    table->half_open_current++;
+    flow->half_open_tracked = true;
+    spin_unlock(&table->half_open_lock);
+    return 0;
+}
+
+static void pht_flow_publish_locked(struct pht_flow_bucket *bucket, struct pht_flow *flow) {
+    /*
+     * The creator keeps its own reference across the post-insert first
+     * transmit. The table takes a distinct ref before publishing so a
+     * concurrent lookup/detach cannot free the flow out from under the creator.
+     */
+    pht_flow_get(flow);
+    pht_stats_inc(PHT_STAT_FLOWS_CURRENT);
+    hlist_add_head(&flow->hnode, &bucket->head);
+    pht_flow_retired_delete_locked(bucket, &flow->endpoints);
+}
+
+static void pht_flow_finish_publish(struct pht_flow *flow) {
+    pht_stats_inc(PHT_STAT_FLOWS_CREATED);
+    if (pht_flow_state_is_half_open(flow->state))
+        pht_flow_arm_retransmit(flow);
+}
+
 int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow) {
     struct pht_flow_bucket *bucket;
     struct pht_flow *iter;
-    bool half_open;
+    int ret;
     u32 idx;
 
     if (!table || !flow)
         return -EINVAL;
 
-    half_open = pht_flow_state_is_half_open(flow->state);
     idx = pht_flow_hash_key(table, &flow->endpoints);
     bucket = &table->buckets[idx];
     spin_lock_bh(&bucket->lock);
@@ -675,32 +818,73 @@ int pht_flow_insert(struct pht_flow_table *table, struct pht_flow *flow) {
             return -EEXIST;
         }
     }
-    if (half_open && !flow->half_open_tracked) {
-        spin_lock(&table->half_open_lock);
-        if (table->half_open_current >= table->half_open_limit) {
-            spin_unlock(&table->half_open_lock);
-            spin_unlock_bh(&bucket->lock);
-            pht_stats_inc(PHT_STAT_HALF_OPEN_REJECTED);
-            return -ENOSPC;
-        }
-        table->half_open_current++;
-        flow->half_open_tracked = true;
-        spin_unlock(&table->half_open_lock);
+
+    ret = pht_flow_admit_half_open_locked(table, flow);
+    if (ret) {
+        spin_unlock_bh(&bucket->lock);
+        return ret;
     }
-    /*
-     * The creator keeps its own reference across the post-insert first
-     * transmit. The table takes a distinct ref before publishing so a
-     * concurrent lookup/detach cannot free the flow out from under the creator.
-     */
-    pht_flow_get(flow);
-    pht_stats_inc(PHT_STAT_FLOWS_CURRENT);
-    hlist_add_head(&flow->hnode, &bucket->head);
+
+    pht_flow_publish_locked(bucket, flow);
     spin_unlock_bh(&bucket->lock);
 
-    pht_stats_inc(PHT_STAT_FLOWS_CREATED);
-    if (pht_flow_state_is_half_open(flow->state))
-        pht_flow_arm_retransmit(flow);
+    pht_flow_finish_publish(flow);
+    return 0;
+}
 
+int pht_flow_replace_dead(struct pht_flow_table *table, struct pht_flow *dead_flow,
+                          struct pht_flow *new_flow) {
+    struct pht_flow_bucket *bucket;
+    struct pht_flow *iter;
+    enum pht_flow_state state;
+    int ret;
+    u32 idx;
+
+    if (!table || !dead_flow || !new_flow)
+        return -EINVAL;
+    if (dead_flow->table != table || new_flow->table != table ||
+        !pht_endpoint_pair_equal(&dead_flow->endpoints, &new_flow->endpoints))
+        return -EINVAL;
+
+    idx = pht_flow_hash_key(table, &new_flow->endpoints);
+    bucket = &table->buckets[idx];
+
+    spin_lock_bh(&bucket->lock);
+    if (hlist_unhashed(&dead_flow->hnode) ||
+        !pht_endpoint_pair_equal(&dead_flow->endpoints, &new_flow->endpoints)) {
+        spin_unlock_bh(&bucket->lock);
+        return -EAGAIN;
+    }
+
+    spin_lock(&dead_flow->lock);
+    state = dead_flow->state;
+    spin_unlock(&dead_flow->lock);
+    if (state != PHT_FLOW_STATE_DEAD) {
+        spin_unlock_bh(&bucket->lock);
+        return -EAGAIN;
+    }
+
+    hlist_for_each_entry(iter, &bucket->head, hnode) {
+        if (iter != dead_flow && pht_endpoint_pair_equal(&iter->endpoints, &new_flow->endpoints)) {
+            spin_unlock_bh(&bucket->lock);
+            return -EEXIST;
+        }
+    }
+
+    pht_flow_untrack_half_open(dead_flow);
+    ret = pht_flow_admit_half_open_locked(table, new_flow);
+    if (ret) {
+        spin_unlock_bh(&bucket->lock);
+        return ret;
+    }
+
+    hlist_del_init(&dead_flow->hnode);
+    pht_stats_dec(PHT_STAT_FLOWS_CURRENT);
+    pht_flow_queue_finalize(dead_flow, false);
+    pht_flow_publish_locked(bucket, new_flow);
+    spin_unlock_bh(&bucket->lock);
+
+    pht_flow_finish_publish(new_flow);
     return 0;
 }
 
@@ -721,19 +905,55 @@ void pht_flow_detach(struct pht_flow *flow) {
     pht_flow_unhash_and_queue_finalize(flow, false);
 }
 
-/* Local teardown is intentionally idempotent: mark the flow dead and stop
- * retransmits, but leave final unhash/free to detach/GC paths.
+/* Terminal teardown normally moves only reopen-guard sequence metadata into the
+ * retired cache and drops the full flow from the canonical hash. If the tiny
+ * GFP_ATOMIC cache allocation fails, keep a hashed DEAD tombstone so reopen ISN
+ * selection still has a durable previous-generation sequence source.
  */
 void pht_flow_remove(struct pht_flow *flow) {
-    if (!flow)
+    struct pht_retired_flow *retired;
+    struct pht_flow_table *table;
+    struct pht_flow_bucket *bucket;
+    struct pht_endpoint_pair ep;
+    unsigned long expires_jiffies;
+    u32 prev_seq;
+    u32 idx;
+
+    if (!flow || !flow->table)
         return;
 
-    spin_lock_bh(&flow->lock);
-    flow->state = PHT_FLOW_STATE_DEAD;
-    spin_unlock_bh(&flow->lock);
-    pht_flow_untrack_half_open(flow);
+    table = flow->table;
+    retired = kzalloc(sizeof(*retired), GFP_ATOMIC);
+    idx = pht_flow_hash_key(table, &flow->endpoints);
+    bucket = &table->buckets[idx];
 
-    pht_flow_cancel_retransmit(flow);
+    spin_lock_bh(&bucket->lock);
+    spin_lock(&flow->lock);
+    flow->state = PHT_FLOW_STATE_DEAD;
+    ep = flow->endpoints;
+    prev_seq = flow->seq;
+    expires_jiffies = flow->last_activity_jiffies + table->hard_idle_timeout_jiffies;
+    spin_unlock(&flow->lock);
+
+    if (hlist_unhashed(&flow->hnode)) {
+        spin_unlock_bh(&bucket->lock);
+        kfree(retired);
+        return;
+    }
+
+    pht_flow_untrack_half_open(flow);
+    if (!retired) {
+        spin_unlock_bh(&bucket->lock);
+        pht_pr_warn_rl("keeping DEAD flow tombstone after retired metadata allocation failure\n");
+        pht_flow_cancel_retransmit(flow);
+        return;
+    }
+
+    pht_flow_retired_publish_locked(bucket, retired, &ep, prev_seq, expires_jiffies);
+    hlist_del_init(&flow->hnode);
+    pht_stats_dec(PHT_STAT_FLOWS_CURRENT);
+    pht_flow_queue_finalize(flow, false);
+    spin_unlock_bh(&bucket->lock);
 }
 
 void pht_flow_touch_inbound(struct pht_flow *flow) {

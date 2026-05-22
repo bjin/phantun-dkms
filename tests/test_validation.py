@@ -45,6 +45,22 @@ def received_messages(payload):
     return payload.get("received", [])
 
 
+def wait_for_flows_current(vm, expected, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        stats = read_module_stats(vm)
+        if stats["flows_current"] == expected:
+            return stats
+        time.sleep(0.1)
+
+    pytest.fail(f"flows_current did not reach {expected}: current={stats!r}")
+
+
+def sequence_distance(a, b):
+    diff = (a - b) & 0xFFFFFFFF
+    return diff if diff < 0x80000000 else 0x100000000 - diff
+
+
 ROUTER_NS = "pht-r"
 VETH_A_R = "veth-pht-ar"
 VETH_R_A = "veth-pht-ra"
@@ -330,7 +346,8 @@ def test_established_syn_fin_is_not_accepted_as_replacement(phantun_module, vm):
 
 
 def test_established_invalid_syn_destroys_flow(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    reopen_guard_bytes = 2_100_000_000
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, reopen_guard_bytes=reopen_guard_bytes)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -369,8 +386,22 @@ def test_established_invalid_syn_destroys_flow(phantun_module, vm):
         {"bind_addr": NS_ADDR_B, "bind_port": dst_port, "count": 2, "timeout_sec": 20},
     )
 
+    baseline_stats = read_module_stats(vm)
+
     try:
         time.sleep(0.2)
+        initial_syn_capture = spawn_ready_capture(
+            vm,
+            NS_B,
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payload": "",
+                "timeout_sec": 10,
+            },
+        )
         res1 = run_netns_scenario(
             vm,
             NS_A,
@@ -384,6 +415,11 @@ def test_established_invalid_syn_destroys_flow(phantun_module, vm):
             },
         )
         assert_completed(res1, "initial echo client")
+        initial_syn_result = initial_syn_capture.communicate(timeout=10)
+        assert_completed(initial_syn_result, "initial SYN capture")
+        initial_syn = parse_guest_json(initial_syn_result.stdout, "initial SYN capture stdout")
+        if initial_syn["flags"] & 0x02 == 0:
+            pytest.fail(f"expected initial opener to be a SYN: {initial_syn!r}")
 
         baseline_invalid_rst = invalid_probe.packets(vm, "invalid_rst")
         baseline_invalid_synack = invalid_probe.packets(vm, "invalid_synack")
@@ -408,6 +444,25 @@ def test_established_invalid_syn_destroys_flow(phantun_module, vm):
             pytest.fail("expected RST|ACK in response to invalid established SYN packet")
         if invalid_probe.packets(vm, "invalid_synack") != baseline_invalid_synack:
             pytest.fail("invalid established SYN packet must not be accepted as replacement")
+        stats_after_teardown = wait_for_flows_current(vm, baseline_stats["flows_current"])
+        if stats_after_teardown["flows_current"] != baseline_stats["flows_current"]:
+            pytest.fail(
+                f"terminal teardown should return flows_current to baseline: "
+                f"before={baseline_stats!r} after={stats_after_teardown!r}"
+            )
+
+        reopen_syn_capture = spawn_ready_capture(
+            vm,
+            NS_B,
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payload": "",
+                "timeout_sec": 10,
+            },
+        )
 
         res2 = run_netns_scenario(
             vm,
@@ -423,6 +478,18 @@ def test_established_invalid_syn_destroys_flow(phantun_module, vm):
             },
         )
         assert_completed(res2, "echo client after invalid SYN")
+        reopen_syn_result = reopen_syn_capture.communicate(timeout=10)
+        assert_completed(reopen_syn_result, "reopen SYN capture")
+        reopen_syn = parse_guest_json(reopen_syn_result.stdout, "reopen SYN capture stdout")
+        if reopen_syn["flags"] & 0x02 == 0:
+            pytest.fail(f"expected reopen opener to be a SYN: {reopen_syn!r}")
+
+        previous_seq = (initial_syn["seq"] + 1 + len("msg1")) & 0xFFFFFFFF
+        if sequence_distance(reopen_syn["seq"], previous_seq) < reopen_guard_bytes:
+            pytest.fail(
+                f"reopen SYN sequence did not honor guard: initial={initial_syn!r} "
+                f"reopen={reopen_syn!r} previous_seq={previous_seq}"
+            )
         data = parse_guest_json(res2.stdout, "echo client")
         if data.get("echoed") != ["msg2"]:
             pytest.fail(f"failed to recover after invalid SYN: {data.get('echoed')!r}")
