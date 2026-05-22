@@ -305,7 +305,9 @@ int pht_validate_ipv6_tcp_checksums(const struct sk_buff *skb, const struct pht_
 }
 #else
 int pht_parse_ipv6_udp(struct sk_buff *skb, struct pht_l4_view *view) { return -EAFNOSUPPORT; }
+
 int pht_parse_ipv6_tcp(struct sk_buff *skb, struct pht_l4_view *view) { return -EAFNOSUPPORT; }
+
 int pht_validate_ipv6_tcp_checksums(const struct sk_buff *skb, const struct pht_l4_view *view) {
     return -EAFNOSUPPORT;
 }

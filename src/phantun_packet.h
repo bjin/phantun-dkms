@@ -39,6 +39,7 @@
 
 struct pht_addr {
     u8 family;
+
     union {
         __be32 v4;
         struct in6_addr v6;
@@ -55,14 +56,17 @@ struct pht_endpoint_pair {
 
 struct pht_l4_view {
     u8 family;
+
     union {
         struct iphdr *iph;
         struct ipv6hdr *ip6h;
     };
+
     union {
         struct tcphdr *tcp;
         struct udphdr *udp;
     };
+
     unsigned int ip_hdr_len;
     unsigned int l4_hdr_len;
     unsigned int payload_offset;
