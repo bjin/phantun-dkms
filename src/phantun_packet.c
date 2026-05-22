@@ -378,22 +378,30 @@ static struct sk_buff *pht_alloc_l3_skb(unsigned int l4_len, size_t payload_len)
     return skb;
 }
 
-struct sk_buff *pht_build_fake_tcp_v4(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
-                                      u8 flags, const void *payload, size_t payload_len) {
+static void pht_fake_tcp_v4_complete_skb(struct sk_buff *skb) {
+    struct iphdr *iph = ip_hdr(skb);
+    struct tcphdr *th = tcp_hdr(skb);
+    u16 tcp_len = ntohs(iph->tot_len) - iph->ihl * 4;
+
+    pht_tcp_v4_complete(iph, th, tcp_len);
+}
+
+struct sk_buff *pht_build_fake_tcp_v4_uninit(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
+                                             u8 flags, size_t payload_len, void **payload_ptr) {
     struct sk_buff *skb;
     struct iphdr *iph;
     struct tcphdr *th;
-    u8 *payload_ptr;
+    u8 *payload;
     u8 *opt;
     unsigned int tcp_hdr_len;
     unsigned int tcp_len;
     bool add_wscale;
 
+    if (payload_ptr)
+        *payload_ptr = NULL;
     if (!ep)
         return NULL;
     if (ep->local_addr.family != AF_INET || ep->remote_addr.family != AF_INET)
-        return NULL;
-    if (payload_len && !payload)
         return NULL;
     if (payload_len > pht_fake_tcp_max_payload_len(AF_INET))
         return NULL;
@@ -407,7 +415,7 @@ struct sk_buff *pht_build_fake_tcp_v4(const struct pht_endpoint_pair *ep, u32 se
 
     iph = ip_hdr(skb);
     th = tcp_hdr(skb);
-    payload_ptr = skb_transport_header(skb) + tcp_hdr_len;
+    payload = skb_transport_header(skb) + tcp_hdr_len;
 
     pht_ipv4_complete(iph, sizeof(*iph) + tcp_len, IPPROTO_TCP, ep->local_addr.v4,
                       ep->remote_addr.v4);
@@ -433,10 +441,27 @@ struct sk_buff *pht_build_fake_tcp_v4(const struct pht_endpoint_pair *ep, u32 se
         opt[3] = PHT_TCP_WINDOW_SCALE;
     }
 
+    if (payload_ptr)
+        *payload_ptr = payload;
+    return skb;
+}
+
+struct sk_buff *pht_build_fake_tcp_v4(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
+                                      u8 flags, const void *payload, size_t payload_len) {
+    struct sk_buff *skb;
+    void *payload_ptr;
+
+    if (payload_len && !payload)
+        return NULL;
+
+    skb = pht_build_fake_tcp_v4_uninit(ep, seq, ack, flags, payload_len, &payload_ptr);
+    if (!skb)
+        return NULL;
+
     if (payload_len)
         memcpy(payload_ptr, payload, payload_len);
 
-    pht_tcp_v4_complete(iph, th, tcp_len);
+    pht_fake_tcp_v4_complete_skb(skb);
     return skb;
 }
 
@@ -466,19 +491,26 @@ struct sk_buff *pht_build_fake_tcp_rstack_v4(const struct pht_endpoint_pair *ep,
     return pht_build_fake_tcp_v4(ep, seq, ack, PHT_TCP_FLAG_RST | PHT_TCP_FLAG_ACK, NULL, 0);
 }
 
-struct sk_buff *pht_build_udp_v4(const struct pht_endpoint_pair *ep, const void *payload,
-                                 size_t payload_len) {
+static void pht_udp_v4_complete_skb(struct sk_buff *skb) {
+    struct iphdr *iph = ip_hdr(skb);
+    struct udphdr *uh = udp_hdr(skb);
+
+    pht_udp_v4_complete(iph, uh, ntohs(uh->len));
+}
+
+struct sk_buff *pht_build_udp_v4_uninit(const struct pht_endpoint_pair *ep, size_t payload_len,
+                                        void **payload_ptr) {
     struct sk_buff *skb;
     struct iphdr *iph;
     struct udphdr *uh;
-    u8 *payload_ptr;
+    void *payload;
     unsigned int udp_len;
 
+    if (payload_ptr)
+        *payload_ptr = NULL;
     if (!ep)
         return NULL;
     if (ep->local_addr.family != AF_INET || ep->remote_addr.family != AF_INET)
-        return NULL;
-    if (payload_len && !payload)
         return NULL;
     if (payload_len > pht_udp_max_payload_len(AF_INET))
         return NULL;
@@ -490,7 +522,7 @@ struct sk_buff *pht_build_udp_v4(const struct pht_endpoint_pair *ep, const void 
 
     iph = ip_hdr(skb);
     uh = udp_hdr(skb);
-    payload_ptr = skb_transport_header(skb) + sizeof(*uh);
+    payload = skb_transport_header(skb) + sizeof(*uh);
 
     pht_ipv4_complete(iph, sizeof(*iph) + udp_len, IPPROTO_UDP, ep->remote_addr.v4,
                       ep->local_addr.v4);
@@ -498,10 +530,28 @@ struct sk_buff *pht_build_udp_v4(const struct pht_endpoint_pair *ep, const void 
     uh->source = ep->remote_port;
     uh->dest = ep->local_port;
     uh->len = htons(udp_len);
+
+    if (payload_ptr)
+        *payload_ptr = payload;
+    return skb;
+}
+
+struct sk_buff *pht_build_udp_v4(const struct pht_endpoint_pair *ep, const void *payload,
+                                 size_t payload_len) {
+    struct sk_buff *skb;
+    void *payload_ptr;
+
+    if (payload_len && !payload)
+        return NULL;
+
+    skb = pht_build_udp_v4_uninit(ep, payload_len, &payload_ptr);
+    if (!skb)
+        return NULL;
+
     if (payload_len)
         memcpy(payload_ptr, payload, payload_len);
 
-    pht_udp_v4_complete(iph, uh, udp_len);
+    pht_udp_v4_complete_skb(skb);
     return skb;
 }
 
@@ -555,6 +605,35 @@ int pht_emit_fake_tcp_v4(struct net *net, const struct pht_endpoint_pair *ep, u3
     return pht_tx_fake_tcp_v4(net, skb, ep, out_ifindex);
 }
 
+int pht_emit_fake_tcp_payload_from_skb_v4(struct net *net, const struct pht_endpoint_pair *ep,
+                                          u32 seq, u32 ack, u8 flags, const struct sk_buff *src,
+                                          unsigned int payload_offset, size_t payload_len,
+                                          int *out_ifindex) {
+    struct sk_buff *skb;
+    void *payload;
+    int ret;
+
+    if (payload_len > pht_fake_tcp_max_payload_len(AF_INET))
+        return -EMSGSIZE;
+    if (payload_len && !src)
+        return -EINVAL;
+
+    skb = pht_build_fake_tcp_v4_uninit(ep, seq, ack, flags, payload_len, &payload);
+    if (!skb)
+        return -ENOMEM;
+
+    if (payload_len) {
+        ret = skb_copy_bits(src, payload_offset, payload, (int)payload_len);
+        if (ret) {
+            kfree_skb(skb);
+            return ret;
+        }
+    }
+
+    pht_fake_tcp_v4_complete_skb(skb);
+    return pht_tx_fake_tcp_v4(net, skb, ep, out_ifindex);
+}
+
 int pht_reinject_udp_v4(struct sk_buff *skb, struct net_device *dev) {
     int ret;
 
@@ -588,6 +667,34 @@ int pht_reinject_udp_payload_v4(struct net_device *dev, const struct pht_endpoin
     if (!skb)
         return -ENOMEM;
 
+    return pht_reinject_udp_v4(skb, dev);
+}
+
+int pht_reinject_udp_payload_from_skb_v4(struct net_device *dev, const struct pht_endpoint_pair *ep,
+                                         const struct sk_buff *src, unsigned int payload_offset,
+                                         size_t payload_len) {
+    struct sk_buff *skb;
+    void *payload;
+    int ret;
+
+    if (payload_len > pht_udp_max_payload_len(AF_INET))
+        return -EMSGSIZE;
+    if (payload_len && !src)
+        return -EINVAL;
+
+    skb = pht_build_udp_v4_uninit(ep, payload_len, &payload);
+    if (!skb)
+        return -ENOMEM;
+
+    if (payload_len) {
+        ret = skb_copy_bits(src, payload_offset, payload, (int)payload_len);
+        if (ret) {
+            kfree_skb(skb);
+            return ret;
+        }
+    }
+
+    pht_udp_v4_complete_skb(skb);
     return pht_reinject_udp_v4(skb, dev);
 }
 
@@ -642,22 +749,29 @@ static struct sk_buff *pht_alloc_l3_skb_v6(unsigned int l4_len, size_t payload_l
     return skb;
 }
 
-struct sk_buff *pht_build_fake_tcp_v6(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
-                                      u8 flags, const void *payload, size_t payload_len) {
+static void pht_fake_tcp_v6_complete_skb(struct sk_buff *skb) {
+    struct ipv6hdr *ip6h = ipv6_hdr(skb);
+    struct tcphdr *th = tcp_hdr(skb);
+
+    pht_tcp_v6_complete(ip6h, th, ntohs(ip6h->payload_len));
+}
+
+struct sk_buff *pht_build_fake_tcp_v6_uninit(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
+                                             u8 flags, size_t payload_len, void **payload_ptr) {
     struct sk_buff *skb;
     struct ipv6hdr *ip6h;
     struct tcphdr *th;
-    u8 *payload_ptr;
+    u8 *payload;
     u8 *opt;
     unsigned int tcp_hdr_len;
     unsigned int tcp_len;
     bool add_wscale;
 
+    if (payload_ptr)
+        *payload_ptr = NULL;
     if (!ep)
         return NULL;
     if (ep->local_addr.family != AF_INET6 || ep->remote_addr.family != AF_INET6)
-        return NULL;
-    if (payload_len && !payload)
         return NULL;
     if (payload_len > pht_fake_tcp_max_payload_len(AF_INET6))
         return NULL;
@@ -671,7 +785,7 @@ struct sk_buff *pht_build_fake_tcp_v6(const struct pht_endpoint_pair *ep, u32 se
 
     ip6h = ipv6_hdr(skb);
     th = tcp_hdr(skb);
-    payload_ptr = skb_transport_header(skb) + tcp_hdr_len;
+    payload = skb_transport_header(skb) + tcp_hdr_len;
 
     pht_ipv6_complete(ip6h, tcp_len, IPPROTO_TCP, &ep->local_addr.v6, &ep->remote_addr.v6);
 
@@ -696,26 +810,50 @@ struct sk_buff *pht_build_fake_tcp_v6(const struct pht_endpoint_pair *ep, u32 se
         opt[3] = PHT_TCP_WINDOW_SCALE;
     }
 
-    if (payload_len)
-        memcpy(payload_ptr, payload, payload_len);
-
-    pht_tcp_v6_complete(ip6h, th, tcp_len);
+    if (payload_ptr)
+        *payload_ptr = payload;
     return skb;
 }
 
-struct sk_buff *pht_build_udp_v6(const struct pht_endpoint_pair *ep, const void *payload,
-                                 size_t payload_len) {
+struct sk_buff *pht_build_fake_tcp_v6(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
+                                      u8 flags, const void *payload, size_t payload_len) {
+    struct sk_buff *skb;
+    void *payload_ptr;
+
+    if (payload_len && !payload)
+        return NULL;
+
+    skb = pht_build_fake_tcp_v6_uninit(ep, seq, ack, flags, payload_len, &payload_ptr);
+    if (!skb)
+        return NULL;
+
+    if (payload_len)
+        memcpy(payload_ptr, payload, payload_len);
+
+    pht_fake_tcp_v6_complete_skb(skb);
+    return skb;
+}
+
+static void pht_udp_v6_complete_skb(struct sk_buff *skb) {
+    struct ipv6hdr *ip6h = ipv6_hdr(skb);
+    struct udphdr *uh = udp_hdr(skb);
+
+    pht_udp_v6_complete(ip6h, uh, ntohs(uh->len));
+}
+
+struct sk_buff *pht_build_udp_v6_uninit(const struct pht_endpoint_pair *ep, size_t payload_len,
+                                        void **payload_ptr) {
     struct sk_buff *skb;
     struct ipv6hdr *ip6h;
     struct udphdr *uh;
-    u8 *payload_ptr;
+    void *payload;
     unsigned int udp_len;
 
+    if (payload_ptr)
+        *payload_ptr = NULL;
     if (!ep)
         return NULL;
     if (ep->local_addr.family != AF_INET6 || ep->remote_addr.family != AF_INET6)
-        return NULL;
-    if (payload_len && !payload)
         return NULL;
     if (payload_len > pht_udp_max_payload_len(AF_INET6))
         return NULL;
@@ -727,17 +865,35 @@ struct sk_buff *pht_build_udp_v6(const struct pht_endpoint_pair *ep, const void 
 
     ip6h = ipv6_hdr(skb);
     uh = udp_hdr(skb);
-    payload_ptr = skb_transport_header(skb) + sizeof(*uh);
+    payload = skb_transport_header(skb) + sizeof(*uh);
 
     pht_ipv6_complete(ip6h, udp_len, IPPROTO_UDP, &ep->remote_addr.v6, &ep->local_addr.v6);
 
     uh->source = ep->remote_port;
     uh->dest = ep->local_port;
     uh->len = htons(udp_len);
+
+    if (payload_ptr)
+        *payload_ptr = payload;
+    return skb;
+}
+
+struct sk_buff *pht_build_udp_v6(const struct pht_endpoint_pair *ep, const void *payload,
+                                 size_t payload_len) {
+    struct sk_buff *skb;
+    void *payload_ptr;
+
+    if (payload_len && !payload)
+        return NULL;
+
+    skb = pht_build_udp_v6_uninit(ep, payload_len, &payload_ptr);
+    if (!skb)
+        return NULL;
+
     if (payload_len)
         memcpy(payload_ptr, payload, payload_len);
 
-    pht_udp_v6_complete(ip6h, uh, udp_len);
+    pht_udp_v6_complete_skb(skb);
     return skb;
 }
 
@@ -797,6 +953,35 @@ int pht_emit_fake_tcp_v6(struct net *net, const struct pht_endpoint_pair *ep, u3
     return pht_tx_fake_tcp_v6(net, skb, ep, out_ifindex);
 }
 
+int pht_emit_fake_tcp_payload_from_skb_v6(struct net *net, const struct pht_endpoint_pair *ep,
+                                          u32 seq, u32 ack, u8 flags, const struct sk_buff *src,
+                                          unsigned int payload_offset, size_t payload_len,
+                                          int *out_ifindex) {
+    struct sk_buff *skb;
+    void *payload;
+    int ret;
+
+    if (payload_len > pht_fake_tcp_max_payload_len(AF_INET6))
+        return -EMSGSIZE;
+    if (payload_len && !src)
+        return -EINVAL;
+
+    skb = pht_build_fake_tcp_v6_uninit(ep, seq, ack, flags, payload_len, &payload);
+    if (!skb)
+        return -ENOMEM;
+
+    if (payload_len) {
+        ret = skb_copy_bits(src, payload_offset, payload, (int)payload_len);
+        if (ret) {
+            kfree_skb(skb);
+            return ret;
+        }
+    }
+
+    pht_fake_tcp_v6_complete_skb(skb);
+    return pht_tx_fake_tcp_v6(net, skb, ep, out_ifindex);
+}
+
 int pht_reinject_udp_v6(struct sk_buff *skb, struct net_device *dev) {
     int ret;
 
@@ -828,34 +1013,97 @@ int pht_reinject_udp_payload_v6(struct net_device *dev, const struct pht_endpoin
 
     return pht_reinject_udp_v6(skb, dev);
 }
+
+int pht_reinject_udp_payload_from_skb_v6(struct net_device *dev, const struct pht_endpoint_pair *ep,
+                                         const struct sk_buff *src, unsigned int payload_offset,
+                                         size_t payload_len) {
+    struct sk_buff *skb;
+    void *payload;
+    int ret;
+
+    if (payload_len > pht_udp_max_payload_len(AF_INET6))
+        return -EMSGSIZE;
+    if (payload_len && !src)
+        return -EINVAL;
+
+    skb = pht_build_udp_v6_uninit(ep, payload_len, &payload);
+    if (!skb)
+        return -ENOMEM;
+
+    if (payload_len) {
+        ret = skb_copy_bits(src, payload_offset, payload, (int)payload_len);
+        if (ret) {
+            kfree_skb(skb);
+            return ret;
+        }
+    }
+
+    pht_udp_v6_complete_skb(skb);
+    return pht_reinject_udp_v6(skb, dev);
+}
 #else
 void pht_ipv6_complete(struct ipv6hdr *ip6h, u16 payload_len, u8 nexthdr,
                        const struct in6_addr *saddr, const struct in6_addr *daddr) {}
+
 void pht_tcp_v6_complete(struct ipv6hdr *ip6h, struct tcphdr *th, u16 tcp_len) {}
+
 void pht_udp_v6_complete(struct ipv6hdr *ip6h, struct udphdr *uh, u16 udp_len) {}
+
 struct sk_buff *pht_build_fake_tcp_v6(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                                       u8 flags, const void *payload, size_t payload_len) {
     return NULL;
 }
+
+struct sk_buff *pht_build_fake_tcp_v6_uninit(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
+                                             u8 flags, size_t payload_len, void **payload_ptr) {
+    if (payload_ptr)
+        *payload_ptr = NULL;
+    return NULL;
+}
+
 struct sk_buff *pht_build_udp_v6(const struct pht_endpoint_pair *ep, const void *payload,
                                  size_t payload_len) {
     return NULL;
 }
+
+struct sk_buff *pht_build_udp_v6_uninit(const struct pht_endpoint_pair *ep, size_t payload_len,
+                                        void **payload_ptr) {
+    if (payload_ptr)
+        *payload_ptr = NULL;
+    return NULL;
+}
+
 int pht_tx_fake_tcp_v6(struct net *net, struct sk_buff *skb, const struct pht_endpoint_pair *ep,
                        int *out_ifindex) {
     kfree_skb(skb);
     return -EAFNOSUPPORT;
 }
+
 int pht_emit_fake_tcp_v6(struct net *net, const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                          u8 flags, const void *payload, size_t payload_len, int *out_ifindex) {
     return -EAFNOSUPPORT;
 }
+
+int pht_emit_fake_tcp_payload_from_skb_v6(struct net *net, const struct pht_endpoint_pair *ep,
+                                          u32 seq, u32 ack, u8 flags, const struct sk_buff *src,
+                                          unsigned int payload_offset, size_t payload_len,
+                                          int *out_ifindex) {
+    return -EAFNOSUPPORT;
+}
+
 int pht_reinject_udp_v6(struct sk_buff *skb, struct net_device *dev) {
     kfree_skb(skb);
     return -EAFNOSUPPORT;
 }
+
 int pht_reinject_udp_payload_v6(struct net_device *dev, const struct pht_endpoint_pair *ep,
                                 const void *payload, size_t payload_len) {
+    return -EAFNOSUPPORT;
+}
+
+int pht_reinject_udp_payload_from_skb_v6(struct net_device *dev, const struct pht_endpoint_pair *ep,
+                                         const struct sk_buff *src, unsigned int payload_offset,
+                                         size_t payload_len) {
     return -EAFNOSUPPORT;
 }
 #endif
@@ -875,6 +1123,25 @@ int pht_emit_fake_tcp(struct net *net, const struct pht_endpoint_pair *ep, u32 s
     }
 }
 
+int pht_emit_fake_tcp_payload_from_skb(struct net *net, const struct pht_endpoint_pair *ep, u32 seq,
+                                       u32 ack, u8 flags, const struct sk_buff *src,
+                                       unsigned int payload_offset, size_t payload_len,
+                                       int *out_ifindex) {
+    if (!ep)
+        return -EINVAL;
+
+    switch (ep->local_addr.family) {
+    case AF_INET:
+        return pht_emit_fake_tcp_payload_from_skb_v4(net, ep, seq, ack, flags, src, payload_offset,
+                                                     payload_len, out_ifindex);
+    case AF_INET6:
+        return pht_emit_fake_tcp_payload_from_skb_v6(net, ep, seq, ack, flags, src, payload_offset,
+                                                     payload_len, out_ifindex);
+    default:
+        return -EAFNOSUPPORT;
+    }
+}
+
 int pht_reinject_udp_payload(struct net_device *dev, const struct pht_endpoint_pair *ep,
                              const void *payload, size_t payload_len) {
     if (!ep)
@@ -885,6 +1152,22 @@ int pht_reinject_udp_payload(struct net_device *dev, const struct pht_endpoint_p
         return pht_reinject_udp_payload_v4(dev, ep, payload, payload_len);
     case AF_INET6:
         return pht_reinject_udp_payload_v6(dev, ep, payload, payload_len);
+    default:
+        return -EAFNOSUPPORT;
+    }
+}
+
+int pht_reinject_udp_payload_from_skb(struct net_device *dev, const struct pht_endpoint_pair *ep,
+                                      const struct sk_buff *src, unsigned int payload_offset,
+                                      size_t payload_len) {
+    if (!ep)
+        return -EINVAL;
+
+    switch (ep->local_addr.family) {
+    case AF_INET:
+        return pht_reinject_udp_payload_from_skb_v4(dev, ep, src, payload_offset, payload_len);
+    case AF_INET6:
+        return pht_reinject_udp_payload_from_skb_v6(dev, ep, src, payload_offset, payload_len);
     default:
         return -EAFNOSUPPORT;
     }

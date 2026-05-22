@@ -945,7 +945,6 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
                                         struct net *net) {
     u32 seq;
     u32 ack;
-    void *payload = NULL;
     int ifindex;
     int ret;
 
@@ -953,18 +952,6 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
         pht_stats_inc(PHT_STAT_OVERSIZED_PAYLOADS_DROPPED);
         pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
         return -EMSGSIZE;
-    }
-
-    if (view->payload_len) {
-        payload = kmalloc(view->payload_len, GFP_ATOMIC);
-        if (!payload)
-            return -ENOMEM;
-
-        ret = pht_copy_l4_payload(skb, view, payload, view->payload_len);
-        if (ret) {
-            kfree(payload);
-            return ret;
-        }
     }
 
     /* Reserve sequence space before emitting so concurrent local senders stay
@@ -976,7 +963,6 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
     if (flow->state != PHT_FLOW_STATE_ESTABLISHED) {
         spin_unlock_bh(&flow->lock);
         spin_unlock_bh(&flow->tx_lock);
-        kfree(payload);
         return -EAGAIN;
     }
     seq = flow->seq;
@@ -984,8 +970,8 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
     flow->seq += view->payload_len;
     spin_unlock_bh(&flow->lock);
 
-    ret = pht_emit_fake_tcp(net, ep, seq, ack, PHT_TCP_FLAG_ACK, payload, view->payload_len,
-                            &ifindex);
+    ret = pht_emit_fake_tcp_payload_from_skb(net, ep, seq, ack, PHT_TCP_FLAG_ACK, skb,
+                                             view->payload_offset, view->payload_len, &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
         if (flow->state == PHT_FLOW_STATE_ESTABLISHED) {
@@ -1004,7 +990,6 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
     }
     spin_unlock_bh(&flow->tx_lock);
 
-    kfree(payload);
     return ret;
 }
 
@@ -1166,9 +1151,6 @@ static int phantun_reinject_inbound_payload(const struct pht_endpoint_pair *ep,
                                             const struct sk_buff *skb,
                                             const struct pht_l4_view *view, struct net *net,
                                             struct net_device *dev) {
-    void *payload;
-    int ret;
-
     if (!view->payload_len)
         return 0;
 
@@ -1179,15 +1161,7 @@ static int phantun_reinject_inbound_payload(const struct pht_endpoint_pair *ep,
     if (!net || !dev || dev_net(dev) != net)
         return -EINVAL;
 
-    payload = kmalloc(view->payload_len, GFP_ATOMIC);
-    if (!payload)
-        return -ENOMEM;
-
-    ret = pht_copy_l4_payload(skb, view, payload, view->payload_len);
-    if (!ret)
-        ret = pht_reinject_udp_payload(dev, ep, payload, view->payload_len);
-    kfree(payload);
-    return ret;
+    return pht_reinject_udp_payload_from_skb(dev, ep, skb, view->payload_offset, view->payload_len);
 }
 
 static void phantun_refresh_inbound_progress(struct pht_flow *flow, const struct pht_l4_view *view,

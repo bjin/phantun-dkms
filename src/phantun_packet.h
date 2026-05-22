@@ -91,6 +91,8 @@ void pht_udp_v6_complete(struct ipv6hdr *ip6h, struct udphdr *uh, u16 udp_len);
 
 struct sk_buff *pht_build_fake_tcp_v4(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                                       u8 flags, const void *payload, size_t payload_len);
+struct sk_buff *pht_build_fake_tcp_v4_uninit(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
+                                             u8 flags, size_t payload_len, void **payload_ptr);
 struct sk_buff *pht_build_fake_tcp_syn_v4(const struct pht_endpoint_pair *ep, u32 seq);
 struct sk_buff *pht_build_fake_tcp_synack_v4(const struct pht_endpoint_pair *ep, u32 seq, u32 ack);
 struct sk_buff *pht_build_fake_tcp_ack_v4(const struct pht_endpoint_pair *ep, u32 seq, u32 ack);
@@ -100,28 +102,55 @@ struct sk_buff *pht_build_fake_tcp_rst_v4(const struct pht_endpoint_pair *ep, u3
 struct sk_buff *pht_build_fake_tcp_rstack_v4(const struct pht_endpoint_pair *ep, u32 seq, u32 ack);
 struct sk_buff *pht_build_udp_v4(const struct pht_endpoint_pair *ep, const void *payload,
                                  size_t payload_len);
+struct sk_buff *pht_build_udp_v4_uninit(const struct pht_endpoint_pair *ep, size_t payload_len,
+                                        void **payload_ptr);
 
 int pht_tx_fake_tcp_v4(struct net *net, struct sk_buff *skb, const struct pht_endpoint_pair *ep,
                        int *out_ifindex);
 int pht_emit_fake_tcp_v4(struct net *net, const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                          u8 flags, const void *payload, size_t payload_len, int *out_ifindex);
+int pht_emit_fake_tcp_payload_from_skb_v4(struct net *net, const struct pht_endpoint_pair *ep,
+                                          u32 seq, u32 ack, u8 flags, const struct sk_buff *src,
+                                          unsigned int payload_offset, size_t payload_len,
+                                          int *out_ifindex);
 int pht_reinject_udp_v4(struct sk_buff *skb, struct net_device *dev);
 int pht_reinject_udp_payload_v4(struct net_device *dev, const struct pht_endpoint_pair *ep,
                                 const void *payload, size_t payload_len);
+int pht_reinject_udp_payload_from_skb_v4(struct net_device *dev, const struct pht_endpoint_pair *ep,
+                                         const struct sk_buff *src, unsigned int payload_offset,
+                                         size_t payload_len);
 struct sk_buff *pht_build_fake_tcp_v6(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                                       u8 flags, const void *payload, size_t payload_len);
+struct sk_buff *pht_build_fake_tcp_v6_uninit(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
+                                             u8 flags, size_t payload_len, void **payload_ptr);
 struct sk_buff *pht_build_udp_v6(const struct pht_endpoint_pair *ep, const void *payload,
                                  size_t payload_len);
+struct sk_buff *pht_build_udp_v6_uninit(const struct pht_endpoint_pair *ep, size_t payload_len,
+                                        void **payload_ptr);
 int pht_tx_fake_tcp_v6(struct net *net, struct sk_buff *skb, const struct pht_endpoint_pair *ep,
                        int *out_ifindex);
 int pht_emit_fake_tcp_v6(struct net *net, const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                          u8 flags, const void *payload, size_t payload_len, int *out_ifindex);
+int pht_emit_fake_tcp_payload_from_skb_v6(struct net *net, const struct pht_endpoint_pair *ep,
+                                          u32 seq, u32 ack, u8 flags, const struct sk_buff *src,
+                                          unsigned int payload_offset, size_t payload_len,
+                                          int *out_ifindex);
 int pht_reinject_udp_v6(struct sk_buff *skb, struct net_device *dev);
 int pht_reinject_udp_payload_v6(struct net_device *dev, const struct pht_endpoint_pair *ep,
                                 const void *payload, size_t payload_len);
+int pht_reinject_udp_payload_from_skb_v6(struct net_device *dev, const struct pht_endpoint_pair *ep,
+                                         const struct sk_buff *src, unsigned int payload_offset,
+                                         size_t payload_len);
 int pht_emit_fake_tcp(struct net *net, const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                       u8 flags, const void *payload, size_t payload_len, int *out_ifindex);
+int pht_emit_fake_tcp_payload_from_skb(struct net *net, const struct pht_endpoint_pair *ep, u32 seq,
+                                       u32 ack, u8 flags, const struct sk_buff *src,
+                                       unsigned int payload_offset, size_t payload_len,
+                                       int *out_ifindex);
 int pht_reinject_udp_payload(struct net_device *dev, const struct pht_endpoint_pair *ep,
                              const void *payload, size_t payload_len);
+int pht_reinject_udp_payload_from_skb(struct net_device *dev, const struct pht_endpoint_pair *ep,
+                                      const struct sk_buff *src, unsigned int payload_offset,
+                                      size_t payload_len);
 
 #endif
