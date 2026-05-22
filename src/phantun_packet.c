@@ -29,8 +29,10 @@ unsigned int pht_fake_tcp_max_payload_len(u8 family) {
     switch (family) {
     case AF_INET:
         return PHT_V4_MAX_TCP_PAYLOAD_LEN;
+#if IS_ENABLED(CONFIG_IPV6)
     case AF_INET6:
         return PHT_V6_MAX_TCP_PAYLOAD_LEN;
+#endif
     default:
         return 0;
     }
@@ -40,8 +42,10 @@ unsigned int pht_udp_max_payload_len(u8 family) {
     switch (family) {
     case AF_INET:
         return PHT_V4_MAX_UDP_PAYLOAD_LEN;
+#if IS_ENABLED(CONFIG_IPV6)
     case AF_INET6:
         return PHT_V6_MAX_UDP_PAYLOAD_LEN;
+#endif
     default:
         return 0;
     }

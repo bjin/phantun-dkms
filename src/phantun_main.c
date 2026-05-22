@@ -14,7 +14,9 @@
 #include <linux/netdevice.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
+#if IS_ENABLED(CONFIG_IPV6)
 #include <linux/netfilter_ipv6.h>
+#endif
 #include <linux/random.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
