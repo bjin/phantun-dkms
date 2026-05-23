@@ -395,6 +395,7 @@ Behavior:
 - handshaking flow → queue one skb or drop
 - no flow → create initiator flow, queue one skb, send `SYN`
 - if skb already carries conntrack state, confirm original UDP entry before stealing packet so translated inbound replies can match established host-firewall policy
+- copy the outbound UDP packet's transmit metadata to the generated fake-TCP packet
 - original UDP skb is stolen from the stack
 
 ### 8.2 Inbound fake-TCP interception
@@ -411,6 +412,7 @@ Behavior:
 - in peer-only mode, bare aligned `SYN` from a managed remote peer may create responder flow on any local destination port, but only when the packet is locally delivered to this host/netns
 - if no flow matches and packet is not valid new bare `SYN`, reject as unknown tuple instead of passing to the real TCP stack
 - consume packet before real TCP stack can generate its own reset
+- inbound fake-TCP metadata may be copied only to fake-TCP replies caused by that same inbound packet
 
 ### 8.3 Inbound raw-UDP drop
 
@@ -450,8 +452,35 @@ For module-generated fake-TCP packets:
 - set IPv4/TCP or IPv6/TCP headers and checksums explicitly for the active family
 - clear conntrack association before injection
 - transmit via the normal family-specific local output path (`ip_local_out` / `ip6_local_out` style)
+- apply the selected per-packet transmit metadata before routing and local output
 
 Because `LOCAL_OUT` steals UDP, not TCP, module-generated fake TCP does not need a complex self-bypass path.
+
+### 8.6 Transmit metadata propagation
+
+Metadata is treated as **per-packet transmit context**, not as flow identity.
+
+For fake-TCP packets generated from a current outbound UDP skb:
+
+- copy the UDP skb mark and priority
+- copy IPv4 TOS, or IPv6 traffic-class / flow-label
+- copy socket UID and explicitly bound output interface when available
+- use that metadata for the generated fake-TCP skb and route lookup
+
+For fake-TCP replies generated directly from an inbound fake-TCP packet, such as responder `SYN|ACK` or an injected `handshake_response`:
+
+- copy inbound fake-TCP metadata only for that immediate reply
+- do not persist inbound metadata in the flow
+- do not let inbound marks, TOS, traffic-class, flow-label, or priority affect later outbound packets
+
+A flow stores only `local_tx_meta`: the last known local outbound UDP transmit policy context. It exists only because some outbound fake-TCP packets have no original UDP skb to copy from:
+
+- handshake retransmits (`SYN`, `SYN|ACK`)
+- configured handshake control payloads when no queued UDP payload is being emitted
+- keepalive `ACK`s
+- local liveness / teardown control packets such as best-effort `RST`
+
+`local_tx_meta` is used only for outbound generated fake-TCP packets. It must not be updated from inbound fake-TCP packets and must not affect inbound UDP reinjection. Decapsulated UDP reinjection uses its own receive-path skb and only uses the private reinjection mark needed to bypass the module's raw-UDP drop hook.
 
 ## 9. Best-effort local flow invalidation
 
