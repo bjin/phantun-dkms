@@ -113,22 +113,29 @@ def recv_many(config):
 def recv_until_timeout(config):
     received = []
     target_count = config.get("count", 1)
+    ready_file = config.get("ready_file")
     timed_out = False
 
     with _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec")) as sock:
-        while len(received) < target_count:
-            try:
-                data, addr = sock.recvfrom(2048)
-            except socket.timeout:
-                timed_out = True
-                break
+        if ready_file:
+            Path(ready_file).write_text("ready\n")
+        try:
+            while len(received) < target_count:
+                try:
+                    data, addr = sock.recvfrom(2048)
+                except socket.timeout:
+                    timed_out = True
+                    break
 
-            received.append(
-                {
-                    "message": data.decode(),
-                    "peer": [addr[0], addr[1]],
-                }
-            )
+                received.append(
+                    {
+                        "message": data.decode(),
+                        "peer": [addr[0], addr[1]],
+                    }
+                )
+        finally:
+            if ready_file:
+                Path(ready_file).unlink(missing_ok=True)
 
     _emit({"received": received, "timed_out": timed_out})
 

@@ -20,6 +20,7 @@ from helpers import (
     parse_guest_json,
     read_module_stats,
     require_guest_command,
+    wait_for_guest_ready_file,
     run_in_netns,
     run_netns_scenario,
     spawn_netns_scenario,
@@ -54,6 +55,33 @@ def wait_for_flows_current(vm, expected, timeout=5):
         time.sleep(0.1)
 
     pytest.fail(f"flows_current did not reach {expected}: current={stats!r}")
+
+
+def wait_for_stat_greater(vm, name, baseline, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        stats = read_module_stats(vm)
+        if stats[name] > baseline:
+            return stats
+        time.sleep(0.1)
+
+    pytest.fail(f"{name} did not exceed {baseline}: current={stats!r}")
+
+
+def spawn_ready_recv_until_timeout(vm, namespace, config):
+    ready_file = f"/tmp/phantun-recv-{time.time_ns()}"
+    receiver = spawn_netns_scenario(
+        vm,
+        namespace,
+        "recv_until_timeout",
+        {**config, "ready_file": ready_file},
+    )
+    wait_for_guest_ready_file(vm, ready_file, timeout=config.get("timeout_sec", 10))
+    return receiver
+
+
+def received_message_texts(payload):
+    return [entry["message"] for entry in payload.get("received", [])]
 
 
 def sequence_distance(a, b):
@@ -495,6 +523,363 @@ def test_established_invalid_syn_destroys_flow(phantun_module, vm):
             pytest.fail(f"failed to recover after invalid SYN: {data.get('echoed')!r}")
     finally:
         invalid_probe.cleanup(vm)
+
+
+def open_flow_to_waiting_receiver(vm, src_port, dst_port, timeout_sec=3):
+    receiver = spawn_ready_recv_until_timeout(
+        vm,
+        NS_B,
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+            "timeout_sec": timeout_sec,
+        },
+    )
+    baseline_stats = read_module_stats(vm)
+    sender = run_netns_scenario(
+        vm,
+        NS_A,
+        "send_many",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payloads": ["open"],
+        },
+    )
+    assert_completed(sender, "established-flow opener")
+    wait_for_stat_greater(vm, "flows_established", baseline_stats["flows_established"])
+    return receiver
+
+
+def assert_receiver_messages(result, expected, context, timed_out):
+    assert_completed(result, context)
+    data = parse_guest_json(result.stdout, f"{context} stdout")
+    messages = received_message_texts(data)
+    if messages != expected or data.get("timed_out") is not timed_out:
+        pytest.fail(f"{context}: expected messages={expected!r} timed_out={timed_out}, got {data!r}")
+
+
+def test_established_payload_without_ack_is_rejected_with_rstack(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    receiver = None
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "est_no_ack_rst",
+            }
+        ],
+    )
+
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        receiver = open_flow_to_waiting_receiver(vm, src_port, dst_port)
+        baseline_rst = rst_probe.packets(vm, "est_no_ack_rst")
+
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "psh",
+                "seq": 12345,
+                "payload": "blocked",
+            },
+        )
+        time.sleep(0.2)
+
+        if rst_probe.packets(vm, "est_no_ack_rst") <= baseline_rst:
+            pytest.fail("established payload without ACK should be rejected with RST|ACK")
+        wait_for_flows_current(vm, baseline_stats["flows_current"])
+
+        receiver_result = receiver.communicate(timeout=10)
+        receiver = None
+        assert_receiver_messages(
+            receiver_result,
+            ["open"],
+            "established no-ACK receiver",
+            timed_out=True,
+        )
+    finally:
+        if receiver is not None:
+            receiver.terminate()
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+@pytest.mark.parametrize(
+    ("flags", "tag"),
+    (
+        ("ack|fin", "fin"),
+        ("ack|urg", "urg"),
+    ),
+)
+def test_established_ack_payload_with_unsupported_flags_tears_down_flow(phantun_module, vm, flags, tag):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    receiver = None
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": f"est_ack_{tag}_rst",
+            }
+        ],
+    )
+
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        receiver = open_flow_to_waiting_receiver(vm, src_port, dst_port)
+        baseline_rst = rst_probe.packets(vm, f"est_ack_{tag}_rst")
+
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": flags,
+                "seq": 12345,
+                "ack": 1,
+                "payload": "blocked",
+            },
+        )
+        time.sleep(0.2)
+
+        if rst_probe.packets(vm, f"est_ack_{tag}_rst") <= baseline_rst:
+            pytest.fail(f"established ACK payload with {flags!r} should be rejected with RST|ACK")
+        wait_for_flows_current(vm, baseline_stats["flows_current"])
+
+        receiver_result = receiver.communicate(timeout=10)
+        receiver = None
+        assert_receiver_messages(
+            receiver_result,
+            ["open"],
+            f"established ACK {tag} receiver",
+            timed_out=True,
+        )
+    finally:
+        if receiver is not None:
+            receiver.terminate()
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_established_ack_psh_payload_is_accepted(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    receiver = None
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst | ack",
+                "comment": "est_ack_psh_rst",
+            }
+        ],
+    )
+
+    try:
+        receiver = open_flow_to_waiting_receiver(vm, src_port, dst_port)
+        baseline_rst = rst_probe.packets(vm, "est_ack_psh_rst")
+
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack|psh",
+                "seq": 12345,
+                "ack": 1,
+                "payload": "accepted",
+            },
+        )
+
+        receiver_result = receiver.communicate(timeout=10)
+        receiver = None
+        assert_receiver_messages(
+            receiver_result,
+            ["open", "accepted"],
+            "established ACK|PSH receiver",
+            timed_out=False,
+        )
+        if rst_probe.packets(vm, "est_ack_psh_rst") != baseline_rst:
+            pytest.fail("established ACK|PSH payload should not be rejected with RST|ACK")
+    finally:
+        if receiver is not None:
+            receiver.terminate()
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+@pytest.mark.parametrize(
+    ("flags", "tag"),
+    (
+        ("syn|ack|fin", "fin"),
+        ("syn|ack|psh", "psh"),
+        ("syn|ack|urg", "urg"),
+    ),
+)
+def test_malformed_synack_flags_do_not_complete_syn_sent(phantun_module, vm, flags, tag):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, handshake_timeout_ms=5000)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    drop_synack = make_netns_prerouting_flag_drop_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": f"drop_syn_sent_{tag}_synack",
+            }
+        ],
+    )
+    syn_capture = spawn_ready_capture(
+        vm,
+        NS_B,
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payload": "",
+            "timeout_sec": 10,
+        },
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "flags_expr": "rst | ack",
+                "comment": f"syn_sent_bad_{tag}_rst",
+            }
+        ],
+    )
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        sender = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["open"],
+            },
+        )
+        assert_completed(sender, f"{tag} malformed SYN|ACK opener")
+
+        syn_result = syn_capture.communicate(timeout=10)
+        assert_completed(syn_result, f"{tag} initial SYN capture")
+        syn_data = parse_guest_json(syn_result.stdout, f"{tag} initial SYN capture stdout")
+        baseline_rst = rst_probe.packets(vm, f"syn_sent_bad_{tag}_rst")
+
+        drop_synack.cleanup(vm)
+        drop_synack = None
+
+        run_netns_scenario(
+            vm,
+            NS_B,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "flags": flags,
+                "seq": 8190,
+                "ack": syn_data["seq"] + 1,
+            },
+        )
+        time.sleep(0.2)
+
+        if rst_probe.packets(vm, f"syn_sent_bad_{tag}_rst") <= baseline_rst:
+            pytest.fail(f"malformed SYN|ACK flags {flags!r} should be rejected with RST|ACK")
+
+        stats_after = wait_for_flows_current(vm, baseline_stats["flows_current"])
+        if stats_after["flows_established"] != baseline_stats["flows_established"]:
+            pytest.fail(
+                f"malformed SYN|ACK flags {flags!r} must not establish flow: "
+                f"before={baseline_stats!r} after={stats_after!r}"
+            )
+    finally:
+        if drop_synack is not None:
+            drop_synack.cleanup(vm)
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
 
 
 def test_bad_final_ack_payload_is_rejected_with_rstack(phantun_module, vm):

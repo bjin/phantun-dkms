@@ -871,6 +871,25 @@ static bool phantun_tcp_is_bare_syn(const struct pht_l4_view *view) {
            !view->tcp->psh && !view->tcp->urg && view->payload_len == 0;
 }
 
+/* Completing the initiator half-open handshake only accepts a clean SYN|ACK.
+ * PSH is rejected here because this packet shape is control-only; no payload or
+ * payload-signalling flags are meaningful until the final ACK path.
+ */
+static bool phantun_tcp_is_clean_synack(const struct pht_l4_view *view, u32 expected_ack) {
+    return view && view->tcp->syn && view->tcp->ack && ntohl(view->tcp->ack_seq) == expected_ack &&
+           view->payload_len == 0 && !view->tcp->rst && !view->tcp->fin && !view->tcp->psh &&
+           !view->tcp->urg;
+}
+
+/* Established fake-TCP is only an ACK-shaped UDP carrier. PSH is tolerated with
+ * ACK because it does not consume sequence space and some peers mark data with
+ * it; FIN and URG require TCP semantics this module does not implement.
+ */
+static bool phantun_tcp_is_established_ack(const struct pht_l4_view *view) {
+    return view && view->tcp->ack && !view->tcp->syn && !view->tcp->rst && !view->tcp->fin &&
+           !view->tcp->urg;
+}
+
 /* The responder's final handshake step may carry payload and PSH. Keep this
  * aligned with opener validation: control flags that consume sequence space or
  * require unsupported semantics must not complete SYN_RCVD just by guessing the
@@ -1804,8 +1823,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             return NF_DROP;
         }
 
-        if (view.tcp->syn && view.tcp->ack && view.payload_len == 0 &&
-            ntohl(view.tcp->ack_seq) == expected_ack) {
+        if (phantun_tcp_is_clean_synack(&view, expected_ack)) {
             /* Handshake establishment is complete even if the responder later
              * sends an injected handshake_response. Reserve responder_seq + 1
              * so that optional control payload is ignored by sequence instead
@@ -1989,9 +2007,9 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         }
 
         if (view.tcp->syn) {
-            if (flow->role == PHT_FLOW_ROLE_INITIATOR && view.tcp->ack && view.payload_len == 0 &&
-                ntohl(view.tcp->ack_seq) == flow->local_isn + 1 &&
-                ntohl(view.tcp->seq) + 1 == flow->peer_syn_next) {
+            if (role_now == PHT_FLOW_ROLE_INITIATOR &&
+                phantun_tcp_is_clean_synack(&view, expected_ack) &&
+                ntohl(view.tcp->seq) + 1 == peer_syn_next) {
                 ret = phantun_send_idle_ack(flow, state->net);
                 if (ret)
                     pht_pr_warn("failed to ACK duplicate current-generation SYN|ACK: %d\n", ret);
@@ -2029,6 +2047,16 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             }
             pht_pr_warn_rl("received invalid SYN on ESTABLISHED tuple, destroying\n");
             phantun_send_rstack(state->net, &ep, &view, true);
+            pht_flow_remove(flow);
+            pht_flow_put(flow);
+            return NF_DROP;
+        }
+
+        if (!phantun_tcp_is_established_ack(&view)) {
+            ret = phantun_send_rstack(state->net, &ep, &view, !view.tcp->ack);
+            if (ret)
+                pht_pr_warn_rl("failed to emit RST|ACK for unsupported established flags: %d\n",
+                               ret);
             pht_flow_remove(flow);
             pht_flow_put(flow);
             return NF_DROP;
