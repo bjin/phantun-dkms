@@ -1042,10 +1042,8 @@ bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
                                  const struct pht_tx_meta *meta) {
     bool queued = false;
 
-    if (!flow) {
-        kfree_skb(skb);
+    if (!flow)
         return false;
-    }
 
     spin_lock_bh(&flow->lock);
     if (!flow->queued_skb) {
