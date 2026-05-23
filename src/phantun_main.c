@@ -985,7 +985,7 @@ static int phantun_send_flow_rst(struct pht_flow *flow, struct net *net) {
     ep = flow->endpoints;
     seq = flow->seq;
     ack = flow->ack;
-    meta = flow->tx_meta;
+    meta = flow->local_tx_meta;
     spin_unlock_bh(&flow->lock);
 
     ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_RST, NULL, 0, &meta, &ifindex);
@@ -1013,6 +1013,11 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
     /* Reserve sequence space before emitting so concurrent local senders stay
      * ordered. If emit fails, roll back only when nothing advanced flow->seq
      * in the meantime.
+     *
+     * The current UDP skb's metadata is also the best local transmit policy
+     * context for later synthetic packets on this flow. Store only metadata
+     * copied from local outbound UDP; inbound fake-TCP metadata is never
+     * promoted into local_tx_meta.
      */
     spin_lock_bh(&flow->tx_lock);
     spin_lock_bh(&flow->lock);
@@ -1022,7 +1027,7 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
         return -EAGAIN;
     }
     if (meta)
-        flow->tx_meta = *meta;
+        flow->local_tx_meta = *meta;
     seq = flow->seq;
     ack = flow->ack;
     flow->seq += view->payload_len;
@@ -1037,7 +1042,7 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
             flow->last_activity_jiffies = jiffies;
             flow->egress_ifindex = ifindex;
             if (meta)
-                flow->tx_meta = *meta;
+                flow->local_tx_meta = *meta;
         }
         spin_unlock_bh(&flow->lock);
     } else {
@@ -1054,6 +1059,10 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
     return ret;
 }
 
+/* @reply_meta is an emission-only override for responder replies generated
+ * directly from an inbound fake-TCP packet. When NULL, use the cached local
+ * outbound policy context for retransmits and other synthetic packets.
+ */
 static int phantun_send_synack(struct pht_flow *flow, struct net *net,
                                const struct pht_tx_meta *reply_meta) {
     struct pht_endpoint_pair ep;
@@ -1067,7 +1076,7 @@ static int phantun_send_synack(struct pht_flow *flow, struct net *net,
     ep = flow->endpoints;
     seq = flow->local_isn;
     ack = flow->peer_syn_next;
-    meta = reply_meta ? *reply_meta : flow->tx_meta;
+    meta = reply_meta ? *reply_meta : flow->local_tx_meta;
     spin_unlock_bh(&flow->lock);
 
     ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_SYN | PHT_TCP_FLAG_ACK, NULL, 0, &meta,
@@ -1104,7 +1113,7 @@ static int phantun_send_handshake_request(struct pht_flow *flow, struct net *net
     ep = flow->endpoints;
     seq = flow->local_isn + 1;
     ack = flow->ack;
-    meta = flow->tx_meta;
+    meta = flow->local_tx_meta;
     spin_unlock_bh(&flow->lock);
 
     ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, phantun_cfg.handshake_request,
@@ -1121,6 +1130,7 @@ static int phantun_send_handshake_request(struct pht_flow *flow, struct net *net
     return ret;
 }
 
+/* Same reply-scoped metadata rule as phantun_send_synack(). */
 static int phantun_send_handshake_response(struct pht_flow *flow, struct net *net,
                                            const struct pht_tx_meta *reply_meta) {
     struct pht_endpoint_pair ep;
@@ -1135,7 +1145,7 @@ static int phantun_send_handshake_response(struct pht_flow *flow, struct net *ne
     ep = flow->endpoints;
     seq = flow->local_isn + 1;
     ack = flow->ack;
-    meta = reply_meta ? *reply_meta : flow->tx_meta;
+    meta = reply_meta ? *reply_meta : flow->local_tx_meta;
     spin_unlock_bh(&flow->lock);
 
     ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, phantun_cfg.handshake_response,
@@ -1164,7 +1174,7 @@ static int phantun_send_idle_ack(struct pht_flow *flow, struct net *net) {
     ep = flow->endpoints;
     seq = flow->seq;
     ack = flow->ack;
-    meta = flow->tx_meta;
+    meta = flow->local_tx_meta;
     spin_unlock_bh(&flow->lock);
 
     ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, NULL, 0, &meta, &ifindex);
@@ -1488,7 +1498,7 @@ create_initiator:
     new_flow->last_ack = 0;
     new_flow->local_isn = init_seq;
     new_flow->peer_syn_next = 0;
-    new_flow->tx_meta = tx_meta;
+    new_flow->local_tx_meta = tx_meta;
     spin_unlock_bh(&new_flow->lock);
     pht_flow_set_queued_skb(new_flow, skb, &tx_meta);
 
@@ -1867,7 +1877,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             new_flow->local_isn = responder_seq;
             new_flow->peer_syn_next = new_flow->ack;
             if (queued_skb)
-                new_flow->tx_meta = queued_tx_meta;
+                new_flow->local_tx_meta = queued_tx_meta;
             spin_unlock_bh(&new_flow->lock);
             if (queued_skb)
                 pht_flow_set_queued_skb(new_flow, queued_skb, &queued_tx_meta);

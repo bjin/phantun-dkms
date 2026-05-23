@@ -84,11 +84,13 @@ struct pht_flow {
     u32 local_isn;
     /* Next remote sequence immediately after the peer's opening SYN. */
     u32 peer_syn_next;
-    /* Latest local outbound UDP policy-routing/QoS metadata used by later
-     * generated fake-TCP packets. Inbound fake-TCP metadata is reply-scoped and
-     * must not be stored here.
+    /* Cached local transmit policy context for synthetic fake-TCP packets that
+     * have no current outbound UDP skb to copy from (retransmits, keepalives,
+     * local teardown RSTs, and control payloads). This is not generic per-flow
+     * packet metadata: only local outbound UDP metadata may be stored here.
+     * Inbound fake-TCP metadata is reply-scoped and must not be persisted.
      */
-    struct pht_tx_meta tx_meta;
+    struct pht_tx_meta local_tx_meta;
     /* Sequence window of the immediately previous generation on this tuple.
      * Used only to absorb delayed packets after ESTABLISHED accepts a
      * replacement bare SYN.
@@ -200,8 +202,6 @@ void pht_flow_put(struct pht_flow *flow);
 void pht_flow_touch(struct pht_flow *flow);
 void pht_flow_touch_inbound(struct pht_flow *flow);
 void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex);
-void pht_flow_set_tx_meta(struct pht_flow *flow, const struct pht_tx_meta *meta);
-void pht_flow_snapshot_tx_meta(struct pht_flow *flow, struct pht_tx_meta *meta);
 bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
                                  const struct pht_tx_meta *meta);
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb,

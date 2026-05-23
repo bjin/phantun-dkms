@@ -101,7 +101,7 @@ static int pht_flow_send_local_rst(struct pht_flow *flow) {
 
     spin_lock_bh(&flow->lock);
     ep = flow->endpoints;
-    meta = flow->tx_meta;
+    meta = flow->local_tx_meta;
     seq = flow->seq;
     spin_unlock_bh(&flow->lock);
 
@@ -127,7 +127,7 @@ static int pht_flow_retransmit_now(struct pht_flow *flow) {
     spin_lock_bh(&flow->lock);
     state = flow->state;
     ep = flow->endpoints;
-    meta = flow->tx_meta;
+    meta = flow->local_tx_meta;
     seq = flow->seq;
     ack = flow->ack;
     if (state == PHT_FLOW_STATE_SYN_SENT) {
@@ -568,7 +568,7 @@ static void pht_flow_emit_keepalives(struct pht_flow_table *table, struct list_h
             ep = flow->endpoints;
             seq = flow->seq;
             ack = flow->ack;
-            meta = flow->tx_meta;
+            meta = flow->local_tx_meta;
         }
         spin_unlock_bh(&flow->lock);
 
@@ -745,7 +745,7 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table, const struct pht_
     timer_setup(&flow->retransmit_timer, pht_flow_retransmit_timer, 0);
     flow->table = table;
     flow->endpoints = *ep;
-    pht_tx_meta_init(&flow->tx_meta);
+    pht_tx_meta_init(&flow->local_tx_meta);
     pht_tx_meta_init(&flow->queued_tx_meta);
     flow->role = role;
     flow->state = state;
@@ -1001,35 +1001,16 @@ void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex) {
     spin_unlock_bh(&flow->lock);
 }
 
-void pht_flow_set_tx_meta(struct pht_flow *flow, const struct pht_tx_meta *meta) {
-    if (!flow || !meta)
-        return;
-
-    spin_lock_bh(&flow->lock);
-    flow->tx_meta = *meta;
-    spin_unlock_bh(&flow->lock);
-}
-
-void pht_flow_snapshot_tx_meta(struct pht_flow *flow, struct pht_tx_meta *meta) {
-    if (!meta)
-        return;
-
-    if (!flow) {
-        pht_tx_meta_init(meta);
-        return;
-    }
-
-    spin_lock_bh(&flow->lock);
-    *meta = flow->tx_meta;
-    spin_unlock_bh(&flow->lock);
-}
-
+/* Queue metadata is exact per-skb metadata. Once the flow is established, that
+ * same local outbound metadata is also the policy context for later synthetic
+ * packets that have no skb to copy from.
+ */
 static void pht_flow_store_queued_tx_meta_locked(struct pht_flow *flow,
                                                  const struct pht_tx_meta *meta) {
     if (meta) {
         flow->queued_tx_meta = *meta;
         if (flow->state == PHT_FLOW_STATE_ESTABLISHED)
-            flow->tx_meta = *meta;
+            flow->local_tx_meta = *meta;
     } else {
         pht_tx_meta_init(&flow->queued_tx_meta);
     }
