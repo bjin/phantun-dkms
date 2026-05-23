@@ -16,6 +16,7 @@ from helpers import (
     assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
+    make_netns_ingress_flag_drop_probe,
     make_netns_output_probe,
     parse_guest_json,
     probe_comment,
@@ -184,6 +185,103 @@ def make_netns_output_tcp_mark_probe(vm, namespace, src_addr, src_port, dst_addr
     return NetnsNftProbe(namespace, "inet", table_name, "output")
 
 
+def make_netns_prerouting_syn_meta_set_probe(
+    vm,
+    namespace,
+    src_addr,
+    src_port,
+    dst_addr,
+    dst_port,
+    mark,
+    dscp,
+):
+    table_name = f"phantun_in_meta_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
+        f"nft add table inet {table_name}",
+        (
+            f"nft 'add chain inet {table_name} prerouting "
+            "{ type filter hook prerouting priority -500; policy accept; }'"
+        ),
+        (
+            f"nft 'add rule inet {table_name} prerouting "
+            f"ip saddr {src_addr} ip daddr {dst_addr} "
+            f"tcp sport {src_port} tcp dport {dst_port} "
+            "tcp flags & (fin|syn|rst|ack) == syn "
+            f"counter meta mark set {mark:#x} ip dscp set {dscp:#x} "
+            'accept comment "mark_inbound_syn_before_phantun"\''
+        ),
+    ]
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsNftProbe(namespace, "inet", table_name, "prerouting")
+
+
+def make_netns_output_synack_reply_scope_probe(
+    vm,
+    namespace,
+    src_addr,
+    src_port,
+    dst_addr,
+    dst_port,
+    mark,
+    dscp,
+):
+    table_name = f"phantun_reply_scope_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
+        f"nft add table inet {table_name}",
+        (f"nft 'add chain inet {table_name} output " "{ type filter hook output priority 0; policy accept; }'"),
+        (
+            f"nft 'add rule inet {table_name} output "
+            f"ip saddr {src_addr} ip daddr {dst_addr} "
+            f"tcp sport {src_port} tcp dport {dst_port} "
+            "tcp flags & (fin|syn|rst|ack) == syn|ack "
+            f"meta mark {mark:#x} ip dscp {dscp:#x} "
+            'counter accept comment "inbound_marked_synack"\''
+        ),
+        (
+            f"nft 'add rule inet {table_name} output "
+            f"ip saddr {src_addr} ip daddr {dst_addr} "
+            f"tcp sport {src_port} tcp dport {dst_port} "
+            "tcp flags & (fin|syn|rst|ack) == syn|ack "
+            "meta mark 0 ip dscp 0x0 "
+            'counter accept comment "default_synack_retransmit"\''
+        ),
+    ]
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsNftProbe(namespace, "inet", table_name, "output")
+
+
+def make_netns_ingress_synack_dscp_drop_probe(
+    vm,
+    namespace,
+    device,
+    src_addr,
+    src_port,
+    dst_addr,
+    dst_port,
+    dscp,
+):
+    table_name = f"phantun_dscp_drop_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table netdev {table_name} >/dev/null 2>&1 || true",
+        f"nft add table netdev {table_name}",
+        (
+            f"nft 'add chain netdev {table_name} ingress "
+            f"{{ type filter hook ingress device {device} priority 0; policy accept; }}'"
+        ),
+        (
+            f"nft 'add rule netdev {table_name} ingress "
+            f"ip saddr {src_addr} ip daddr {dst_addr} "
+            f"tcp sport {src_port} tcp dport {dst_port} "
+            "tcp flags & (fin|syn|rst|ack) == syn|ack "
+            f'ip dscp {dscp:#x} counter drop comment "dscp_synack_drop"\''
+        ),
+    ]
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsNftProbe(namespace, "netdev", table_name, "ingress")
+
+
 def make_netns_input_invalid_drop_probe(vm, namespace, dst_port):
     return make_netns_input_probe(vm, namespace, dst_port, allow_udp_dport=True)
 
@@ -323,6 +421,289 @@ def test_netns_outbound_mark_propagates_to_fake_tcp(phantun_module, vm):
     finally:
         mark_setter.cleanup(vm)
         mark_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_netns_inbound_metadata_is_reply_scoped(phantun_module, vm):
+    phantun_module.load(
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        handshake_timeout_ms=200,
+        handshake_retries=3,
+    )
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    mark = 0x42
+    dscp = 0x12
+    inbound_marker = make_netns_prerouting_syn_meta_set_probe(
+        vm,
+        NS_B,
+        NS_ADDR_A,
+        src_port,
+        NS_ADDR_B,
+        dst_port,
+        mark,
+        dscp,
+    )
+    synack_probe = make_netns_output_synack_reply_scope_probe(
+        vm,
+        NS_B,
+        NS_ADDR_B,
+        dst_port,
+        NS_ADDR_A,
+        src_port,
+        mark,
+        dscp,
+    )
+    synack_drop = make_netns_ingress_synack_dscp_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        NS_ADDR_B,
+        dst_port,
+        NS_ADDR_A,
+        src_port,
+        dscp,
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "ping_server",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "reply": "pong",
+            "timeout_sec": 8,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payload": "ping",
+                "timeout_sec": 8,
+            },
+            timeout=12,
+        )
+        server_result = server.communicate(timeout=12)
+
+        assert_completed(client_result, "reply-scoped metadata ping client")
+        assert_completed(server_result, "reply-scoped metadata ping server")
+
+        if inbound_marker.packets(vm, "mark_inbound_syn_before_phantun") == 0:
+            pytest.fail("test rule did not mark inbound SYN metadata before phantun")
+        if synack_probe.packets(vm, "inbound_marked_synack") == 0:
+            pytest.fail("immediate responder SYN|ACK did not copy inbound fake-TCP metadata")
+        if synack_drop.packets(vm, "dscp_synack_drop") == 0:
+            pytest.fail("receiver-side DSCP drop did not exercise the immediate SYN|ACK")
+        if synack_probe.packets(vm, "default_synack_retransmit") == 0:
+            pytest.fail("responder SYN|ACK retransmit inherited inbound metadata")
+    finally:
+        inbound_marker.cleanup(vm)
+        synack_probe.cleanup(vm)
+        synack_drop.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_netns_collision_loser_retransmit_preserves_outbound_metadata(phantun_module, vm):
+    phantun_module.load(
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        handshake_timeout_ms=300,
+        handshake_retries=10,
+    )
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    mark_a = 0x41
+    mark_b = 0x42
+    initial_stats = read_module_stats(vm)
+
+    mark_setter_a = make_netns_output_udp_mark_set_probe(
+        vm,
+        NS_A,
+        NS_ADDR_A,
+        src_port,
+        NS_ADDR_B,
+        dst_port,
+        mark_a,
+    )
+    mark_setter_b = make_netns_output_udp_mark_set_probe(
+        vm,
+        NS_B,
+        NS_ADDR_B,
+        dst_port,
+        NS_ADDR_A,
+        src_port,
+        mark_b,
+    )
+    marked_synack_a = make_netns_output_synack_reply_scope_probe(
+        vm,
+        NS_A,
+        NS_ADDR_A,
+        src_port,
+        NS_ADDR_B,
+        dst_port,
+        mark_a,
+        0,
+    )
+    marked_synack_b = make_netns_output_synack_reply_scope_probe(
+        vm,
+        NS_B,
+        NS_ADDR_B,
+        dst_port,
+        NS_ADDR_A,
+        src_port,
+        mark_b,
+        0,
+    )
+    drop_initial_syn_a = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn",
+                "comment": "drop_initial_syn_a",
+            }
+        ],
+    )
+    drop_initial_syn_b = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "flags_expr": "syn",
+                "comment": "drop_initial_syn_b",
+            }
+        ],
+    )
+    drop_immediate_synack_a = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn|ack",
+                "comment": "drop_immediate_synack_a",
+            }
+        ],
+    )
+    drop_immediate_synack_b = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "flags_expr": "syn|ack",
+                "comment": "drop_immediate_synack_b",
+            }
+        ],
+    )
+
+    vm.run(["ip", "netns", "exec", NS_A, "tc", "qdisc", "add", "dev", VETH_A, "root", "netem", "delay", "150ms"])
+    vm.run(["ip", "netns", "exec", NS_B, "tc", "qdisc", "add", "dev", VETH_B, "root", "netem", "delay", "150ms"])
+
+    try:
+        client_a = spawn_netns_scenario(
+            vm,
+            NS_A,
+            "simultaneous_exchange",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payload": "pingA",
+            },
+        )
+        client_b = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "simultaneous_exchange",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "payload": "pingB",
+            },
+        )
+
+        time.sleep(0.55)
+        drop_initial_syn_a.cleanup(vm)
+        drop_initial_syn_b.cleanup(vm)
+        time.sleep(0.45)
+        drop_immediate_synack_a.cleanup(vm)
+        drop_immediate_synack_b.cleanup(vm)
+
+        res_a = client_a.communicate(timeout=15)
+        res_b = client_b.communicate(timeout=15)
+        assert_completed(res_a, "collision metadata client A")
+        assert_completed(res_b, "collision metadata client B")
+
+        data_a = parse_guest_json(res_a.stdout, "collision metadata client A")
+        data_b = parse_guest_json(res_b.stdout, "collision metadata client B")
+        if data_a.get("received") != "pingB":
+            pytest.fail(f"client A unexpected collision reply: {data_a.get('received')!r}")
+        if data_b.get("received") != "pingA":
+            pytest.fail(f"client B unexpected collision reply: {data_b.get('received')!r}")
+
+        final_stats = read_module_stats(vm)
+        if final_stats["collisions_lost"] - initial_stats["collisions_lost"] != 1:
+            pytest.fail(f"expected exactly one collision loss, got stats {final_stats!r}")
+
+        marked_retransmits = marked_synack_a.packets(vm, "inbound_marked_synack") + marked_synack_b.packets(
+            vm,
+            "inbound_marked_synack",
+        )
+        if marked_retransmits == 0:
+            pytest.fail("collision-loser SYN|ACK retransmit did not preserve queued outbound metadata")
+    finally:
+        mark_setter_a.cleanup(vm)
+        mark_setter_b.cleanup(vm)
+        marked_synack_a.cleanup(vm)
+        marked_synack_b.cleanup(vm)
+        drop_initial_syn_a.cleanup(vm)
+        drop_initial_syn_b.cleanup(vm)
+        drop_immediate_synack_a.cleanup(vm)
+        drop_immediate_synack_b.cleanup(vm)
+        vm.run(["ip", "netns", "exec", NS_A, "tc", "qdisc", "del", "dev", VETH_A, "root", "netem"], check=False)
+        vm.run(["ip", "netns", "exec", NS_B, "tc", "qdisc", "del", "dev", VETH_B, "root", "netem"], check=False)
         cleanup_netns_topology(vm)
 
 

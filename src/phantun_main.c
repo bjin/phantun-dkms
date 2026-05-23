@@ -1054,7 +1054,8 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
     return ret;
 }
 
-static int phantun_send_synack(struct pht_flow *flow, struct net *net) {
+static int phantun_send_synack(struct pht_flow *flow, struct net *net,
+                               const struct pht_tx_meta *reply_meta) {
     struct pht_endpoint_pair ep;
     struct pht_tx_meta meta;
     u32 seq;
@@ -1066,7 +1067,7 @@ static int phantun_send_synack(struct pht_flow *flow, struct net *net) {
     ep = flow->endpoints;
     seq = flow->local_isn;
     ack = flow->peer_syn_next;
-    meta = flow->tx_meta;
+    meta = reply_meta ? *reply_meta : flow->tx_meta;
     spin_unlock_bh(&flow->lock);
 
     ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_SYN | PHT_TCP_FLAG_ACK, NULL, 0, &meta,
@@ -1120,7 +1121,8 @@ static int phantun_send_handshake_request(struct pht_flow *flow, struct net *net
     return ret;
 }
 
-static int phantun_send_handshake_response(struct pht_flow *flow, struct net *net) {
+static int phantun_send_handshake_response(struct pht_flow *flow, struct net *net,
+                                           const struct pht_tx_meta *reply_meta) {
     struct pht_endpoint_pair ep;
     struct pht_tx_meta meta;
     u32 seq;
@@ -1133,7 +1135,7 @@ static int phantun_send_handshake_response(struct pht_flow *flow, struct net *ne
     ep = flow->endpoints;
     seq = flow->local_isn + 1;
     ack = flow->ack;
-    meta = flow->tx_meta;
+    meta = reply_meta ? *reply_meta : flow->tx_meta;
     spin_unlock_bh(&flow->lock);
 
     ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, phantun_cfg.handshake_response,
@@ -1762,7 +1764,6 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         new_flow->last_ack = new_flow->ack;
         new_flow->local_isn = responder_seq;
         new_flow->peer_syn_next = new_flow->ack;
-        new_flow->tx_meta = tx_meta;
         spin_unlock_bh(&new_flow->lock);
         if (carry_quarantine) {
             phantun_flow_arm_prev_generation_quarantine(
@@ -1782,7 +1783,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             return NF_DROP;
         }
 
-        ret = phantun_send_synack(new_flow, state->net);
+        ret = phantun_send_synack(new_flow, state->net, &tx_meta);
         if (ret) {
             pht_pr_warn("failed to emit SYN|ACK: %d\n", ret);
             pht_flow_detach(new_flow);
@@ -1865,12 +1866,11 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             new_flow->last_ack = new_flow->ack;
             new_flow->local_isn = responder_seq;
             new_flow->peer_syn_next = new_flow->ack;
-            new_flow->tx_meta = tx_meta;
+            if (queued_skb)
+                new_flow->tx_meta = queued_tx_meta;
             spin_unlock_bh(&new_flow->lock);
-            if (queued_skb) {
+            if (queued_skb)
                 pht_flow_set_queued_skb(new_flow, queued_skb, &queued_tx_meta);
-                pht_flow_set_tx_meta(new_flow, &tx_meta);
-            }
 
             ret = pht_flow_insert(flows, new_flow);
             if (ret) {
@@ -1878,7 +1878,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 return NF_DROP;
             }
 
-            ret = phantun_send_synack(new_flow, state->net);
+            ret = phantun_send_synack(new_flow, state->net, &tx_meta);
             if (ret) {
                 pht_pr_warn("failed to emit SYN|ACK after collision handoff: %d\n", ret);
                 pht_flow_detach(new_flow);
@@ -1940,7 +1940,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
     if (state_now == PHT_FLOW_STATE_SYN_RCVD && phantun_tcp_is_bare_syn(&view) &&
         phantun_tcp_syn_is_aligned(&view) && ntohl(view.tcp->seq) + 1 == peer_syn_next) {
-        ret = phantun_send_synack(flow, state->net);
+        ret = phantun_send_synack(flow, state->net, &tx_meta);
         if (ret)
             pht_pr_warn("failed to re-emit SYN|ACK: %d\n", ret);
         pht_flow_put(flow);
@@ -1992,7 +1992,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                     pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
                 }
 
-                ret = phantun_send_handshake_response(flow, state->net);
+                ret = phantun_send_handshake_response(flow, state->net, &tx_meta);
                 if (ret) {
                     pht_pr_warn("failed to emit handshake response: %d\n", ret);
                     pht_flow_remove(flow);
@@ -2083,7 +2083,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             if (phantun_tcp_is_bare_syn(&view) && phantun_tcp_syn_is_aligned(&view)) {
                 if (role_now == PHT_FLOW_ROLE_RESPONDER &&
                     ntohl(view.tcp->seq) + 1 == peer_syn_next) {
-                    ret = phantun_send_synack(flow, state->net);
+                    ret = phantun_send_synack(flow, state->net, &tx_meta);
                     if (ret)
                         pht_pr_warn("failed to re-emit SYN|ACK for duplicate established SYN: %d\n",
                                     ret);

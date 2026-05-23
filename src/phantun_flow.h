@@ -51,9 +51,10 @@ struct pht_flow_table;
 struct pht_flow {
     refcount_t refs;
     /*
-     * lock protects mutable protocol state: state/seq/ack tracking, cached
-     * transmit policy metadata, quarantine/drop-next shaping flags, the one-skb
-     * queue, retry counters, timestamps, and retransmit bookkeeping.
+     * lock protects mutable protocol state: state/seq/ack tracking, persistent
+     * local-outbound transmit policy metadata, quarantine/drop-next shaping
+     * flags, the one-skb queue, retry counters, timestamps, and retransmit
+     * bookkeeping.
      *
      * It does not protect refs, hash/list membership, the timer object itself,
      * or immutable identity/config fields set at create time.
@@ -83,7 +84,10 @@ struct pht_flow {
     u32 local_isn;
     /* Next remote sequence immediately after the peer's opening SYN. */
     u32 peer_syn_next;
-    /* Latest known policy-routing/QoS metadata for generated fake-TCP packets. */
+    /* Latest local outbound UDP policy-routing/QoS metadata used by later
+     * generated fake-TCP packets. Inbound fake-TCP metadata is reply-scoped and
+     * must not be stored here.
+     */
     struct pht_tx_meta tx_meta;
     /* Sequence window of the immediately previous generation on this tuple.
      * Used only to absorb delayed packets after ESTABLISHED accepts a
