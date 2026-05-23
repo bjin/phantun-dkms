@@ -150,6 +150,40 @@ def make_netns_input_probe(vm, namespace, dst_port, allow_udp_dport):
     return NetnsNftProbe(namespace, "inet", table_name, "input")
 
 
+def make_netns_output_udp_mark_set_probe(vm, namespace, src_addr, src_port, dst_addr, dst_port, mark):
+    table_name = f"phantun_mark_set_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
+        f"nft add table inet {table_name}",
+        (f"nft 'add chain inet {table_name} output " "{ type filter hook output priority -300; policy accept; }'"),
+        (
+            f"nft 'add rule inet {table_name} output "
+            f"ip saddr {src_addr} ip daddr {dst_addr} "
+            f"udp sport {src_port} udp dport {dst_port} "
+            f'counter meta mark set {mark:#x} accept comment "mark_udp_before_phantun"\''
+        ),
+    ]
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsNftProbe(namespace, "inet", table_name, "output")
+
+
+def make_netns_output_tcp_mark_probe(vm, namespace, src_addr, src_port, dst_addr, dst_port, mark):
+    table_name = f"phantun_mark_seen_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
+        f"nft add table inet {table_name}",
+        (f"nft 'add chain inet {table_name} output " "{ type filter hook output priority 0; policy accept; }'"),
+        (
+            f"nft 'add rule inet {table_name} output "
+            f"ip saddr {src_addr} ip daddr {dst_addr} "
+            f"tcp sport {src_port} tcp dport {dst_port} meta mark {mark:#x} "
+            f'counter accept comment "marked_fake_tcp"\''
+        ),
+    ]
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsNftProbe(namespace, "inet", table_name, "output")
+
+
 def make_netns_input_invalid_drop_probe(vm, namespace, dst_port):
     return make_netns_input_probe(vm, namespace, dst_port, allow_udp_dport=True)
 
@@ -220,6 +254,75 @@ def test_netns_ping_pong_uses_tcp_output_only(phantun_module, vm):
     finally:
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_netns_outbound_mark_propagates_to_fake_tcp(phantun_module, vm):
+    load_netns_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    mark = 0x42
+    mark_setter = make_netns_output_udp_mark_set_probe(
+        vm,
+        NS_A,
+        NS_ADDR_A,
+        src_port,
+        NS_ADDR_B,
+        dst_port,
+        mark,
+    )
+    mark_probe = make_netns_output_tcp_mark_probe(
+        vm,
+        NS_A,
+        NS_ADDR_A,
+        src_port,
+        NS_ADDR_B,
+        dst_port,
+        mark,
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "ping_server",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "reply": "pong",
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payload": "ping",
+            },
+        )
+        server_result = server.communicate(timeout=10)
+
+        assert_completed(client_result, "marked ping client")
+        assert_completed(server_result, "marked ping server")
+
+        if mark_setter.packets(vm, "mark_udp_before_phantun") == 0:
+            pytest.fail("test mark rule did not see the original outbound UDP before phantun")
+        if mark_probe.packets(vm, "marked_fake_tcp") == 0:
+            pytest.fail("generated fake-TCP packets did not preserve the outbound UDP mark")
+    finally:
+        mark_setter.cleanup(vm)
+        mark_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 

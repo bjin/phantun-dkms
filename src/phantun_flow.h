@@ -51,9 +51,9 @@ struct pht_flow_table;
 struct pht_flow {
     refcount_t refs;
     /*
-     * lock protects mutable protocol state: state/seq/ack tracking,
-     * quarantine/drop-next shaping flags, the one-skb queue, retry counters,
-     * timestamps, and retransmit bookkeeping.
+     * lock protects mutable protocol state: state/seq/ack tracking, cached
+     * transmit policy metadata, quarantine/drop-next shaping flags, the one-skb
+     * queue, retry counters, timestamps, and retransmit bookkeeping.
      *
      * It does not protect refs, hash/list membership, the timer object itself,
      * or immutable identity/config fields set at create time.
@@ -83,6 +83,8 @@ struct pht_flow {
     u32 local_isn;
     /* Next remote sequence immediately after the peer's opening SYN. */
     u32 peer_syn_next;
+    /* Latest known policy-routing/QoS metadata for generated fake-TCP packets. */
+    struct pht_tx_meta tx_meta;
     /* Sequence window of the immediately previous generation on this tuple.
      * Used only to absorb delayed packets after ESTABLISHED accepts a
      * replacement bare SYN.
@@ -95,6 +97,7 @@ struct pht_flow {
      * is waiting for the injected handshake_response to clear.
      */
     struct sk_buff *queued_skb;
+    struct pht_tx_meta queued_tx_meta;
     unsigned int retries_done;
     unsigned int max_retries;
     unsigned long last_activity_jiffies;
@@ -193,9 +196,13 @@ void pht_flow_put(struct pht_flow *flow);
 void pht_flow_touch(struct pht_flow *flow);
 void pht_flow_touch_inbound(struct pht_flow *flow);
 void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex);
-bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb);
-void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb);
-struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow);
+void pht_flow_set_tx_meta(struct pht_flow *flow, const struct pht_tx_meta *meta);
+void pht_flow_snapshot_tx_meta(struct pht_flow *flow, struct pht_tx_meta *meta);
+bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
+                                 const struct pht_tx_meta *meta);
+void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb,
+                             const struct pht_tx_meta *meta);
+struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow, struct pht_tx_meta *meta);
 void pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state);
 void pht_flow_arm_retransmit(struct pht_flow *flow);
 void pht_flow_cancel_retransmit(struct pht_flow *flow);

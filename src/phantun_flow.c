@@ -90,14 +90,23 @@ static void pht_flow_free(struct pht_flow *flow) {
 }
 
 static int pht_flow_send_local_rst(struct pht_flow *flow) {
+    struct pht_endpoint_pair ep;
+    struct pht_tx_meta meta;
+    u32 seq;
     int ifindex;
     int ret;
 
     if (!flow || !flow->table || !flow->table->net)
         return -EINVAL;
 
-    ret = pht_emit_fake_tcp(flow->table->net, &flow->endpoints, flow->seq, 0, PHT_TCP_FLAG_RST,
-                            NULL, 0, &ifindex);
+    spin_lock_bh(&flow->lock);
+    ep = flow->endpoints;
+    meta = flow->tx_meta;
+    seq = flow->seq;
+    spin_unlock_bh(&flow->lock);
+
+    ret = pht_emit_fake_tcp(flow->table->net, &ep, seq, 0, PHT_TCP_FLAG_RST, NULL, 0, &meta,
+                            &ifindex);
     if (!ret) {
         pht_flow_set_egress_ifindex(flow, ifindex);
         pht_stats_inc(PHT_STAT_RST_SENT);
@@ -107,6 +116,7 @@ static int pht_flow_send_local_rst(struct pht_flow *flow) {
 
 static int pht_flow_retransmit_now(struct pht_flow *flow) {
     struct pht_endpoint_pair ep;
+    struct pht_tx_meta meta;
     u32 seq;
     u32 ack;
     enum pht_flow_state state;
@@ -117,6 +127,7 @@ static int pht_flow_retransmit_now(struct pht_flow *flow) {
     spin_lock_bh(&flow->lock);
     state = flow->state;
     ep = flow->endpoints;
+    meta = flow->tx_meta;
     seq = flow->seq;
     ack = flow->ack;
     if (state == PHT_FLOW_STATE_SYN_SENT) {
@@ -137,7 +148,7 @@ static int pht_flow_retransmit_now(struct pht_flow *flow) {
         int ifindex;
         int ret;
 
-        ret = pht_emit_fake_tcp(flow->table->net, &ep, seq, ack, flags, NULL, 0, &ifindex);
+        ret = pht_emit_fake_tcp(flow->table->net, &ep, seq, ack, flags, NULL, 0, &meta, &ifindex);
         if (!ret)
             pht_flow_set_egress_ifindex(flow, ifindex);
         return ret;
@@ -510,7 +521,7 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
             if (is_liveness_failure) {
                 struct sk_buff *queued_skb;
 
-                queued_skb = pht_flow_take_queued_skb(flow);
+                queued_skb = pht_flow_take_queued_skb(flow, NULL);
                 if (queued_skb)
                     __skb_queue_tail(reinject_list, queued_skb);
             }
@@ -541,6 +552,7 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
 static void pht_flow_emit_keepalives(struct pht_flow_table *table, struct list_head *keepalives) {
     while (!list_empty(keepalives)) {
         struct pht_endpoint_pair ep;
+        struct pht_tx_meta meta;
         struct pht_flow *flow = list_first_entry(keepalives, struct pht_flow, keepalive_node);
         u32 seq;
         u32 ack;
@@ -556,11 +568,13 @@ static void pht_flow_emit_keepalives(struct pht_flow_table *table, struct list_h
             ep = flow->endpoints;
             seq = flow->seq;
             ack = flow->ack;
+            meta = flow->tx_meta;
         }
         spin_unlock_bh(&flow->lock);
 
         if (live && table->net) {
-            ret = pht_emit_fake_tcp(table->net, &ep, seq, ack, PHT_TCP_FLAG_ACK, NULL, 0, &ifindex);
+            ret = pht_emit_fake_tcp(table->net, &ep, seq, ack, PHT_TCP_FLAG_ACK, NULL, 0, &meta,
+                                    &ifindex);
             if (!ret) {
                 spin_lock_bh(&flow->lock);
                 if (flow->state == PHT_FLOW_STATE_ESTABLISHED && flow->table == table)
@@ -731,6 +745,8 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table, const struct pht_
     timer_setup(&flow->retransmit_timer, pht_flow_retransmit_timer, 0);
     flow->table = table;
     flow->endpoints = *ep;
+    pht_tx_meta_init(&flow->tx_meta);
+    pht_tx_meta_init(&flow->queued_tx_meta);
     flow->role = role;
     flow->state = state;
     flow->max_retries = table->handshake_retries;
@@ -985,10 +1001,45 @@ void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex) {
     spin_unlock_bh(&flow->lock);
 }
 
+void pht_flow_set_tx_meta(struct pht_flow *flow, const struct pht_tx_meta *meta) {
+    if (!flow || !meta)
+        return;
+
+    spin_lock_bh(&flow->lock);
+    flow->tx_meta = *meta;
+    spin_unlock_bh(&flow->lock);
+}
+
+void pht_flow_snapshot_tx_meta(struct pht_flow *flow, struct pht_tx_meta *meta) {
+    if (!meta)
+        return;
+
+    if (!flow) {
+        pht_tx_meta_init(meta);
+        return;
+    }
+
+    spin_lock_bh(&flow->lock);
+    *meta = flow->tx_meta;
+    spin_unlock_bh(&flow->lock);
+}
+
+static void pht_flow_store_queued_tx_meta_locked(struct pht_flow *flow,
+                                                 const struct pht_tx_meta *meta) {
+    if (meta) {
+        flow->queued_tx_meta = *meta;
+        if (flow->state == PHT_FLOW_STATE_ESTABLISHED)
+            flow->tx_meta = *meta;
+    } else {
+        pht_tx_meta_init(&flow->queued_tx_meta);
+    }
+}
+
 /* On success the flow takes ownership of @skb. On failure the caller still
  * owns @skb and must decide whether to free or reuse it.
  */
-bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb) {
+bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
+                                 const struct pht_tx_meta *meta) {
     bool queued = false;
 
     if (!flow) {
@@ -999,6 +1050,7 @@ bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb) {
     spin_lock_bh(&flow->lock);
     if (!flow->queued_skb) {
         flow->queued_skb = skb;
+        pht_flow_store_queued_tx_meta_locked(flow, meta);
         flow->last_activity_jiffies = jiffies;
         queued = true;
     }
@@ -1010,7 +1062,8 @@ bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb) {
 /* The flow takes ownership of @skb. Any previously queued skb is released
  * here so callers do not need a second free path.
  */
-void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb) {
+void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb,
+                             const struct pht_tx_meta *meta) {
     struct sk_buff *old;
 
     if (!flow) {
@@ -1021,20 +1074,26 @@ void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb) {
     spin_lock_bh(&flow->lock);
     old = flow->queued_skb;
     flow->queued_skb = skb;
+    pht_flow_store_queued_tx_meta_locked(flow, meta);
     spin_unlock_bh(&flow->lock);
 
     kfree_skb(old);
 }
 
-struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow) {
+struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow, struct pht_tx_meta *meta) {
     struct sk_buff *skb;
 
+    if (meta)
+        pht_tx_meta_init(meta);
     if (!flow)
         return NULL;
 
     spin_lock_bh(&flow->lock);
     skb = flow->queued_skb;
+    if (skb && meta)
+        *meta = flow->queued_tx_meta;
     flow->queued_skb = NULL;
+    pht_tx_meta_init(&flow->queued_tx_meta);
     spin_unlock_bh(&flow->lock);
     return skb;
 }
