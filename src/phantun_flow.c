@@ -414,6 +414,7 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
     table->half_open_limit = cfg->half_open_limit;
     table->half_open_current = 0;
     table->hash_seed = get_random_u32();
+    table->reinject_mark = get_random_u32() | BIT(31);
     table->gc_interval_jiffies = msecs_to_jiffies(PHT_FLOW_GC_INTERVAL_SEC * 1000U);
     if (table->keepalive_interval_jiffies > 0) {
         unsigned long min_gc = table->keepalive_interval_jiffies / 2;
@@ -1001,19 +1002,16 @@ void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex) {
     spin_unlock_bh(&flow->lock);
 }
 
-/* Queue metadata is exact per-skb metadata. Once the flow is established, that
- * same local outbound metadata is also the policy context for later synthetic
- * packets that have no skb to copy from.
+/* Queue metadata is exact per-skb metadata. The persistent local transmit
+ * context is updated by every intercepted local outbound UDP packet before the
+ * queue decision, including packets dropped because the bounded queue is full.
  */
 static void pht_flow_store_queued_tx_meta_locked(struct pht_flow *flow,
                                                  const struct pht_tx_meta *meta) {
-    if (meta) {
+    if (meta)
         flow->queued_tx_meta = *meta;
-        if (flow->state == PHT_FLOW_STATE_ESTABLISHED)
-            flow->local_tx_meta = *meta;
-    } else {
+    else
         pht_tx_meta_init(&flow->queued_tx_meta);
-    }
 }
 
 /* On success the flow takes ownership of @skb. On failure the caller still
@@ -1027,6 +1025,8 @@ bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
         return false;
 
     spin_lock_bh(&flow->lock);
+    if (meta)
+        flow->local_tx_meta = *meta;
     if (!flow->queued_skb) {
         flow->queued_skb = skb;
         pht_flow_store_queued_tx_meta_locked(flow, meta);
@@ -1039,7 +1039,8 @@ bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
 }
 
 /* The flow takes ownership of @skb. Any previously queued skb is released
- * here so callers do not need a second free path.
+ * here so callers do not need a second free path. This may requeue or transfer
+ * an existing skb, so true local-out callers update local_tx_meta explicitly.
  */
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb,
                              const struct pht_tx_meta *meta) {

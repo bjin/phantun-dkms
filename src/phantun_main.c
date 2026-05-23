@@ -998,7 +998,8 @@ static int phantun_send_flow_rst(struct pht_flow *flow, struct net *net) {
 
 static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_endpoint_pair *ep,
                                         const struct pht_l4_view *view, const struct sk_buff *skb,
-                                        const struct pht_tx_meta *meta, struct net *net) {
+                                        const struct pht_tx_meta *meta, struct net *net,
+                                        bool persist_meta) {
     u32 seq;
     u32 ack;
     int ifindex;
@@ -1014,10 +1015,10 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
      * ordered. If emit fails, roll back only when nothing advanced flow->seq
      * in the meantime.
      *
-     * The current UDP skb's metadata is also the best local transmit policy
-     * context for later synthetic packets on this flow. Store only metadata
-     * copied from local outbound UDP; inbound fake-TCP metadata is never
-     * promoted into local_tx_meta.
+     * For immediate local-out sends, the current UDP skb's metadata is also the
+     * best local transmit policy context for later synthetic packets. Queued
+     * skb metadata remains per-skb only; replaying an older queued packet must
+     * not overwrite a newer local_tx_meta learned while the queue was full.
      */
     spin_lock_bh(&flow->tx_lock);
     spin_lock_bh(&flow->lock);
@@ -1026,7 +1027,7 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
         spin_unlock_bh(&flow->tx_lock);
         return -EAGAIN;
     }
-    if (meta)
+    if (persist_meta && meta)
         flow->local_tx_meta = *meta;
     seq = flow->seq;
     ack = flow->ack;
@@ -1041,7 +1042,7 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
         if (flow->state == PHT_FLOW_STATE_ESTABLISHED) {
             flow->last_activity_jiffies = jiffies;
             flow->egress_ifindex = ifindex;
-            if (meta)
+            if (persist_meta && meta)
                 flow->local_tx_meta = *meta;
         }
         spin_unlock_bh(&flow->lock);
@@ -1162,7 +1163,8 @@ static int phantun_send_handshake_response(struct pht_flow *flow, struct net *ne
     return ret;
 }
 
-static int phantun_send_idle_ack(struct pht_flow *flow, struct net *net) {
+static int phantun_send_idle_ack(struct pht_flow *flow, struct net *net,
+                                 const struct pht_tx_meta *reply_meta) {
     struct pht_endpoint_pair ep;
     struct pht_tx_meta meta;
     u32 seq;
@@ -1174,7 +1176,7 @@ static int phantun_send_idle_ack(struct pht_flow *flow, struct net *net) {
     ep = flow->endpoints;
     seq = flow->seq;
     ack = flow->ack;
-    meta = flow->local_tx_meta;
+    meta = reply_meta ? *reply_meta : flow->local_tx_meta;
     spin_unlock_bh(&flow->lock);
 
     ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, NULL, 0, &meta, &ifindex);
@@ -1216,7 +1218,7 @@ static int phantun_flush_queued_udp(struct pht_flow *flow, struct net *net, bool
 
     phantun_fill_udp_endpoint_pair(&qview, &qep);
     qep.scope_ifindex = flow->endpoints.scope_ifindex;
-    ret = phantun_send_established_udp(flow, &qep, &qview, queued_skb, &meta, net);
+    ret = phantun_send_established_udp(flow, &qep, &qview, queued_skb, &meta, net, false);
     if (ret && ret != -EMSGSIZE) {
         pht_flow_set_queued_skb(flow, queued_skb, &meta);
         return ret;
@@ -1241,6 +1243,8 @@ static int phantun_reinject_inbound_payload(const struct pht_endpoint_pair *ep,
                                             const struct sk_buff *skb,
                                             const struct pht_l4_view *view, struct net *net,
                                             struct net_device *dev) {
+    struct pht_flow_table *flows;
+
     if (!view->payload_len)
         return 0;
 
@@ -1251,7 +1255,12 @@ static int phantun_reinject_inbound_payload(const struct pht_endpoint_pair *ep,
     if (!net || !dev || dev_net(dev) != net)
         return -EINVAL;
 
-    return pht_reinject_udp_payload_from_skb(dev, ep, skb, view->payload_offset, view->payload_len);
+    flows = phantun_net_flows(net);
+    if (!flows)
+        return -EINVAL;
+
+    return pht_reinject_udp_payload_from_skb(dev, ep, skb, view->payload_offset, view->payload_len,
+                                             flows->reinject_mark);
 }
 
 static void phantun_refresh_inbound_progress(struct pht_flow *flow, const struct pht_l4_view *view,
@@ -1278,12 +1287,11 @@ static void phantun_note_inbound_payload(struct pht_flow *flow, const struct pht
     phantun_refresh_inbound_progress(flow, view, NULL);
 }
 
-static int phantun_finalize_established_rx(struct pht_flow *flow,
-                                           const struct pht_endpoint_pair *ep,
-                                           const struct sk_buff *skb,
-                                           const struct pht_l4_view *view, struct net *net,
-                                           struct net_device *dev, bool reinject_payload,
-                                           bool send_idle_ack) {
+static int
+phantun_finalize_established_rx(struct pht_flow *flow, const struct pht_endpoint_pair *ep,
+                                const struct sk_buff *skb, const struct pht_l4_view *view,
+                                struct net *net, struct net_device *dev, bool reinject_payload,
+                                bool send_idle_ack, const struct pht_tx_meta *reply_meta) {
     bool allow_flush;
     int ret = 0;
 
@@ -1312,7 +1320,7 @@ static int phantun_finalize_established_rx(struct pht_flow *flow,
     }
 
     if (send_idle_ack && view->payload_len)
-        ret = phantun_send_idle_ack(flow, net);
+        ret = phantun_send_idle_ack(flow, net, reply_meta);
     return ret;
 }
 
@@ -1430,7 +1438,7 @@ retry_lookup:
                 return NF_STOLEN;
             }
 
-            ret = phantun_send_established_udp(flow, &ep, &view, skb, &tx_meta, state->net);
+            ret = phantun_send_established_udp(flow, &ep, &view, skb, &tx_meta, state->net, true);
             if (ret && ret != -EMSGSIZE) {
                 pht_pr_warn("failed to emit fake-TCP payload for established flow: %d\n", ret);
                 phantun_send_flow_rst(flow, state->net);
@@ -1596,20 +1604,26 @@ static unsigned int phantun_pre_routing_segment_gso(void *priv, struct sk_buff *
 }
 
 /* Selector-matched raw inbound UDP is dropped before local delivery so a
- * tuple is owned either by fake-TCP translation or by nothing. Reinject-marked
- * UDP is exempt because it already came out of the translator.
+ * tuple is owned either by fake-TCP translation or by nothing. UDP carrying
+ * this netns' private reinjection mark is exempt because it already came out
+ * of the translator.
  */
 static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb,
                                                  const struct nf_hook_state *state) {
     struct pht_l4_view view;
     struct pht_addr local_addr;
     struct pht_addr remote_addr;
+    struct pht_flow_table *flows;
     int ret;
 
     if (!state || !skb)
         return NF_ACCEPT;
 
-    if (skb->mark == PHANTUN_REINJECT_MARK) {
+    flows = phantun_net_flows(state->net);
+    if (!flows)
+        return NF_ACCEPT;
+
+    if (skb->mark == flows->reinject_mark) {
         skb->mark = 0;
         return NF_ACCEPT;
     }
@@ -1660,6 +1674,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     struct pht_flow *dead_flow = NULL;
     struct sk_buff *queued_skb;
     struct pht_tx_meta queued_tx_meta;
+    struct pht_tx_meta local_tx_meta;
     enum pht_flow_state state_now;
     struct net_device *in_dev;
     u32 expected_ack;
@@ -1858,8 +1873,11 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
             pht_pr_info("collision on tuple; switching to responder role\n");
             pht_stats_inc(PHT_STAT_COLLISIONS_LOST);
-            queued_skb = pht_flow_take_queued_skb(flow, &queued_tx_meta);
             pht_flow_detach(flow);
+            queued_skb = pht_flow_take_queued_skb(flow, &queued_tx_meta);
+            spin_lock_bh(&flow->lock);
+            local_tx_meta = flow->local_tx_meta;
+            spin_unlock_bh(&flow->lock);
             pht_flow_put(flow);
 
             new_flow =
@@ -1876,8 +1894,11 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             new_flow->last_ack = new_flow->ack;
             new_flow->local_isn = responder_seq;
             new_flow->peer_syn_next = new_flow->ack;
-            if (queued_skb)
-                new_flow->local_tx_meta = queued_tx_meta;
+            /* queued_tx_meta stays tied to the transferred skb. local_tx_meta
+             * may be newer when later UDP arrived while the one-skb queue was
+             * full, so preserve it separately for retransmits and keepalives.
+             */
+            new_flow->local_tx_meta = local_tx_meta;
             spin_unlock_bh(&new_flow->lock);
             if (queued_skb)
                 pht_flow_set_queued_skb(new_flow, queued_skb, &queued_tx_meta);
@@ -1930,7 +1951,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
                 ret = phantun_flush_queued_udp(flow, state->net, &flushed_payload);
                 if (!ret && !phantun_request_enabled() && (!had_queued || !flushed_payload))
-                    ret = phantun_send_idle_ack(flow, state->net);
+                    ret = phantun_send_idle_ack(flow, state->net, &tx_meta);
             }
             if (ret) {
                 pht_pr_warn("failed to finalize initiator open: %d\n", ret);
@@ -2023,7 +2044,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 }
 
                 ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
-                                                      true, true);
+                                                      true, true, &tx_meta);
                 if (ret) {
                     pht_pr_warn("failed to process responder open payload: %d\n", ret);
                     if (ret == -EMSGSIZE)
@@ -2055,7 +2076,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             if (drop_open_payload)
                 pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
             ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
-                                                  !drop_open_payload, true);
+                                                  !drop_open_payload, true, &tx_meta);
             if (ret) {
                 pht_pr_warn("failed to process responder open payload: %d\n", ret);
                 if (ret == -EMSGSIZE)
@@ -2084,7 +2105,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             if (role_now == PHT_FLOW_ROLE_INITIATOR &&
                 phantun_tcp_is_clean_synack(&view, expected_ack) &&
                 ntohl(view.tcp->seq) + 1 == peer_syn_next) {
-                ret = phantun_send_idle_ack(flow, state->net);
+                ret = phantun_send_idle_ack(flow, state->net, &tx_meta);
                 if (ret)
                     pht_pr_warn("failed to ACK duplicate current-generation SYN|ACK: %d\n", ret);
                 pht_flow_put(flow);
@@ -2175,7 +2196,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         }
 
         ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
-                                              !drop_payload, true);
+                                              !drop_payload, true, &tx_meta);
         if (ret) {
             pht_pr_warn("failed to process established inbound payload: %d\n", ret);
             if (ret == -EMSGSIZE)

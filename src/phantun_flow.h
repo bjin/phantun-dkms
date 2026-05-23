@@ -172,6 +172,11 @@ struct pht_flow_table {
      * module reloads.
      */
     u32 hash_seed;
+    /* Per-netns cookie used as a private reinjection mark. It is randomized at
+     * table init with the high bit set so it stays out of the low mark range
+     * commonly used by firewall rules and other applications.
+     */
+    u32 reinject_mark;
     /* Serializes half-open admission and exact insert->established/dead
      * accounting so SYN_SENT/SYN_RCVD pressure is bounded per netns.
      */

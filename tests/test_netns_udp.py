@@ -26,6 +26,7 @@ from helpers import (
     run_in_netns,
     run_netns_scenario,
     spawn_netns_scenario,
+    wait_for_guest_ready_file,
 )
 
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
@@ -250,6 +251,93 @@ def make_netns_output_synack_reply_scope_probe(
     ]
     run_in_netns(vm, namespace, "\n".join(lines))
     return NetnsNftProbe(namespace, "inet", table_name, "output")
+
+
+def make_netns_prerouting_ack_meta_set_probe(
+    vm,
+    namespace,
+    src_addr,
+    src_port,
+    dst_addr,
+    dst_port,
+    mark,
+    dscp,
+):
+    table_name = f"phantun_ack_meta_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
+        f"nft add table inet {table_name}",
+        (
+            f"nft 'add chain inet {table_name} prerouting "
+            "{ type filter hook prerouting priority -500; policy accept; }'"
+        ),
+        (
+            f"nft 'add rule inet {table_name} prerouting "
+            f"ip saddr {src_addr} ip daddr {dst_addr} "
+            f"tcp sport {src_port} tcp dport {dst_port} "
+            "tcp flags & (fin|syn|rst|ack) == ack "
+            f"counter meta mark set {mark:#x} ip dscp set {dscp:#x} "
+            'accept comment "mark_inbound_ack_before_phantun"\''
+        ),
+    ]
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsNftProbe(namespace, "inet", table_name, "prerouting")
+
+
+def make_netns_output_ack_reply_scope_probe(
+    vm,
+    namespace,
+    src_addr,
+    src_port,
+    dst_addr,
+    dst_port,
+    mark,
+    dscp,
+):
+    table_name = f"phantun_ack_reply_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
+        f"nft add table inet {table_name}",
+        (f"nft 'add chain inet {table_name} output " "{ type filter hook output priority 0; policy accept; }'"),
+        (
+            f"nft 'add rule inet {table_name} output "
+            f"ip saddr {src_addr} ip daddr {dst_addr} "
+            f"tcp sport {src_port} tcp dport {dst_port} "
+            "tcp flags & (fin|syn|rst|ack) == ack "
+            f"meta mark {mark:#x} ip dscp {dscp:#x} "
+            'counter accept comment "inbound_marked_ack"\''
+        ),
+    ]
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsNftProbe(namespace, "inet", table_name, "output")
+
+
+def make_netns_prerouting_udp_mark_set_probe(
+    vm,
+    namespace,
+    src_addr,
+    src_port,
+    dst_addr,
+    dst_port,
+    mark,
+):
+    table_name = f"phantun_udp_mark_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
+        f"nft add table inet {table_name}",
+        (
+            f"nft 'add chain inet {table_name} prerouting "
+            "{ type filter hook prerouting priority -500; policy accept; }'"
+        ),
+        (
+            f"nft 'add rule inet {table_name} prerouting "
+            f"ip saddr {src_addr} ip daddr {dst_addr} "
+            f"udp sport {src_port} udp dport {dst_port} "
+            f'counter meta mark set {mark:#x} accept comment "spoof_old_reinject_mark"\''
+        ),
+    ]
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsNftProbe(namespace, "inet", table_name, "prerouting")
 
 
 def make_netns_ingress_synack_dscp_drop_probe(
@@ -515,6 +603,318 @@ def test_netns_inbound_metadata_is_reply_scoped(phantun_module, vm):
         inbound_marker.cleanup(vm)
         synack_probe.cleanup(vm)
         synack_drop.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_netns_established_payload_ack_uses_inbound_reply_metadata(phantun_module, vm):
+    load_netns_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    mark = 0x52
+    dscp = 0x16
+    setup_ready = f"/tmp/phantun_ack_setup_{uuid.uuid4().hex}"
+    marked_ready = f"/tmp/phantun_ack_marked_{uuid.uuid4().hex}"
+    probes = []
+
+    try:
+        setup_server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_until_timeout",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 1,
+                "timeout_sec": 8,
+                "ready_file": setup_ready,
+            },
+        )
+        wait_for_guest_ready_file(vm, setup_ready, timeout=5)
+        setup = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["setup"],
+            },
+        )
+        assert_completed(setup, "metadata ACK setup sender")
+        setup_result = setup_server.communicate(timeout=10)
+        assert_completed(setup_result, "metadata ACK setup receiver")
+        setup_data = parse_guest_json(setup_result.stdout, "metadata ACK setup receiver stdout")
+        if [entry["message"] for entry in setup_data.get("received", [])] != ["setup"]:
+            pytest.fail(f"metadata ACK setup receiver saw unexpected payloads: {setup_data!r}")
+
+        inbound_marker = make_netns_prerouting_ack_meta_set_probe(
+            vm,
+            NS_B,
+            NS_ADDR_A,
+            src_port,
+            NS_ADDR_B,
+            dst_port,
+            mark,
+            dscp,
+        )
+        probes.append(inbound_marker)
+        ack_probe = make_netns_output_ack_reply_scope_probe(
+            vm,
+            NS_B,
+            NS_ADDR_B,
+            dst_port,
+            NS_ADDR_A,
+            src_port,
+            mark,
+            dscp,
+        )
+        probes.append(ack_probe)
+
+        marked_server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_until_timeout",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 1,
+                "timeout_sec": 8,
+                "ready_file": marked_ready,
+            },
+        )
+        wait_for_guest_ready_file(vm, marked_ready, timeout=5)
+        marked = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["marked"],
+            },
+        )
+        assert_completed(marked, "metadata ACK marked sender")
+        marked_result = marked_server.communicate(timeout=10)
+        assert_completed(marked_result, "metadata ACK marked receiver")
+
+        marked_data = parse_guest_json(marked_result.stdout, "metadata ACK marked receiver stdout")
+        if [entry["message"] for entry in marked_data.get("received", [])] != ["marked"]:
+            pytest.fail(f"metadata ACK marked receiver saw unexpected payloads: {marked_data!r}")
+        if inbound_marker.packets(vm, "mark_inbound_ack_before_phantun") == 0:
+            pytest.fail("test rule did not mark established inbound fake-TCP payload metadata")
+        if ack_probe.packets(vm, "inbound_marked_ack") == 0:
+            pytest.fail("pure ACK reply did not copy inbound fake-TCP metadata")
+    finally:
+        for probe in probes:
+            probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_netns_half_open_responder_retransmit_uses_queued_udp_metadata(phantun_module, vm):
+    phantun_module.load(
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        handshake_timeout_ms=1000,
+        handshake_retries=6,
+    )
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    initial_mark = 0x43
+    latest_mark = 0x44
+    mark_setters = []
+    initial_mark_setter = make_netns_output_udp_mark_set_probe(
+        vm,
+        NS_B,
+        NS_ADDR_B,
+        dst_port,
+        NS_ADDR_A,
+        src_port,
+        initial_mark,
+    )
+    mark_setters.append(initial_mark_setter)
+    synack_probe = make_netns_output_synack_reply_scope_probe(
+        vm,
+        NS_B,
+        NS_ADDR_B,
+        dst_port,
+        NS_ADDR_A,
+        src_port,
+        latest_mark,
+        0,
+    )
+    drop_synack = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn|ack",
+                "comment": "drop_half_open_synack",
+            }
+        ],
+    )
+
+    try:
+        opener = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["open"],
+            },
+        )
+        assert_completed(opener, "half-open metadata opener")
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if drop_synack.packets(vm, "drop_half_open_synack") > 0:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("responder did not emit the initial SYN|ACK before queueing UDP")
+        queued = run_netns_scenario(
+            vm,
+            NS_B,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "payloads": ["queued"],
+            },
+        )
+        assert_completed(queued, "half-open metadata queued sender")
+        if initial_mark_setter.packets(vm, "mark_udp_before_phantun") == 0:
+            pytest.fail("test mark rule did not see queued responder UDP before phantun")
+        initial_mark_setter.cleanup(vm)
+        mark_setters.remove(initial_mark_setter)
+
+        latest_mark_setter = make_netns_output_udp_mark_set_probe(
+            vm,
+            NS_B,
+            NS_ADDR_B,
+            dst_port,
+            NS_ADDR_A,
+            src_port,
+            latest_mark,
+        )
+        mark_setters.append(latest_mark_setter)
+        dropped = run_netns_scenario(
+            vm,
+            NS_B,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "payloads": ["updates-policy-while-queue-full"],
+            },
+        )
+        assert_completed(dropped, "half-open metadata queue-full sender")
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if synack_probe.packets(vm, "inbound_marked_synack") > 0:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("SYN|ACK retransmit did not use queued outbound UDP metadata")
+
+        if latest_mark_setter.packets(vm, "mark_udp_before_phantun") == 0:
+            pytest.fail("test mark rule did not see queue-full responder UDP before phantun")
+    finally:
+        for mark_setter in mark_setters:
+            mark_setter.cleanup(vm)
+        synack_probe.cleanup(vm)
+        drop_synack.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_netns_old_reinject_mark_constant_does_not_bypass_raw_udp_drop(phantun_module, vm):
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    old_public_mark = 0x50485455
+    ready_file = f"/tmp/phantun_old_reinject_{uuid.uuid4().hex}"
+
+    phantun_module.load(managed_local_ports=str(dst_port))
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    mark_spoofer = make_netns_prerouting_udp_mark_set_probe(
+        vm,
+        NS_B,
+        NS_ADDR_A,
+        src_port,
+        NS_ADDR_B,
+        dst_port,
+        old_public_mark,
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_until_timeout",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "timeout_sec": 1,
+            "ready_file": ready_file,
+        },
+    )
+
+    try:
+        wait_for_guest_ready_file(vm, ready_file, timeout=5)
+        client = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["spoofed-reinject-mark"],
+            },
+        )
+        assert_completed(client, "old reinject mark raw UDP sender")
+        server_result = server.communicate(timeout=5)
+        assert_completed(server_result, "old reinject mark raw UDP receiver")
+
+        if mark_spoofer.packets(vm, "spoof_old_reinject_mark") == 0:
+            pytest.fail("test rule did not set the old public reinjection mark")
+        server_data = parse_guest_json(server_result.stdout, "old reinject mark receiver stdout")
+        if server_data.get("received"):
+            pytest.fail(f"old public reinjection mark bypassed raw UDP drop: {server_data!r}")
+    finally:
+        mark_spoofer.cleanup(vm)
         cleanup_netns_topology(vm)
 
 

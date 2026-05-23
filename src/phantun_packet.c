@@ -21,7 +21,6 @@
 #include <net/ipv6.h>
 #endif
 
-#include "phantun.h"
 #include "phantun_packet.h"
 #include "phantun_stats.h"
 
@@ -709,19 +708,20 @@ int pht_emit_fake_tcp_payload_from_skb_v4(struct net *net, const struct pht_endp
     return pht_tx_fake_tcp_v4(net, skb, ep, meta, out_ifindex);
 }
 
-int pht_reinject_udp_v4(struct sk_buff *skb, struct net_device *dev) {
+int pht_reinject_udp_v4(struct sk_buff *skb, struct net_device *dev, u32 reinject_mark) {
     int ret;
 
-    if (!skb || !dev) {
+    if (!skb || !dev || !reinject_mark) {
         kfree_skb(skb);
         return -EINVAL;
     }
 
     /* Re-enter through ingress so conntrack and LOCAL_IN firewall policy see
      * the packet exactly as a real receive. The PRE_ROUTING UDP drop hook
-     * clears PHANTUN_REINJECT_MARK and skips re-capturing this skb.
+     * clears the table-private reinjection mark and skips re-capturing this
+     * manufactured skb.
      */
-    skb->mark = PHANTUN_REINJECT_MARK;
+    skb->mark = reinject_mark;
     skb->dev = dev;
     skb->skb_iif = dev->ifindex;
     skb->pkt_type = PACKET_HOST;
@@ -732,7 +732,7 @@ int pht_reinject_udp_v4(struct sk_buff *skb, struct net_device *dev) {
 }
 
 int pht_reinject_udp_payload_v4(struct net_device *dev, const struct pht_endpoint_pair *ep,
-                                const void *payload, size_t payload_len) {
+                                const void *payload, size_t payload_len, u32 reinject_mark) {
     struct sk_buff *skb;
 
     if (payload_len > pht_udp_max_payload_len(AF_INET))
@@ -742,12 +742,12 @@ int pht_reinject_udp_payload_v4(struct net_device *dev, const struct pht_endpoin
     if (!skb)
         return -ENOMEM;
 
-    return pht_reinject_udp_v4(skb, dev);
+    return pht_reinject_udp_v4(skb, dev, reinject_mark);
 }
 
 int pht_reinject_udp_payload_from_skb_v4(struct net_device *dev, const struct pht_endpoint_pair *ep,
                                          const struct sk_buff *src, unsigned int payload_offset,
-                                         size_t payload_len) {
+                                         size_t payload_len, u32 reinject_mark) {
     struct sk_buff *skb;
     void *payload;
     int ret;
@@ -770,7 +770,7 @@ int pht_reinject_udp_payload_from_skb_v4(struct net_device *dev, const struct ph
     }
 
     pht_udp_v4_complete_skb(skb);
-    return pht_reinject_udp_v4(skb, dev);
+    return pht_reinject_udp_v4(skb, dev, reinject_mark);
 }
 
 #if IS_ENABLED(CONFIG_IPV6)
@@ -1064,15 +1064,15 @@ int pht_emit_fake_tcp_payload_from_skb_v6(struct net *net, const struct pht_endp
     return pht_tx_fake_tcp_v6(net, skb, ep, meta, out_ifindex);
 }
 
-int pht_reinject_udp_v6(struct sk_buff *skb, struct net_device *dev) {
+int pht_reinject_udp_v6(struct sk_buff *skb, struct net_device *dev, u32 reinject_mark) {
     int ret;
 
-    if (!skb || !dev) {
+    if (!skb || !dev || !reinject_mark) {
         kfree_skb(skb);
         return -EINVAL;
     }
 
-    skb->mark = PHANTUN_REINJECT_MARK;
+    skb->mark = reinject_mark;
     skb->dev = dev;
     skb->skb_iif = dev->ifindex;
     skb->pkt_type = PACKET_HOST;
@@ -1083,7 +1083,7 @@ int pht_reinject_udp_v6(struct sk_buff *skb, struct net_device *dev) {
 }
 
 int pht_reinject_udp_payload_v6(struct net_device *dev, const struct pht_endpoint_pair *ep,
-                                const void *payload, size_t payload_len) {
+                                const void *payload, size_t payload_len, u32 reinject_mark) {
     struct sk_buff *skb;
 
     if (payload_len > pht_udp_max_payload_len(AF_INET6))
@@ -1093,12 +1093,12 @@ int pht_reinject_udp_payload_v6(struct net_device *dev, const struct pht_endpoin
     if (!skb)
         return -ENOMEM;
 
-    return pht_reinject_udp_v6(skb, dev);
+    return pht_reinject_udp_v6(skb, dev, reinject_mark);
 }
 
 int pht_reinject_udp_payload_from_skb_v6(struct net_device *dev, const struct pht_endpoint_pair *ep,
                                          const struct sk_buff *src, unsigned int payload_offset,
-                                         size_t payload_len) {
+                                         size_t payload_len, u32 reinject_mark) {
     struct sk_buff *skb;
     void *payload;
     int ret;
@@ -1121,7 +1121,7 @@ int pht_reinject_udp_payload_from_skb_v6(struct net_device *dev, const struct ph
     }
 
     pht_udp_v6_complete_skb(skb);
-    return pht_reinject_udp_v6(skb, dev);
+    return pht_reinject_udp_v6(skb, dev, reinject_mark);
 }
 #else
 void pht_ipv6_complete(struct ipv6hdr *ip6h, u16 payload_len, u8 nexthdr,
@@ -1174,19 +1174,19 @@ int pht_emit_fake_tcp_payload_from_skb_v6(struct net *net, const struct pht_endp
     return -EAFNOSUPPORT;
 }
 
-int pht_reinject_udp_v6(struct sk_buff *skb, struct net_device *dev) {
+int pht_reinject_udp_v6(struct sk_buff *skb, struct net_device *dev, u32 reinject_mark) {
     kfree_skb(skb);
     return -EAFNOSUPPORT;
 }
 
 int pht_reinject_udp_payload_v6(struct net_device *dev, const struct pht_endpoint_pair *ep,
-                                const void *payload, size_t payload_len) {
+                                const void *payload, size_t payload_len, u32 reinject_mark) {
     return -EAFNOSUPPORT;
 }
 
 int pht_reinject_udp_payload_from_skb_v6(struct net_device *dev, const struct pht_endpoint_pair *ep,
                                          const struct sk_buff *src, unsigned int payload_offset,
-                                         size_t payload_len) {
+                                         size_t payload_len, u32 reinject_mark) {
     return -EAFNOSUPPORT;
 }
 #endif
@@ -1229,15 +1229,15 @@ int pht_emit_fake_tcp_payload_from_skb(struct net *net, const struct pht_endpoin
 }
 
 int pht_reinject_udp_payload(struct net_device *dev, const struct pht_endpoint_pair *ep,
-                             const void *payload, size_t payload_len) {
+                             const void *payload, size_t payload_len, u32 reinject_mark) {
     if (!ep)
         return -EINVAL;
 
     switch (ep->local_addr.family) {
     case AF_INET:
-        return pht_reinject_udp_payload_v4(dev, ep, payload, payload_len);
+        return pht_reinject_udp_payload_v4(dev, ep, payload, payload_len, reinject_mark);
     case AF_INET6:
-        return pht_reinject_udp_payload_v6(dev, ep, payload, payload_len);
+        return pht_reinject_udp_payload_v6(dev, ep, payload, payload_len, reinject_mark);
     default:
         return -EAFNOSUPPORT;
     }
@@ -1245,15 +1245,17 @@ int pht_reinject_udp_payload(struct net_device *dev, const struct pht_endpoint_p
 
 int pht_reinject_udp_payload_from_skb(struct net_device *dev, const struct pht_endpoint_pair *ep,
                                       const struct sk_buff *src, unsigned int payload_offset,
-                                      size_t payload_len) {
+                                      size_t payload_len, u32 reinject_mark) {
     if (!ep)
         return -EINVAL;
 
     switch (ep->local_addr.family) {
     case AF_INET:
-        return pht_reinject_udp_payload_from_skb_v4(dev, ep, src, payload_offset, payload_len);
+        return pht_reinject_udp_payload_from_skb_v4(dev, ep, src, payload_offset, payload_len,
+                                                    reinject_mark);
     case AF_INET6:
-        return pht_reinject_udp_payload_from_skb_v6(dev, ep, src, payload_offset, payload_len);
+        return pht_reinject_udp_payload_from_skb_v6(dev, ep, src, payload_offset, payload_len,
+                                                    reinject_mark);
     default:
         return -EAFNOSUPPORT;
     }
