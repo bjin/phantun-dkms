@@ -407,6 +407,7 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
     INIT_LIST_HEAD(&table->finalize_list);
 
     table->handshake_timeout_jiffies = msecs_to_jiffies(cfg->handshake_timeout_ms);
+    table->replacement_protect_jiffies = msecs_to_jiffies(cfg->effective_replacement_protect_ms);
     table->keepalive_interval_jiffies = msecs_to_jiffies(cfg->keepalive_interval_sec * 1000U);
     table->keepalive_misses = cfg->keepalive_misses;
     table->hard_idle_timeout_jiffies = msecs_to_jiffies(cfg->hard_idle_timeout_sec * 1000U);
@@ -1081,14 +1082,24 @@ struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow, struct pht_tx_me
 void pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state) {
     bool half_open;
     enum pht_flow_state old_state;
+    unsigned long now;
 
     if (!flow)
         return;
 
     spin_lock_bh(&flow->lock);
+    now = jiffies;
     old_state = flow->state;
+    if (state == PHT_FLOW_STATE_ESTABLISHED && old_state == PHT_FLOW_STATE_SYN_SENT &&
+        flow->role == PHT_FLOW_ROLE_INITIATOR && flow->table &&
+        flow->table->replacement_protect_jiffies) {
+        flow->replacement_protect_until_jiffies = now + flow->table->replacement_protect_jiffies;
+        flow->replacement_protect_active = true;
+    } else if (state != PHT_FLOW_STATE_ESTABLISHED || flow->role != PHT_FLOW_ROLE_INITIATOR) {
+        flow->replacement_protect_active = false;
+    }
     flow->state = state;
-    flow->last_activity_jiffies = jiffies;
+    flow->last_activity_jiffies = now;
     flow->retries_done = 0;
     half_open = pht_flow_state_is_half_open(state);
     spin_unlock_bh(&flow->lock);

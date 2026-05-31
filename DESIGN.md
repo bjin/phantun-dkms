@@ -191,7 +191,7 @@ Before creating a new outbound flow for a tuple:
   - preserve at most one queued outbound UDP skb across reopen
   - create a fresh initiator flow
 
-### 5.3 Replacement-generation quarantine
+### 5.3 Replacement-generation quarantine and protection
 
 If an established flow accepts a valid bare replacement `SYN` on the same tuple:
 
@@ -202,6 +202,12 @@ If an established flow accepts a valid bare replacement `SYN` on the same tuple:
 - v1 default quarantine window: `3000 ms` (`replacement_quarantine_ms`)
 
 Purpose: avoid poisoning recovery with delayed old-generation packets just after tuple reuse.
+
+Established initiator flows also arm a non-sliding bare-`SYN` replacement protection deadline when the `SYN_SENT` handshake accepts a clean `SYN|ACK`.
+During that deadline, a bare aligned replacement `SYN` is silently dropped before generic replacement handling.
+This covers delayed loser `SYN` packets from simultaneous initiation without changing responder duplicate-`SYN` handling.
+`replacement_protect_ms = 0` means auto: use `min(replacement_quarantine_ms, handshake_timeout_ms * max(1, handshake_retries / 2))`.
+A non-zero `replacement_protect_ms` is used directly, and replacement behavior resumes unchanged after the deadline expires.
 
 ### 5.4 Simultaneous initiation policy
 
@@ -240,6 +246,7 @@ Each flow stores:
 - responder control-response pending-ACK / pending-release flag
 - retransmit timer state
 - idle timestamp
+- initiator bare-`SYN` replacement-protection deadline
 - refcount and lock
 
 ### 6.1 Initiator states
@@ -269,6 +276,7 @@ On valid `SYN|ACK`:
 - else if queued UDP exists: send `ACK + first queued UDP payload`
 - else: send pure final `ACK`
 - if both `handshake_request` and `handshake_response` configured: arm ignore slot for payload starting at `responder_seq + 1`
+- arm the non-sliding established-initiator replacement-protection deadline
 - transition immediately to `ESTABLISHED`
 
 #### `ESTABLISHED`
@@ -289,9 +297,11 @@ Behavior:
 Inbound flag priority in established state:
 
 1. `RST` → destroy local state silently
-2. bare aligned `SYN` with no payload, no `ACK`, and no other control flags → accept as generation replacement, move old generation into quarantine, create new responder `SYN_RCVD`, send `SYN|ACK`
-3. any other packet with `SYN` set → send `RST|ACK`, destroy local state
-4. otherwise → normal data processing
+2. duplicate current-generation `SYN|ACK` → send pure `ACK`, keep current generation
+3. bare aligned `SYN` while the established-initiator replacement protection deadline is active → silently drop, keep current generation
+4. bare aligned `SYN` with no payload, no `ACK`, and no other control flags → accept as generation replacement, move old generation into quarantine, create new responder `SYN_RCVD`, send `SYN|ACK`
+5. any other packet with `SYN` set → send `RST|ACK`, destroy local state
+6. otherwise → normal data processing
 
 ### 6.2 Responder states
 
@@ -341,12 +351,13 @@ Behavior:
 - accepted inbound packet refreshes liveness suspicion
 - keepalive, liveness failure, and hard idle teardown use the same policy as initiator-established flows
 
-Inbound flag priority matches initiator-established handling:
+Inbound flag priority:
 
 1. `RST` → destroy flow silently
-2. bare aligned replacement `SYN` with no payload, no `ACK`, and no other control flags → replace generation, quarantine old generation, create new `SYN_RCVD`, send `SYN|ACK`
-3. any other packet with `SYN` set → send `RST|ACK`, destroy flow
-4. otherwise → normal data processing
+2. duplicate current-generation bare `SYN` → re-emit `SYN|ACK`, keep current generation
+3. bare aligned replacement `SYN` with no payload, no `ACK`, and no other control flags → replace generation, quarantine old generation, create new `SYN_RCVD`, send `SYN|ACK`
+4. any other packet with `SYN` set → send `RST|ACK`, destroy flow
+5. otherwise → normal data processing
 
 ## 7. Failure policy
 

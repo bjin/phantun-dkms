@@ -68,6 +68,7 @@ static unsigned int hard_idle_timeout_sec = PHANTUN_DEFAULT_HARD_IDLE_TIMEOUT_SE
 static unsigned int reopen_guard_bytes = PHANTUN_DEFAULT_REOPEN_GUARD_BYTES;
 static unsigned int half_open_limit = PHANTUN_DEFAULT_HALF_OPEN_LIMIT;
 static unsigned int replacement_quarantine_ms = PHANTUN_DEFAULT_REPLACEMENT_QUARANTINE_MS;
+static unsigned int replacement_protect_ms = PHANTUN_DEFAULT_REPLACEMENT_PROTECT_MS;
 module_param_array_named(managed_local_ports, managed_local_ports, uint, &managed_local_ports_count,
                          0444);
 MODULE_PARM_DESC(managed_local_ports, "Comma-separated local UDP/TCP ports managed by phantun");
@@ -112,6 +113,10 @@ MODULE_PARM_DESC(half_open_limit, "Maximum concurrent half-open flows per networ
 module_param(replacement_quarantine_ms, uint, 0444);
 MODULE_PARM_DESC(replacement_quarantine_ms,
                  "Previous-generation quarantine window in milliseconds after tuple replacement");
+module_param(replacement_protect_ms, uint, 0444);
+MODULE_PARM_DESC(replacement_protect_ms,
+                 "Established initiator bare-SYN replacement protection window in milliseconds; "
+                 "0 uses auto formula");
 
 static struct phantun_config phantun_cfg;
 static void *phantun_alloc_req;
@@ -937,6 +942,30 @@ static bool phantun_tcp_is_syn_rcvd_final_ack(const struct pht_l4_view *view, u3
 
 static bool phantun_tcp_syn_is_aligned(const struct pht_l4_view *view) {
     return view && ntohl(view->tcp->seq) % 4095U == 0;
+}
+
+static bool phantun_flow_should_drop_protected_replacement_syn(struct pht_flow *flow,
+                                                               const struct pht_l4_view *view) {
+    unsigned long now;
+    bool drop = false;
+
+    if (!flow || !view || !phantun_tcp_is_bare_syn(view) || !phantun_tcp_syn_is_aligned(view))
+        return false;
+
+    now = jiffies;
+    spin_lock_bh(&flow->lock);
+    if (flow->state != PHT_FLOW_STATE_ESTABLISHED || flow->role != PHT_FLOW_ROLE_INITIATOR ||
+        !flow->replacement_protect_active)
+        goto out;
+    if (time_before(now, flow->replacement_protect_until_jiffies)) {
+        drop = true;
+        goto out;
+    }
+    flow->replacement_protect_active = false;
+
+out:
+    spin_unlock_bh(&flow->lock);
+    return drop;
 }
 
 /* Local reopen chooses a new aligned ISN outside reopen_guard_bytes of the
@@ -2121,6 +2150,10 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                     pht_flow_put(flow);
                     return NF_DROP;
                 }
+                if (phantun_flow_should_drop_protected_replacement_syn(flow, &view)) {
+                    pht_flow_put(flow);
+                    return NF_DROP;
+                }
                 /* Accept bare replacement SYN as a new generation. Preserve
                  * only the just-replaced seq/ack window so delayed old packets
                  * are dropped quietly during the quarantine window.
@@ -2620,6 +2653,22 @@ static int phantun_validate_handshake_payload_lengths(const struct phantun_confi
     return 0;
 }
 
+static unsigned int phantun_compute_effective_replacement_protect_ms(void) {
+    unsigned int retry_budget;
+    unsigned int handshake_budget_ms;
+
+    if (replacement_protect_ms)
+        return replacement_protect_ms;
+
+    retry_budget = max(1U, handshake_retries / 2U);
+    if (handshake_timeout_ms > UINT_MAX / retry_budget)
+        handshake_budget_ms = UINT_MAX;
+    else
+        handshake_budget_ms = handshake_timeout_ms * retry_budget;
+
+    return min(replacement_quarantine_ms, handshake_budget_ms);
+}
+
 static int phantun_snapshot_config(void) {
     unsigned int i;
     int ret;
@@ -2679,6 +2728,9 @@ static int phantun_snapshot_config(void) {
     phantun_cfg.reopen_guard_bytes = reopen_guard_bytes;
     phantun_cfg.half_open_limit = half_open_limit;
     phantun_cfg.replacement_quarantine_ms = replacement_quarantine_ms;
+    phantun_cfg.replacement_protect_ms = replacement_protect_ms;
+    phantun_cfg.effective_replacement_protect_ms =
+        phantun_compute_effective_replacement_protect_ms();
 
     return 0;
 }
@@ -2718,6 +2770,13 @@ static void phantun_log_config(void) {
     pht_pr_info("  reopen_guard_bytes = %u\n", phantun_cfg.reopen_guard_bytes);
     pht_pr_info("  half_open_limit = %u\n", phantun_cfg.half_open_limit);
     pht_pr_info("  replacement_quarantine_ms = %u\n", phantun_cfg.replacement_quarantine_ms);
+    if (phantun_cfg.replacement_protect_ms == 0)
+        pht_pr_info("  replacement_protect_ms = 0 (auto effective %u)\n",
+                    phantun_cfg.effective_replacement_protect_ms);
+    else
+        pht_pr_info("  replacement_protect_ms = %u (effective %u)\n",
+                    phantun_cfg.replacement_protect_ms,
+                    phantun_cfg.effective_replacement_protect_ms);
 }
 
 static int __init phantun_init(void) {

@@ -47,6 +47,34 @@ def received_messages(payload):
     return payload.get("received", [])
 
 
+def wait_for_probe_packets_after(vm, probe, comment, baseline, label, timeout=5):
+    deadline = time.time() + timeout
+    last = baseline
+    while time.time() < deadline:
+        last = probe.packets(vm, comment)
+        if last > baseline:
+            return last
+        time.sleep(0.1)
+    pytest.fail(f"{label}: expected {comment} packets to increase beyond {baseline}, got {last}")
+
+
+def test_replacement_protect_auto_config_logs_effective_window(phantun_module, dmesg, vm):
+    dmesg.clear()
+    phantun_module.load(
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        replacement_protect_ms=0,
+        replacement_quarantine_ms=7000,
+        handshake_timeout_ms=800,
+        handshake_retries=3,
+    )
+
+    res = vm.run(["lsmod"])
+    if "phantun" not in res.stdout:
+        pytest.fail("phantun module is not loaded after replacement_protect_ms=0")
+    if not dmesg.wait_for("replacement_protect_ms = 0 (auto effective 800)", timeout=5):
+        pytest.fail("Module did not log replacement_protect_ms=0 auto effective window from handshake budget")
+
+
 def test_liveness_timeout_recovers(phantun_module, vm):
     load_recovery_module(phantun_module)
     ensure_netns_topology(vm)
@@ -492,6 +520,329 @@ def test_established_bare_syn_replacement(phantun_module, vm):
             ["ip", "netns", "exec", NS_B, "nft", "delete", "table", "inet", "filter"],
             check=False,
         )
+
+
+def test_replacement_protect_suppresses_initiator_bare_syn_then_expires(phantun_module, vm):
+    protect_ms = 5000
+    load_recovery_module(phantun_module, replacement_protect_ms=protect_ms)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    response_probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "flags_expr": "syn | ack",
+                "comment": "protect_synack",
+            },
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "flags_expr": "rst",
+                "comment": "protect_rst",
+            },
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "echo_server",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+            "timeout_sec": 20,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        client_result_1 = run_netns_scenario(
+            vm,
+            NS_A,
+            "echo_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["msg1"],
+            },
+        )
+        assert_completed(client_result_1, "client send 1")
+
+        baseline_synack = response_probe.packets(vm, "protect_synack")
+        baseline_rst = response_probe.packets(vm, "protect_rst")
+        stale_syn = run_netns_scenario(
+            vm,
+            NS_B,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "seq": 4095 * 1001,
+                "flags": "syn",
+            },
+        )
+        assert_completed(stale_syn, "inject protected stale SYN")
+        time.sleep(0.5)
+
+        if response_probe.packets(vm, "protect_synack") != baseline_synack:
+            pytest.fail("protected established-initiator bare SYN should not emit SYN|ACK")
+        if response_probe.packets(vm, "protect_rst") != baseline_rst:
+            pytest.fail("protected established-initiator bare SYN should not emit RST")
+
+        client_result_2 = run_netns_scenario(
+            vm,
+            NS_A,
+            "echo_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["msg2"],
+            },
+        )
+        assert_completed(client_result_2, "client send 2 after protected SYN")
+        client_data_2 = parse_guest_json(client_result_2.stdout, "client send 2 stdout")
+        if client_data_2.get("echoed") != ["msg2"]:
+            pytest.fail(f"protected stale SYN disrupted established flow: {client_data_2!r}")
+
+        time.sleep((protect_ms / 1000) + 0.5)
+        baseline_expired_synack = response_probe.packets(vm, "protect_synack")
+        expired_syn = run_netns_scenario(
+            vm,
+            NS_B,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "seq": 4095 * 1002,
+                "flags": "syn",
+            },
+        )
+        assert_completed(expired_syn, "inject expired-window SYN")
+        wait_for_probe_packets_after(
+            vm,
+            response_probe,
+            "protect_synack",
+            baseline_expired_synack,
+            "expired replacement protection",
+        )
+
+        server_result = server.communicate(timeout=15)
+        assert_completed(server_result, "server")
+        server_data = parse_guest_json(server_result.stdout, "server stdout")
+        if received_messages(server_data) != ["msg1", "msg2"]:
+            pytest.fail(f"unexpected messages after protected stale SYN: {received_messages(server_data)!r}")
+    finally:
+        response_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_established_duplicate_current_generation_syn_dispatch(phantun_module, vm):
+    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, keepalive_interval_sec=60)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    syn_ready = f"/tmp/phantun-capture-syn-{uuid.uuid4().hex}"
+    synack_ready = f"/tmp/phantun-capture-synack-{uuid.uuid4().hex}"
+    capture_syn = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "ready_file": syn_ready,
+            "timeout_sec": 10,
+        },
+    )
+    capture_synack = spawn_netns_scenario(
+        vm,
+        NS_A,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "ready_file": synack_ready,
+            "timeout_sec": 10,
+        },
+    )
+    initiator_probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "flags_expr": "ack",
+                "comment": "dup_synack_ack",
+            },
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "flags_expr": "rst",
+                "comment": "dup_synack_rst",
+            },
+        ],
+    )
+    responder_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "dup_syn_synack",
+            },
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst",
+                "comment": "dup_syn_rst",
+            },
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "echo_server",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "timeout_sec": 10,
+        },
+    )
+
+    try:
+        wait_for_guest_ready_file(vm, syn_ready, timeout=5)
+        wait_for_guest_ready_file(vm, synack_ready, timeout=5)
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "echo_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["msg1"],
+            },
+        )
+        assert_completed(client_result, "client send")
+        server_result = server.communicate(timeout=10)
+        assert_completed(server_result, "server")
+
+        syn_result = capture_syn.communicate(timeout=10)
+        synack_result = capture_synack.communicate(timeout=10)
+        assert_completed(syn_result, "capture opening SYN")
+        assert_completed(synack_result, "capture opening SYN|ACK")
+        syn_data = parse_guest_json(syn_result.stdout, "opening SYN")
+        synack_data = parse_guest_json(synack_result.stdout, "opening SYN|ACK")
+        if syn_data.get("flags") != 0x02:
+            pytest.fail(f"expected captured opening SYN, got {syn_data!r}")
+        if synack_data.get("flags") != 0x12:
+            pytest.fail(f"expected captured opening SYN|ACK, got {synack_data!r}")
+
+        baseline_ack = initiator_probe.packets(vm, "dup_synack_ack")
+        baseline_initiator_rst = initiator_probe.packets(vm, "dup_synack_rst")
+        baseline_stats = read_module_stats(vm)
+        duplicate_synack = run_netns_scenario(
+            vm,
+            NS_B,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "seq": synack_data["seq"],
+                "ack": synack_data["ack"],
+                "flags": "syn|ack",
+            },
+        )
+        assert_completed(duplicate_synack, "inject duplicate SYN|ACK")
+        wait_for_probe_packets_after(
+            vm,
+            initiator_probe,
+            "dup_synack_ack",
+            baseline_ack,
+            "duplicate current-generation SYN|ACK",
+        )
+        if initiator_probe.packets(vm, "dup_synack_rst") != baseline_initiator_rst:
+            pytest.fail("duplicate current-generation SYN|ACK should not emit RST")
+        if read_module_stats(vm)["flows_created"] != baseline_stats["flows_created"]:
+            pytest.fail("duplicate current-generation SYN|ACK should not replace the flow")
+
+        baseline_synack = responder_probe.packets(vm, "dup_syn_synack")
+        baseline_responder_rst = responder_probe.packets(vm, "dup_syn_rst")
+        baseline_stats = read_module_stats(vm)
+        duplicate_syn = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "seq": syn_data["seq"],
+                "flags": "syn",
+            },
+        )
+        assert_completed(duplicate_syn, "inject duplicate SYN")
+        wait_for_probe_packets_after(
+            vm,
+            responder_probe,
+            "dup_syn_synack",
+            baseline_synack,
+            "duplicate current-generation SYN",
+        )
+        if responder_probe.packets(vm, "dup_syn_rst") != baseline_responder_rst:
+            pytest.fail("duplicate current-generation SYN should not emit RST")
+        if read_module_stats(vm)["flows_created"] != baseline_stats["flows_created"]:
+            pytest.fail("duplicate current-generation SYN should not replace the flow")
+    finally:
+        initiator_probe.cleanup(vm)
+        responder_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
 
 
 def test_replacement_quarantine_drops_delayed_old_generation_packet(phantun_module, vm):

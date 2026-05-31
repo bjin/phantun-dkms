@@ -53,8 +53,8 @@ struct pht_flow {
     /*
      * lock protects mutable protocol state: state/seq/ack tracking, persistent
      * local-outbound transmit policy metadata, quarantine/drop-next shaping
-     * flags, the one-skb queue, retry counters, timestamps, and retransmit
-     * bookkeeping.
+     * flags, replacement-protection deadline, the one-skb queue, retry
+     * counters, timestamps, and retransmit bookkeeping.
      *
      * It does not protect refs, hash/list membership, the timer object itself,
      * or immutable identity/config fields set at create time.
@@ -110,6 +110,7 @@ struct pht_flow {
     unsigned long last_inbound_jiffies;
     unsigned long retransmit_at_jiffies;
     unsigned long quarantine_until_jiffies;
+    unsigned long replacement_protect_until_jiffies;
     unsigned int keepalives_sent;
     /* Last successful routed egress device toward the remote peer. Used only
      * for best-effort invalidation when that device goes away.
@@ -125,6 +126,7 @@ struct pht_flow {
     bool response_pending_ack;
     bool retransmit_armed;
     bool quarantine_prev_active;
+    bool replacement_protect_active;
     bool half_open_tracked;
     /* Latched GC reason for hard-idle teardown. */
     bool hard_expired;
@@ -161,6 +163,7 @@ struct pht_flow_table {
     unsigned long keepalive_interval_jiffies;
     unsigned long hard_idle_timeout_jiffies;
     unsigned long handshake_timeout_jiffies;
+    unsigned long replacement_protect_jiffies;
     unsigned long gc_interval_jiffies;
     unsigned int keepalive_misses;
     unsigned int handshake_retries;

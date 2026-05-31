@@ -262,6 +262,7 @@ Validation rules:
 | `reopen_guard_bytes` | `4194304` | Minimum sequence-space distance before reopening same tuple. |
 | `half_open_limit` | `4096` | Maximum concurrent half-open flows per network namespace. New SYN-created or outbound half-open flows beyond this limit are rejected until existing half-open flows establish or time out. |
 | `replacement_quarantine_ms` | `3000` | Previous-generation quarantine window after tuple replacement. Matching old-generation packets are silently dropped during this window. |
+| `replacement_protect_ms` | `0` (auto) | Established-initiator bare-SYN replacement protection window. During the window, aligned bare replacement SYNs to an established initiator are silently dropped to suppress stale simultaneous-initiation loser SYNs. After the window expires, normal replacement handling resumes. |
 
 ### Shaping payload formats
 

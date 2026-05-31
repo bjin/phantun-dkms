@@ -132,6 +132,11 @@ let
       parameter = "replacement_quarantine_ms";
       value = cfg.replacementQuarantineMs;
     }
+    {
+      option = "replacementProtectMs";
+      parameter = "replacement_protect_ms";
+      value = cfg.replacementProtectMs;
+    }
   ];
 
   numericOptions = positiveNumericOptions ++ [
@@ -271,6 +276,12 @@ in
       type = nullableIntType;
       default = null;
       description = "Positive previous-generation quarantine window in milliseconds, or null to use the kernel default.";
+    };
+
+    replacementProtectMs = mkOption {
+      type = nullableIntType;
+      default = null;
+      description = "Positive established-initiator replacement protection window in milliseconds, or null to omit replacement_protect_ms and use the kernel default.";
     };
 
     rawKernelParameters = mkOption {

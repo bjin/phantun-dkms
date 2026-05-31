@@ -19,6 +19,7 @@
 #define PHANTUN_DEFAULT_REOPEN_GUARD_BYTES 4194304U
 #define PHANTUN_DEFAULT_HALF_OPEN_LIMIT 4096U
 #define PHANTUN_DEFAULT_REPLACEMENT_QUARANTINE_MS 3000U
+#define PHANTUN_DEFAULT_REPLACEMENT_PROTECT_MS 0U
 #define PHANTUN_PRE_ROUTING_PRIORITY (-400)
 #define PHANTUN_LOCAL_OUT_PRIORITY (-199)
 #define PHT_FAMILY_IPV4 BIT(0)
@@ -55,6 +56,8 @@ struct phantun_config {
     unsigned int reopen_guard_bytes;
     unsigned int half_open_limit;
     unsigned int replacement_quarantine_ms;
+    unsigned int replacement_protect_ms;
+    unsigned int effective_replacement_protect_ms;
 };
 
 #endif
