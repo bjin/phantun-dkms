@@ -101,7 +101,18 @@ Per flow, roles are only:
 - **initiator**: creates the flow because local outbound UDP appears
 - **responder**: accepts an inbound fake-TCP `SYN`
 
-### 4.2 Interception selectors
+### 4.2 Namespace attachment
+
+`managed_netns=init|all` is the outer attachment boundary.
+
+| Value | Effect |
+|---|---|
+| `init` | Default. Attach only to `init_net`. |
+| `all` | Attach to every network namespace through pernet init. |
+
+Only selected namespaces receive a flow table, per-net netdevice notifier, reserved local TCP sockets, and IPv4/IPv6 netfilter hooks. The selector rules below still decide traffic ownership inside each selected namespace. Skipped namespaces must remain invisible to global address notifiers and exit as no-ops because their pernet storage has no initialized flow table.
+
+### 4.3 Interception selectors
 
 The translator owns traffic based on two optional selector lists.
 A packet must satisfy **every configured selector**.
@@ -137,21 +148,21 @@ Peer-only caveat:
 - inbound TCP ownership becomes broad for that remote `IPv4:port` or `[IPv6]:port`
 - use peer-only mode only when that remote peer is dedicated to this translator
 
-### 4.3 Optional local TCP reservation guard
+### 4.4 Optional local TCP reservation guard
 
 Local-only mode selects inbound fake TCP by destination port, but selector ownership alone does not make the module the real TCP owner of that port. Operators that want the kernel to reject competing TCP listeners can configure `reserved_local_ports`.
 
 Rules:
 
 - effective only when `managed_local_ports` is set and `managed_remote_peers` is empty
-- during `phantun_net_init()`, the module attempts wildcard TCP binds for each effective reserved port and enabled family in that netns (`0.0.0.0:port`, `[::]:port`)
+- during `phantun_net_init()`, the module attempts wildcard TCP binds for each effective reserved port and enabled family in selected netns (`0.0.0.0:port`, `[::]:port`)
 - those sockets stay bound until `phantun_net_exit()`
 - bind failures are logged and do not disable interception in that namespace
 - wildcard bind intentionally blocks loopback listeners on the same port too
 
 This is a defensive ownership guard only. The module does **not** call `listen()`, does **not** accept connections, and does **not** behave like a real TCP service endpoint.
 
-### 4.4 Default inbound raw-UDP drop
+### 4.5 Default inbound raw-UDP drop
 
 By default, raw inbound UDP that matches configured selectors, is destined for local delivery in the current host/netns, and arrives from a non-loopback device is dropped in `PRE_ROUTING`.
 
@@ -524,6 +535,7 @@ Design constraints:
 - up to 64 `managed_remote_peers`
 - at least one selector list must be non-empty
 - `ip_families` is one of `both`, `ipv4`, `ipv6`; default `both`
+- `managed_netns` is one of `init`, `all`; default `init`
 
 Future control plane direction:
 

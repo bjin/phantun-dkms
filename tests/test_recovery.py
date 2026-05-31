@@ -35,6 +35,7 @@ REQ = "HSREQ42"
 def load_recovery_module(phantun_module, **kwargs):
     # Set keepalive interval to 1s to test liveness.
     phantun_module.load(
+        managed_netns="all",
         managed_local_ports=MANAGED_LOCAL_PORTS,
         keepalive_interval_sec=1,
         keepalive_misses=2,
@@ -282,7 +283,7 @@ def test_liveness_reinitiates_flow_with_queued_packet(phantun_module, vm):
 
 
 def test_syn_isn_tie_break(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -534,6 +535,7 @@ def test_established_bare_syn_replacement(phantun_module, vm):
 def test_replacement_protect_suppresses_initiator_bare_syn_then_expires(phantun_module, vm):
     protect_ms = 5000
     phantun_module.load(
+        managed_netns="all",
         managed_local_ports=MANAGED_LOCAL_PORTS,
         keepalive_interval_sec=60,
         keepalive_misses=2,
@@ -681,7 +683,7 @@ def test_replacement_protect_suppresses_initiator_bare_syn_then_expires(phantun_
 
 
 def test_established_duplicate_current_generation_syn_dispatch(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, keepalive_interval_sec=60)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, keepalive_interval_sec=60)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):

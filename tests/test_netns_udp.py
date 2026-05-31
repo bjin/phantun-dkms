@@ -35,7 +35,7 @@ SECONDARY_ADDR_B = "10.200.0.20"
 
 
 def load_netns_module(phantun_module):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
 
 
 # Build small INPUT policies that mimic stateful host firewalls. The reply path
@@ -514,6 +514,7 @@ def test_netns_outbound_mark_propagates_to_fake_tcp(phantun_module, vm):
 
 def test_netns_inbound_metadata_is_reply_scoped(phantun_module, vm):
     phantun_module.load(
+        managed_netns="all",
         managed_local_ports=MANAGED_LOCAL_PORTS,
         handshake_timeout_ms=200,
         handshake_retries=3,
@@ -722,6 +723,7 @@ def test_netns_established_payload_ack_uses_inbound_reply_metadata(phantun_modul
 
 def test_netns_half_open_responder_retransmit_uses_queued_udp_metadata(phantun_module, vm):
     phantun_module.load(
+        managed_netns="all",
         managed_local_ports=MANAGED_LOCAL_PORTS,
         handshake_timeout_ms=1000,
         handshake_retries=6,
@@ -861,7 +863,7 @@ def test_netns_old_reinject_mark_constant_does_not_bypass_raw_udp_drop(phantun_m
     old_public_mark = 0x50485455
     ready_file = f"/tmp/phantun_old_reinject_{uuid.uuid4().hex}"
 
-    phantun_module.load(managed_local_ports=str(dst_port))
+    phantun_module.load(managed_netns="all", managed_local_ports=str(dst_port))
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -920,6 +922,7 @@ def test_netns_old_reinject_mark_constant_does_not_bypass_raw_udp_drop(phantun_m
 
 def test_netns_collision_loser_retransmit_preserves_outbound_metadata(phantun_module, vm):
     phantun_module.load(
+        managed_netns="all",
         managed_local_ports=MANAGED_LOCAL_PORTS,
         handshake_timeout_ms=300,
         handshake_retries=10,

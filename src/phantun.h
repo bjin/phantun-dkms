@@ -31,12 +31,18 @@
 #define pht_pr_info(fmt, ...) pr_info(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
 #define pht_pr_debug(fmt, ...) pr_debug(PHANTUN_MODULE_NAME ": " fmt, ##__VA_ARGS__)
 
+enum pht_managed_netns {
+    PHT_MANAGED_NETNS_INIT,
+    PHT_MANAGED_NETNS_ALL,
+};
+
 struct pht_managed_peer {
     struct pht_addr addr;
     __be16 port;
 };
 
 struct phantun_config {
+    enum pht_managed_netns managed_netns;
     unsigned int enabled_families;
     u16 managed_local_ports[PHANTUN_MAX_MANAGED_PORTS];
     unsigned int managed_local_ports_count;

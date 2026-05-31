@@ -64,6 +64,7 @@ def assert_tcp_bind_errno(result, expected_errno, bind_addr, bind_port):
 
 def test_sysfs_stats_exist_and_increment(phantun_module, vm):
     phantun_module.load(
+        managed_netns="all",
         managed_local_ports=MANAGED_LOCAL_PORTS,
         handshake_request=REQ,
         handshake_response=RESP,
@@ -147,7 +148,7 @@ def test_sysfs_stats_exist_and_increment(phantun_module, vm):
 
 
 def test_oversized_outbound_udp_is_dropped_without_tearing_down_flow(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     src_port = PORTS_A[0]
@@ -205,6 +206,7 @@ def test_oversized_outbound_udp_is_dropped_without_tearing_down_flow(phantun_mod
 
 def test_managed_remote_peers_filter_blocks_unmatched_remote_peer(phantun_module, vm):
     phantun_module.load(
+        managed_netns="all",
         managed_local_ports=MANAGED_LOCAL_PORTS,
         managed_remote_peers="10.200.1.2:3333",
     )
@@ -261,6 +263,7 @@ def test_managed_remote_peers_filter_blocks_unmatched_remote_peer(phantun_module
 
 def test_managed_remote_peers_filter_blocks_unmatched_peer_port(phantun_module, vm):
     phantun_module.load(
+        managed_netns="all",
         managed_local_ports=MANAGED_LOCAL_PORTS,
         managed_remote_peers="10.200.0.2:5555",
     )
@@ -320,7 +323,7 @@ def test_peer_only_mode_translates_matching_peers(phantun_module, vm):
     dst_port = PORTS_B[0]
     managed_peers = f"{NS_ADDR_A}:{src_port},{NS_ADDR_B}:{dst_port}"
 
-    phantun_module.load(managed_remote_peers=managed_peers)
+    phantun_module.load(managed_netns="all", managed_remote_peers=managed_peers)
     ensure_netns_topology(vm)
 
     probe_a = make_netns_output_probe(vm, NS_A, [(NS_ADDR_A, src_port, NS_ADDR_B, dst_port)])
@@ -383,6 +386,7 @@ def test_intersection_mode_requires_local_and_remote_match(phantun_module, vm):
     dst_port = PORTS_B[0]
 
     phantun_module.load(
+        managed_netns="all",
         managed_local_ports="5555",
         managed_remote_peers=f"{NS_ADDR_B}:{dst_port}",
     )
@@ -490,7 +494,7 @@ def test_inbound_udp_to_managed_local_port_is_dropped(phantun_module, vm):
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
 
-    phantun_module.load(managed_local_ports=str(dst_port))
+    phantun_module.load(managed_netns="all", managed_local_ports=str(dst_port))
     ensure_netns_topology(vm)
     baseline_stats = read_module_stats(vm)
 
@@ -582,7 +586,7 @@ def test_reserved_local_ports_filters_to_managed_local_ports_only(phantun_module
     assert_tcp_bind_ok(unreserved_probe, "0.0.0.0", 3333)
 
 
-def test_reserved_local_ports_applies_to_new_netns(phantun_module, vm):
+def test_reserved_local_ports_default_init_mode_skips_new_netns(phantun_module, vm):
     managed_port = PORTS_A[0]
     namespace = "pht-reserve-after-load"
 
@@ -593,6 +597,90 @@ def test_reserved_local_ports_applies_to_new_netns(phantun_module, vm):
     try:
         run_in_netns(vm, namespace, ["ip", "link", "set", "lo", "up"])
         probe = run_tcp_bind_probe(vm, "0.0.0.0", managed_port, namespace=namespace)
+        assert_tcp_bind_ok(probe, "0.0.0.0", managed_port)
+    finally:
+        vm.run(["ip", "netns", "del", namespace], check=False)
+
+
+def test_reserved_local_ports_all_mode_applies_to_new_netns(phantun_module, vm):
+    managed_port = PORTS_A[0]
+    namespace = "pht-reserve-after-load"
+
+    phantun_module.load(
+        managed_netns="all",
+        managed_local_ports=str(managed_port),
+        reserved_local_ports="all",
+    )
+    vm.run(["ip", "netns", "del", namespace], check=False)
+    vm.run(["ip", "netns", "add", namespace])
+
+    try:
+        run_in_netns(vm, namespace, ["ip", "link", "set", "lo", "up"])
+        probe = run_tcp_bind_probe(vm, "0.0.0.0", managed_port, namespace=namespace)
         assert_tcp_bind_errno(probe, errno.EADDRINUSE, "0.0.0.0", managed_port)
     finally:
         vm.run(["ip", "netns", "del", namespace], check=False)
+
+
+def test_default_init_mode_leaves_non_init_netns_udp_untranslated(phantun_module, vm):
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+
+    phantun_module.load(managed_local_ports=str(src_port))
+    ensure_netns_topology(vm)
+    baseline_stats = read_module_stats(vm)
+    probe = make_netns_output_probe(
+        vm,
+        NS_A,
+        [(NS_ADDR_A, src_port, NS_ADDR_B, dst_port)],
+        udp_action="accept",
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        client = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["default-init-raw-udp"],
+            },
+            timeout=10,
+        )
+        server_result = server.communicate(timeout=10)
+        assert_completed(client, "default init-mode client")
+        assert_completed(server_result, "default init-mode server")
+
+        server_data = parse_guest_json(server_result.stdout, "default init-mode server stdout")
+        if [entry["message"] for entry in server_data.get("received", [])] != [
+            "default-init-raw-udp",
+        ]:
+            pytest.fail(f"unexpected default init-mode server payloads: {server_data!r}")
+
+        udp_packets = probe.packets(vm, probe_comment("udp", NS_ADDR_A, src_port, NS_ADDR_B, dst_port))
+        tcp_packets = probe.packets(vm, probe_comment("tcp", NS_ADDR_A, src_port, NS_ADDR_B, dst_port))
+        if udp_packets == 0:
+            pytest.fail("expected raw UDP to leave a non-init netns in default managed_netns=init mode")
+        if tcp_packets != 0:
+            pytest.fail(f"expected no fake-TCP output in default managed_netns=init mode, got {tcp_packets}")
+
+        stats = read_module_stats(vm)
+        if stats != baseline_stats:
+            pytest.fail(f"default init-mode non-init traffic must not touch module stats: {stats!r}")
+    finally:
+        probe.cleanup(vm)
+        cleanup_netns_topology(vm)

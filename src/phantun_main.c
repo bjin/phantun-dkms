@@ -58,6 +58,7 @@ static char *managed_remote_peers[PHANTUN_MAX_MANAGED_PEERS];
 static int managed_remote_peers_count;
 static char *reserved_local_ports;
 static char *ip_families = "both";
+static char *managed_netns = "init";
 static char *handshake_request;
 static char *handshake_response;
 static unsigned int handshake_timeout_ms = PHANTUN_DEFAULT_HANDSHAKE_TIMEOUT_MS;
@@ -84,6 +85,9 @@ MODULE_PARM_DESC(reserved_local_ports,
                  "reserves every managed_local_ports entry");
 module_param(ip_families, charp, 0444);
 MODULE_PARM_DESC(ip_families, "IP families to translate: both, ipv4, or ipv6");
+module_param(managed_netns, charp, 0444);
+MODULE_PARM_DESC(managed_netns,
+                 "Network namespaces to attach to: init (initial netns only) or all");
 module_param(handshake_request, charp, 0444);
 MODULE_PARM_DESC(handshake_request,
                  "Optional initiator control payload sent as the first fake-TCP payload (plain "
@@ -130,6 +134,13 @@ static struct notifier_block phantun_inet6addr_nb;
 struct phantun_net {
     struct pht_flow_table flows;
     struct notifier_block netdev_nb;
+    bool flow_table_ready;
+    bool active;
+    bool netdev_notifier_registered;
+    bool hooks_v4_registered;
+#if IS_ENABLED(CONFIG_IPV6)
+    bool hooks_v6_registered;
+#endif
     struct socket *reserved_local_socks_v4[PHANTUN_MAX_MANAGED_PORTS];
 #if IS_ENABLED(CONFIG_IPV6)
     struct socket *reserved_local_socks_v6[PHANTUN_MAX_MANAGED_PORTS];
@@ -145,7 +156,31 @@ static struct pht_flow_table *phantun_net_flows(const struct net *net) {
         return NULL;
 
     pnet = net_generic(net, phantun_net_id);
-    return pnet ? &pnet->flows : NULL;
+    return pnet && pnet->active ? &pnet->flows : NULL;
+}
+
+static struct pht_flow_table *phantun_net_hook_flows(const struct net *net) {
+    struct phantun_net *pnet;
+
+    if (!net)
+        return NULL;
+
+    pnet = net_generic(net, phantun_net_id);
+    return pnet && pnet->flow_table_ready ? &pnet->flows : NULL;
+}
+
+static bool phantun_netns_selected(const struct net *net) {
+    if (!net)
+        return false;
+
+    switch (phantun_cfg.managed_netns) {
+    case PHT_MANAGED_NETNS_ALL:
+        return true;
+    case PHT_MANAGED_NETNS_INIT:
+        return net_eq(net, &init_net);
+    default:
+        return false;
+    }
 }
 
 /* Invalidate only on topology changes that break the current source identity or
@@ -1321,7 +1356,7 @@ static int phantun_reinject_inbound_payload(const struct pht_endpoint_pair *ep,
     if (!net || !dev || dev_net(dev) != net)
         return -EINVAL;
 
-    flows = phantun_net_flows(net);
+    flows = phantun_net_hook_flows(net);
     if (!flows)
         return -EINVAL;
 
@@ -1435,7 +1470,7 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
     if (!state || !skb)
         return NF_ACCEPT;
 
-    flows = phantun_net_flows(state->net);
+    flows = phantun_net_hook_flows(state->net);
     if (!flows)
         return NF_ACCEPT;
 
@@ -1693,7 +1728,7 @@ static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb
     if (!state || !skb)
         return NF_ACCEPT;
 
-    flows = phantun_net_flows(state->net);
+    flows = phantun_net_hook_flows(state->net);
     if (!flows)
         return NF_ACCEPT;
 
@@ -1772,7 +1807,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     if (phantun_pre_routing_uses_loopback_dev(skb, state))
         return NF_ACCEPT;
 
-    flows = phantun_net_flows(state->net);
+    flows = phantun_net_hook_flows(state->net);
     if (!flows)
         return NF_DROP;
 
@@ -2374,9 +2409,12 @@ static int __net_init phantun_net_init(struct net *net) {
     struct phantun_net *pnet = net_generic(net, phantun_net_id);
     struct pht_flow_table *flows;
     int ret;
-
     if (!pnet)
         return -EINVAL;
+
+    memset(pnet, 0, sizeof(*pnet));
+    if (!phantun_netns_selected(net))
+        return 0;
 
     flows = &pnet->flows;
     ret = pht_flow_table_init(flows, net, &phantun_cfg);
@@ -2384,14 +2422,15 @@ static int __net_init phantun_net_init(struct net *net) {
         pht_pr_err("failed to initialize flow table: %d\n", ret);
         return ret;
     }
+    pnet->flow_table_ready = true;
 
     pnet->netdev_nb.notifier_call = phantun_netdev_event;
     ret = register_netdevice_notifier_net(net, &pnet->netdev_nb);
     if (ret) {
         pht_pr_err("failed to register netdevice notifier: %d\n", ret);
-        pht_flow_table_destroy(flows);
-        return ret;
+        goto err_attach;
     }
+    pnet->netdev_notifier_registered = true;
 
     phantun_reserve_configured_local_tcp_ports(pnet, net);
 
@@ -2399,11 +2438,9 @@ static int __net_init phantun_net_init(struct net *net) {
         ret = nf_register_net_hooks(net, phantun_nf_ops_v4, ARRAY_SIZE(phantun_nf_ops_v4));
         if (ret) {
             pht_pr_err("failed to register IPv4 netfilter hooks: %d\n", ret);
-            phantun_release_reserved_local_tcp_ports(pnet);
-            unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
-            pht_flow_table_destroy(flows);
-            return ret;
+            goto err_attach;
         }
+        pnet->hooks_v4_registered = true;
         pht_pr_info(
             "registered IPv4 LOCAL_OUT/PRE_ROUTING hooks and topology notifiers: netns %u\n",
             phantun_netns_id(net));
@@ -2414,38 +2451,67 @@ static int __net_init phantun_net_init(struct net *net) {
         ret = nf_register_net_hooks(net, phantun_nf_ops_v6, ARRAY_SIZE(phantun_nf_ops_v6));
         if (ret) {
             pht_pr_err("failed to register IPv6 netfilter hooks: %d\n", ret);
-            if (phantun_cfg.enabled_families & PHT_FAMILY_IPV4)
-                nf_unregister_net_hooks(net, phantun_nf_ops_v4, ARRAY_SIZE(phantun_nf_ops_v4));
-            phantun_release_reserved_local_tcp_ports(pnet);
-            unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
-            pht_flow_table_destroy(flows);
-            return ret;
+            goto err_attach;
         }
+        pnet->hooks_v6_registered = true;
         pht_pr_info(
             "registered IPv6 LOCAL_OUT/PRE_ROUTING hooks and topology notifiers: netns %u\n",
             phantun_netns_id(net));
     }
 #endif
+    pnet->active = true;
     return 0;
+
+err_attach:
+    pnet->active = false;
+#if IS_ENABLED(CONFIG_IPV6)
+    if (pnet->hooks_v6_registered) {
+        nf_unregister_net_hooks(net, phantun_nf_ops_v6, ARRAY_SIZE(phantun_nf_ops_v6));
+        pnet->hooks_v6_registered = false;
+    }
+#endif
+    if (pnet->hooks_v4_registered) {
+        nf_unregister_net_hooks(net, phantun_nf_ops_v4, ARRAY_SIZE(phantun_nf_ops_v4));
+        pnet->hooks_v4_registered = false;
+    }
+    phantun_release_reserved_local_tcp_ports(pnet);
+    if (pnet->netdev_notifier_registered) {
+        unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
+        pnet->netdev_notifier_registered = false;
+    }
+    if (pnet->flow_table_ready) {
+        pht_flow_table_destroy(flows);
+        pnet->flow_table_ready = false;
+    }
+    return ret;
 }
 
 static void __net_exit phantun_net_exit(struct net *net) {
     struct phantun_net *pnet = net_generic(net, phantun_net_id);
     struct pht_flow_table *flows;
 
-    if (!pnet)
+    if (!pnet || !pnet->flow_table_ready)
         return;
 
-    flows = &pnet->flows;
-    if (phantun_cfg.enabled_families & PHT_FAMILY_IPV4)
+    pnet->active = false;
+    if (pnet->hooks_v4_registered) {
         nf_unregister_net_hooks(net, phantun_nf_ops_v4, ARRAY_SIZE(phantun_nf_ops_v4));
+        pnet->hooks_v4_registered = false;
+    }
 #if IS_ENABLED(CONFIG_IPV6)
-    if (phantun_cfg.enabled_families & PHT_FAMILY_IPV6)
+    if (pnet->hooks_v6_registered) {
         nf_unregister_net_hooks(net, phantun_nf_ops_v6, ARRAY_SIZE(phantun_nf_ops_v6));
+        pnet->hooks_v6_registered = false;
+    }
 #endif
-    unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
-    pht_flow_table_destroy(flows);
+    if (pnet->netdev_notifier_registered) {
+        unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
+        pnet->netdev_notifier_registered = false;
+    }
     phantun_release_reserved_local_tcp_ports(pnet);
+    flows = &pnet->flows;
+    pht_flow_table_destroy(flows);
+    pnet->flow_table_ready = false;
     pht_pr_info("unregistered netfilter hooks and topology notifiers: netns %u\n",
                 phantun_netns_id(net));
 }
@@ -2456,6 +2522,35 @@ static struct pernet_operations phantun_pernet_ops = {
     .init = phantun_net_init,
     .exit = phantun_net_exit,
 };
+
+static const char *phantun_managed_netns_name(enum pht_managed_netns mode) {
+    switch (mode) {
+    case PHT_MANAGED_NETNS_INIT:
+        return "init";
+    case PHT_MANAGED_NETNS_ALL:
+        return "all";
+    default:
+        return "unknown";
+    }
+}
+
+static int phantun_parse_managed_netns(enum pht_managed_netns *mode) {
+    if (!mode)
+        return -EINVAL;
+
+    if (!managed_netns || strcmp(managed_netns, "init") == 0) {
+        *mode = PHT_MANAGED_NETNS_INIT;
+        return 0;
+    }
+
+    if (strcmp(managed_netns, "all") == 0) {
+        *mode = PHT_MANAGED_NETNS_ALL;
+        return 0;
+    }
+
+    pht_pr_err("managed_netns must be one of: init, all\n");
+    return -EINVAL;
+}
 
 static int phantun_parse_ip_families(unsigned int *families) {
     if (!ip_families || strcmp(ip_families, "both") == 0) {
@@ -2522,6 +2617,11 @@ static int phantun_validate_config(void) {
     unsigned int i;
     int ret;
     unsigned int enabled_families;
+    enum pht_managed_netns managed_netns_mode;
+
+    ret = phantun_parse_managed_netns(&managed_netns_mode);
+    if (ret)
+        return ret;
 
     ret = phantun_parse_ip_families(&enabled_families);
     if (ret)
@@ -2753,6 +2853,10 @@ static int phantun_snapshot_config(void) {
     int ret;
 
     memset(&phantun_cfg, 0, sizeof(phantun_cfg));
+    ret = phantun_parse_managed_netns(&phantun_cfg.managed_netns);
+    if (ret)
+        return ret;
+
     ret = phantun_parse_ip_families(&phantun_cfg.enabled_families);
     if (ret)
         return ret;
@@ -2840,6 +2944,7 @@ static void phantun_log_config(void) {
                                                          : "<disabled>");
     }
 
+    pht_pr_info("  managed_netns = %s\n", phantun_managed_netns_name(phantun_cfg.managed_netns));
     pht_pr_info("  ip_families = %s\n", ip_families ? ip_families : "both");
     pht_pr_info("  handshake_timeout_ms = %u\n", phantun_cfg.handshake_timeout_ms);
     pht_pr_info("  handshake_retries = %u\n", phantun_cfg.handshake_retries);

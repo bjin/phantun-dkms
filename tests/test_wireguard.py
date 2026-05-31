@@ -32,7 +32,7 @@ NS_ADDR_B_ROAM = "10.200.0.22"
 
 
 def load_wireguard_module(phantun_module, **kwargs):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, **kwargs)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, **kwargs)
 
 
 def require_wireguard_stack(vm):

@@ -141,6 +141,7 @@ Then import the NixOS module and configure the kernel parameters with typed opti
 ```
 
 `loadOnBoot = false` leaves the package and generated modprobe configuration available for manual `modprobe phantun`, but does not add `phantun` to `boot.kernelModules`.
+Set `services.phantun.managedNetns = "all";` when the managed application intentionally runs outside the initial network namespace.
 
 The `nixpkgs.follows` line makes this module use the consumer flake's `nixpkgs` input instead of keeping a second transitive `nixpkgs` pinned by this repository.
 
@@ -189,6 +190,17 @@ Rules:
 - `managed_remote_peers` is exact-address matching. If a remote host rotates its public source address, including IPv6 privacy-address rotation, update the configured peer address or use `managed_local_ports` for server-like endpoints that should accept any remote address on the owned local port.
 - IPv6 link-local endpoint addresses are not supported. Selector-matched traffic with a link-local local or remote endpoint is rejected instead of translated.
 
+### Namespace attachment
+
+`managed_netns=init|all` controls where the module attaches before selectors are evaluated:
+
+| Value | Meaning |
+|---|---|
+| `init` | Default. Attach only to the initial network namespace (`init_net`), which is the normal host namespace. |
+| `all` | Compatibility mode. Attach to every network namespace created through Linux pernet hooks. |
+
+This boundary controls which namespaces receive flow tables, topology notifiers, optional reserved TCP sockets, and IPv4/IPv6 netfilter hooks. Inside each attached namespace, `managed_local_ports` and `managed_remote_peers` still decide traffic ownership. If your UDP application intentionally runs in a separate network namespace, container namespace, or test namespace, set `managed_netns=all`.
+
 ### Selector modes
 
 | Mode | What you set | Tradeoff |
@@ -219,27 +231,29 @@ For a WireGuard-server-style deployment, this means `managed_local_ports=51820` 
 Rules and trade-offs:
 
 - only honored when `managed_local_ports` is set and `managed_remote_peers` is empty
-- reservation is attempted in **every network namespace where phantun attaches**
+- reservation is attempted in selected namespaces only
 - reservation uses wildcard kernel binds on enabled families: `0.0.0.0:<port>` for IPv4 and `[::]:<port>` for IPv6
 - wildcard reservation also blocks loopback listeners on the same port in that namespace
 - if a port is already occupied, the module stays active and logs that truthfully instead of failing the load
 
-Use `reserved_local_ports` only when you want `phantun-dkms` to proactively claim those fake-TCP ports and you are willing to give up loopback TCP coexistence on those same ports in the affected namespace(s). If you want a local WireGuard server and a user-space Phantun process to share the host by using `127.0.0.1:<port>`, keep this parameter unset.
+Use `reserved_local_ports` only when you want `phantun-dkms` to proactively claim those fake-TCP ports and you are willing to give up loopback TCP coexistence on those same ports in selected namespaces. If you want a local WireGuard server and a user-space Phantun process to share the host by using `127.0.0.1:<port>`, keep this parameter unset.
 
 
 ## Everyday parameters
 
-### Required selectors
+### Selectors and attachment
 
 | Parameter | Type | Default | Meaning |
 |---|---|---:|---|
 | `managed_local_ports` | integer array, max 64 | empty | Local ports the module owns. For WireGuard, usually the local listen port. |
 | `managed_remote_peers` | string array, max 64 | empty | Exact peers in `x.y.z.w:p` or `[IPv6]:p` form. |
 | `ip_families` | string | `both` | Enabled translation families: `both`, `ipv4`, or `ipv6`. |
+| `managed_netns` | string | `init` | Namespace attachment scope: `init` for the initial network namespace only, or `all` for every network namespace. |
 
 Validation rules:
 
 - `managed_local_ports`: `1..65535`
+- `managed_netns`: `init` or `all`
 - `managed_remote_peers`: valid `IPv4:port` or bracketed `[IPv6]:port`
 - at least one selector list required
 
@@ -324,7 +338,7 @@ sudo modprobe phantun
 |---|---|
 | **No TUN plumbing** | Do not copy Phantun's TUN DNAT/SNAT/masquerade setup into this project. |
 | **Conntrack** | The module stays on the normal host path and integrates with conntrack instead of creating a separate TUN routing topology. |
-| **Loopback** | Loopback traffic is still left alone by the data path, so default local Phantun-on-loopback setups can coexist. Only an effective `reserved_local_ports` wildcard bind in pure local-only mode blocks loopback listeners on the same port in that namespace; ignored or failed reservations do not. |
+| **Loopback** | Loopback traffic is still left alone by the data path, so default local Phantun-on-loopback setups can coexist. Only an effective `reserved_local_ports` wildcard bind in pure local-only mode blocks loopback listeners on the same port in a selected namespace; ignored or failed reservations do not. |
 | **MTU** | Same basic fake-TCP packet overhead as Phantun; Phantun's MTU guidance still applies. |
 | **Handshake buffering** | During handshake, the module queues at most **one** outbound UDP packet per flow; later packets may be dropped and must rely on normal app retransmission. |
 | **Shaping semantics** | `handshake_request` / `handshake_response` are hints, not a verified sub-protocol. |
@@ -406,6 +420,7 @@ can increment both an aggregate and a more specific reason counter:
 ## Limits and current status
 
 - IPv4 and IPv6 are supported, with `ip_families=both|ipv4|ipv6` selecting active translation families.
+- By default, hooks are installed only in the initial network namespace. Use `managed_netns=all` for namespace/container workloads that need translation outside `init_net`.
 - Linux kernel compatibility: from `5.10` to `7.1`.
 - Mixed **Phantun** / **`phantun-dkms`** deployments are **untested** and should be treated as **likely non-seamless**.
 - **No FIN close state machine**.

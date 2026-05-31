@@ -209,6 +209,20 @@ def test_module_rejects_missing_selectors(phantun_module, vm):
         vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
 
 
+def test_module_rejects_invalid_managed_netns(phantun_module, vm):
+    phantun_module.unload()
+    vm.run("echo 'options phantun managed_local_ports=1234 managed_netns=bogus' > /etc/modprobe.d/phantun.conf")
+    try:
+        res = vm.run(["modprobe", "phantun"], check=False)
+        assert_modprobe_rejected(res, "invalid managed_netns")
+
+        lsmod = vm.run(["lsmod"])
+        if "phantun" in lsmod.stdout:
+            pytest.fail("phantun module should not remain loaded after invalid managed_netns")
+    finally:
+        vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
+
+
 def test_module_rejects_malformed_managed_remote_peer(phantun_module, vm):
     phantun_module.unload()
     vm.run("echo 'options phantun managed_remote_peers=not-a-peer' > /etc/modprobe.d/phantun.conf")

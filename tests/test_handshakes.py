@@ -30,7 +30,7 @@ RESP_BASE64 = "base64:" + base64.b64encode(RESP.encode()).decode()
 
 
 def load_handshake_module(phantun_module, **kwargs):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, **kwargs)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, **kwargs)
 
 
 def received_messages(payload):

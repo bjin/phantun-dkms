@@ -63,7 +63,7 @@ def wg_endpoint(addr, port):
 
 
 def load_ipv6_module(phantun_module, **kwargs):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, **kwargs)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, **kwargs)
 
 
 def require_runtime_ipv6_support(phantun_module):
@@ -74,7 +74,7 @@ def require_runtime_ipv6_support(phantun_module):
         return
 
     try:
-        phantun_module.load(managed_local_ports=str(PORTS_A[0]), ip_families="ipv6")
+        phantun_module.load(managed_netns="all", managed_local_ports=str(PORTS_A[0]), ip_families="ipv6")
     except subprocess.CalledProcessError as exc:
         phantun_module._runtime_ipv6_supported = False
         phantun_module.unload()
@@ -174,7 +174,9 @@ def test_ipv6_udp_ping_pong_uses_tcp_output_only(phantun_module, vm):
 def test_ipv6_managed_remote_peers_bracketed_peer(phantun_module, vm):
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
-    phantun_module.load(managed_remote_peers=f"[{NS6_ADDR_B}]:{dst_port},[{NS6_ADDR_A}]:{src_port}")
+    phantun_module.load(
+        managed_netns="all", managed_remote_peers=f"[{NS6_ADDR_B}]:{dst_port},[{NS6_ADDR_A}]:{src_port}"
+    )
     ensure_netns_topology(vm, with_ipv6=True)
     require_nft_or_skip(vm)
 
@@ -304,7 +306,7 @@ def test_ip_families_can_disable_one_family(phantun_module, vm):
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
 
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, ip_families="ipv4")
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, ip_families="ipv4")
     ensure_netns_topology(vm, with_ipv6=True)
     require_nft_or_skip(vm)
     probe_v6_plain = make_netns_output_probe(
@@ -321,7 +323,7 @@ def test_ip_families_can_disable_one_family(phantun_module, vm):
         probe_v6_plain.cleanup(vm)
         cleanup_netns_topology(vm)
 
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, ip_families="ipv6")
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, ip_families="ipv6")
     ensure_netns_topology(vm, with_ipv6=True)
     require_nft_or_skip(vm)
     probe_v4_plain = make_netns_output_probe(
@@ -530,7 +532,7 @@ def cleanup_wireguard(vm, key_a_path, key_b_path):
 
 def test_kernel_wireguard_over_ipv6_phantun_translates_underlay(phantun_module, vm):
     require_wireguard_stack(vm)
-    phantun_module.load(managed_local_ports=f"{PORT_A},{PORT_B}")
+    phantun_module.load(managed_netns="all", managed_local_ports=f"{PORT_A},{PORT_B}")
     ensure_netns_topology(vm, with_ipv6=True)
     key_a_path = key_b_path = "/tmp/nonexistent"
     underlay_a = [(NS6_ADDR_A, PORT_A, NS6_ADDR_B, PORT_B)]
@@ -567,7 +569,7 @@ def test_kernel_wireguard_over_ipv6_phantun_translates_underlay(phantun_module, 
 
 def test_kernel_wireguard_roaming_between_ipv4_and_ipv6_endpoints(phantun_module, vm):
     require_wireguard_stack(vm)
-    phantun_module.load(managed_local_ports=f"{PORT_A},{PORT_B}")
+    phantun_module.load(managed_netns="all", managed_local_ports=f"{PORT_A},{PORT_B}")
     ensure_netns_topology(vm, with_ipv6=True)
     key_a_path = key_b_path = "/tmp/nonexistent"
     ipv6_a = (NS6_ADDR_A, PORT_A, NS6_ADDR_B, PORT_B)

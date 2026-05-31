@@ -70,6 +70,7 @@ let
       mkParam "reserved_local_ports" (renderReservedLocalPorts cfg.reservedLocalPorts)
     )
     ++ lib.optional (cfg.ipFamilies != null) (mkParam "ip_families" cfg.ipFamilies)
+    ++ lib.optional (cfg.managedNetns != null) (mkParam "managed_netns" cfg.managedNetns)
     ++ lib.optional (cfg.handshakeRequest != null) (mkParam "handshake_request" cfg.handshakeRequest)
     ++ lib.optional (cfg.handshakeResponse != null) (mkParam "handshake_response" cfg.handshakeResponse)
     ++ lib.concatMap (
@@ -214,6 +215,22 @@ in
       default = null;
       example = "both";
       description = "Enabled translation families, or null to omit ip_families and use the kernel default.";
+    };
+
+    managedNetns = mkOption {
+      type = types.nullOr (
+        types.enum [
+          "init"
+          "all"
+        ]
+      );
+      default = null;
+      example = "all";
+      description = ''
+        Network namespace attachment scope, or null to omit managed_netns and
+        use the kernel default. Set to "all" for workloads intentionally
+        running in non-init network namespaces.
+      '';
     };
 
     handshakeRequest = mkOption {

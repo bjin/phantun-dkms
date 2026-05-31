@@ -34,6 +34,7 @@ REQ = "HSREQ42"
 def load_recovery_module(phantun_module, **kwargs):
     # Set keepalive interval to 1s to test liveness.
     phantun_module.load(
+        managed_netns="all",
         managed_local_ports=MANAGED_LOCAL_PORTS,
         keepalive_interval_sec=1,
         keepalive_misses=2,
@@ -150,7 +151,7 @@ def ensure_forwarding_topology(vm):
 
 
 def test_forwarded_fake_tcp_is_not_owned_in_prerouting(phantun_module, vm):
-    phantun_module.load(managed_local_ports=str(PORTS_B[0]))
+    phantun_module.load(managed_netns="all", managed_local_ports=str(PORTS_B[0]))
     ensure_forwarding_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -230,7 +231,7 @@ def test_forwarded_fake_tcp_is_not_owned_in_prerouting(phantun_module, vm):
 
 
 def test_syn_fin_is_rejected_without_creating_flow(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -288,7 +289,7 @@ def test_syn_fin_is_rejected_without_creating_flow(phantun_module, vm):
 
 
 def test_established_syn_fin_is_not_accepted_as_replacement(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -375,7 +376,9 @@ def test_established_syn_fin_is_not_accepted_as_replacement(phantun_module, vm):
 
 def test_established_invalid_syn_destroys_flow(phantun_module, vm):
     reopen_guard_bytes = 2_100_000_000
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, reopen_guard_bytes=reopen_guard_bytes)
+    phantun_module.load(
+        managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, reopen_guard_bytes=reopen_guard_bytes
+    )
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -563,7 +566,7 @@ def assert_receiver_messages(result, expected, context, timed_out):
 
 
 def test_established_payload_without_ack_is_rejected_with_rstack(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -637,7 +640,7 @@ def test_established_payload_without_ack_is_rejected_with_rstack(phantun_module,
     ),
 )
 def test_established_ack_payload_with_unsupported_flags_tears_down_flow(phantun_module, vm, flags, tag):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -705,7 +708,7 @@ def test_established_ack_payload_with_unsupported_flags_tears_down_flow(phantun_
 
 
 def test_established_ack_psh_payload_is_accepted(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -776,7 +779,7 @@ def test_established_ack_psh_payload_is_accepted(phantun_module, vm):
     ),
 )
 def test_malformed_synack_flags_do_not_complete_syn_sent(phantun_module, vm, flags, tag):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, handshake_timeout_ms=5000)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, handshake_timeout_ms=5000)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -883,7 +886,7 @@ def test_malformed_synack_flags_do_not_complete_syn_sent(phantun_module, vm, fla
 
 
 def test_bad_final_ack_payload_is_rejected_with_rstack(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -973,7 +976,7 @@ def test_bad_final_ack_payload_is_rejected_with_rstack(phantun_module, vm):
     ),
 )
 def test_unsupported_final_ack_flags_are_rejected_with_rstack(phantun_module, vm, flags, tag):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -1073,7 +1076,7 @@ def test_unsupported_final_ack_flags_are_rejected_with_rstack(phantun_module, vm
 
 
 def test_fragmented_syn_is_rejected_without_creating_flow(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -1127,7 +1130,7 @@ def test_fragmented_syn_is_rejected_without_creating_flow(phantun_module, vm):
 
 
 def test_bad_tcp_checksum_syn_is_silently_dropped(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -1206,7 +1209,7 @@ def test_bad_tcp_checksum_syn_is_silently_dropped(phantun_module, vm):
 
 
 def test_bad_tcp_checksum_unknown_ack_is_silently_dropped(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -1287,7 +1290,7 @@ def test_bad_tcp_checksum_unknown_ack_is_silently_dropped(phantun_module, vm):
 
 
 def test_unknown_synack_is_rejected_without_creating_flow(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -1372,7 +1375,7 @@ def test_unknown_synack_is_rejected_without_creating_flow(phantun_module, vm):
 
 
 def test_unknown_ack_payload_is_rejected_with_rstack(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -1452,7 +1455,7 @@ def test_unknown_ack_payload_is_rejected_with_rstack(phantun_module, vm):
 
 
 def test_oversized_established_payload_is_rejected_and_counted(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -1557,7 +1560,7 @@ def test_oversized_established_payload_is_rejected_and_counted(phantun_module, v
 
 
 def test_oversized_final_ack_payload_is_rejected_and_counted(phantun_module, vm):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):

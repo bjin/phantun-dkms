@@ -31,7 +31,7 @@ RESP = "HSRESP42"
 
 
 def load_loss_module(phantun_module, **kwargs):
-    phantun_module.load(managed_local_ports=MANAGED_LOCAL_PORTS, **kwargs)
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, **kwargs)
 
 
 def received_messages(payload):
@@ -325,6 +325,7 @@ def test_synack_loss_is_retried(phantun_module, vm):
 
 def test_half_open_retry_exhaustion_releases_flow_slot(phantun_module, vm):
     phantun_module.load(
+        managed_netns="all",
         managed_local_ports=MANAGED_LOCAL_PORTS,
         handshake_timeout_ms=200,
         handshake_retries=1,
@@ -407,6 +408,7 @@ def test_half_open_retry_exhaustion_releases_flow_slot(phantun_module, vm):
 
 def test_responder_half_open_limit_rejects_excess_bare_syns(phantun_module, vm):
     phantun_module.load(
+        managed_netns="all",
         managed_local_ports=MANAGED_LOCAL_PORTS,
         half_open_limit=2,
         handshake_timeout_ms=2000,
@@ -519,6 +521,7 @@ def test_responder_half_open_limit_rejects_excess_bare_syns(phantun_module, vm):
 
 def test_initiator_half_open_limit_rejects_excess_udp(phantun_module, vm):
     phantun_module.load(
+        managed_netns="all",
         managed_local_ports=MANAGED_LOCAL_PORTS,
         half_open_limit=2,
         handshake_timeout_ms=2000,
