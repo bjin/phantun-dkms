@@ -133,6 +133,10 @@ def test_initial_syn_emit_failure_releases_flow_slot_and_queue(phantun_module, v
         stats_after_failure = wait_for_flows_current(vm, baseline_stats["flows_current"])
         if stats_after_failure["udp_packets_dropped"] <= baseline_stats["udp_packets_dropped"]:
             pytest.fail(f"expected failed initial SYN emit to count a UDP drop: {stats_after_failure!r}")
+        if stats_after_failure["udp_translation_failed_dropped"] <= baseline_stats["udp_translation_failed_dropped"]:
+            pytest.fail(
+                "expected failed initial SYN emit to count a UDP translation failure, " f"got {stats_after_failure!r}"
+            )
 
         probe.cleanup(vm)
         second = run_netns_scenario(
@@ -393,6 +397,8 @@ def test_half_open_retry_exhaustion_releases_flow_slot(phantun_module, vm):
                 "expected responder half-open flow creation before retry exhaustion: "
                 f"baseline={baseline_stats!r} current={stats!r}"
             )
+        if stats["handshake_retries_exhausted"] <= baseline_stats["handshake_retries_exhausted"]:
+            pytest.fail(f"expected handshake_retries_exhausted to increase, got {stats!r}")
     finally:
         drop_synack.cleanup(vm)
         synack_probe.cleanup(vm)
@@ -902,6 +908,8 @@ def test_duplicate_outbound_udp_while_half_open_queues_only_one_skb(phantun_modu
             pytest.fail(f"expected exactly one queued UDP packet while half-open, got {final_stats!r}")
         if final_stats["udp_packets_dropped"] <= initial_stats["udp_packets_dropped"]:
             pytest.fail(f"expected later duplicate UDP during half-open to be dropped, got {final_stats!r}")
+        if final_stats["udp_queue_full_dropped"] <= initial_stats["udp_queue_full_dropped"]:
+            pytest.fail(f"expected later duplicate UDP to count as queue-full drop, got {final_stats!r}")
     finally:
         probe.cleanup(vm)
         cleanup_netns_topology(vm)

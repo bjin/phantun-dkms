@@ -515,10 +515,32 @@ static void phantun_reserve_configured_local_tcp_ports(struct phantun_net *pnet,
 }
 
 static void phantun_account_udp_queue_result(bool queued) {
-    if (queued)
+    if (queued) {
         pht_stats_inc(PHT_STAT_UDP_PACKETS_QUEUED);
-    else
-        pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+        return;
+    }
+
+    pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+    pht_stats_inc(PHT_STAT_UDP_QUEUE_FULL_DROPPED);
+}
+
+static void phantun_account_udp_translation_failure(void) {
+    pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+    pht_stats_inc(PHT_STAT_UDP_TRANSLATION_FAILED_DROPPED);
+}
+
+static void phantun_account_tcp_protocol_rejected(void) {
+    pht_stats_inc(PHT_STAT_TCP_PROTOCOL_REJECTED);
+}
+
+static void phantun_account_tcp_misaligned_syn_rejected(void) {
+    pht_stats_inc(PHT_STAT_TCP_PROTOCOL_REJECTED);
+    pht_stats_inc(PHT_STAT_TCP_MISALIGNED_SYN_REJECTED);
+}
+
+static void phantun_account_tcp_unknown_tuple_rejected(void) {
+    pht_stats_inc(PHT_STAT_TCP_PROTOCOL_REJECTED);
+    pht_stats_inc(PHT_STAT_TCP_UNKNOWN_TUPLE_REJECTED);
 }
 
 static bool phantun_dev_is_loopback(const struct net_device *dev) {
@@ -899,6 +921,8 @@ static bool phantun_flow_should_drop_quarantined_packet(struct pht_flow *flow,
     drop = true;
 out:
     spin_unlock_bh(&flow->lock);
+    if (drop)
+        pht_stats_inc(PHT_STAT_REPLACEMENT_QUARANTINE_DROPPED);
     return drop;
 }
 
@@ -965,6 +989,8 @@ static bool phantun_flow_should_drop_protected_replacement_syn(struct pht_flow *
 
 out:
     spin_unlock_bh(&flow->lock);
+    if (drop)
+        pht_stats_inc(PHT_STAT_REPLACEMENT_PROTECT_DROPPED);
     return drop;
 }
 
@@ -1235,6 +1261,7 @@ static int phantun_flush_queued_udp(struct pht_flow *flow, struct net *net, bool
 
     ret = phantun_parse_udp_skb(queued_skb, &qview);
     if (ret) {
+        phantun_account_udp_translation_failure();
         kfree_skb(queued_skb);
         return ret;
     }
@@ -1258,6 +1285,16 @@ static int phantun_flush_queued_udp(struct pht_flow *flow, struct net *net, bool
 
     kfree_skb(queued_skb);
     return 0;
+}
+
+static void phantun_discard_queued_udp_translation_failure(struct pht_flow *flow) {
+    struct sk_buff *queued_skb = pht_flow_take_queued_skb(flow, NULL);
+
+    if (!queued_skb)
+        return;
+
+    phantun_account_udp_translation_failure();
+    kfree_skb(queued_skb);
 }
 
 static bool phantun_payload_exceeds_udp_reinject_limit(const struct pht_l4_view *view) {
@@ -1344,8 +1381,10 @@ phantun_finalize_established_rx(struct pht_flow *flow, const struct pht_endpoint
 
     if (allow_flush) {
         ret = phantun_flush_queued_udp(flow, net, NULL);
-        if (ret)
+        if (ret) {
+            phantun_discard_queued_udp_translation_failure(flow);
             return ret;
+        }
     }
 
     if (send_idle_ack && view->payload_len)
@@ -1434,6 +1473,7 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
 
     ret = phantun_confirm_outbound_udp_conntrack(skb);
     if (ret) {
+        phantun_account_udp_translation_failure();
         pht_pr_warn_rl("failed to confirm outbound UDP conntrack before translation: %d\n", ret);
         kfree_skb(skb);
         return NF_STOLEN;
@@ -1469,6 +1509,7 @@ retry_lookup:
 
             ret = phantun_send_established_udp(flow, &ep, &view, skb, &tx_meta, state->net, true);
             if (ret && ret != -EMSGSIZE) {
+                phantun_account_udp_translation_failure();
                 pht_pr_warn("failed to emit fake-TCP payload for established flow: %d\n", ret);
                 phantun_send_flow_rst(flow, state->net);
                 pht_flow_remove(flow);
@@ -1512,6 +1553,7 @@ retry_lookup:
 create_initiator:
     new_flow = pht_flow_create(flows, &ep, PHT_FLOW_ROLE_INITIATOR, PHT_FLOW_STATE_SYN_SENT);
     if (IS_ERR(new_flow)) {
+        phantun_account_udp_translation_failure();
         pht_pr_warn("failed to create initiator flow: %ld\n", PTR_ERR(new_flow));
         kfree_skb(skb);
         if (dead_flow)
@@ -1520,7 +1562,7 @@ create_initiator:
     }
 
     if (!phantun_pick_reopen_isn(prev_seq, has_prev_seq, &init_seq)) {
-        pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+        phantun_account_udp_translation_failure();
         pht_pr_warn("failed to choose reopen ISN for new flow\n");
         pht_flow_put(new_flow);
         if (dead_flow)
@@ -1556,7 +1598,10 @@ create_initiator:
         goto retry_lookup;
     }
     if (ret) {
-        pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+        if (ret == -ENOSPC)
+            pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+        else
+            phantun_account_udp_translation_failure();
         pht_pr_warn("failed to insert initiator flow: %d\n", ret);
         pht_flow_put(new_flow);
         if (dead_flow)
@@ -1574,7 +1619,7 @@ create_initiator:
             pht_flow_set_egress_ifindex(new_flow, ifindex);
     }
     if (ret) {
-        pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+        phantun_account_udp_translation_failure();
         pht_pr_warn("failed to emit fake-TCP SYN: %d\n", ret);
         pht_flow_detach(new_flow);
         pht_flow_put(new_flow);
@@ -1682,6 +1727,7 @@ static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb
     }
 
     pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+    pht_stats_inc(PHT_STAT_UDP_RAW_INBOUND_DROPPED);
     kfree_skb(skb);
     return NF_STOLEN;
 }
@@ -1716,6 +1762,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     u32 quarantine_prev_remote_seq_start = 0;
     u32 quarantine_prev_remote_seq_end = 0;
     bool carry_quarantine = false;
+    bool count_replacement_accept = false;
     bool had_queued;
     int ret;
 
@@ -1783,6 +1830,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         }
 
         if (!phantun_tcp_is_bare_syn(&view)) {
+            phantun_account_tcp_unknown_tuple_rejected();
             ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta, view.tcp->syn);
             if (ret)
                 pht_pr_warn_rl("failed to emit RST|ACK for unknown packet: %d\n", ret);
@@ -1792,6 +1840,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         }
 
         if (!phantun_tcp_syn_is_aligned(&view)) {
+            phantun_account_tcp_misaligned_syn_rejected();
             ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta, true);
             if (ret)
                 pht_pr_warn_rl("failed to emit RST|ACK for misaligned SYN: %d\n", ret);
@@ -1841,6 +1890,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         if (ret) {
             pht_pr_warn("failed to emit SYN|ACK: %d\n", ret);
             pht_flow_detach(new_flow);
+        } else if (count_replacement_accept) {
+            pht_stats_inc(PHT_STAT_REPLACEMENTS_ACCEPTED);
         }
         pht_flow_put(new_flow);
         if (dead_flow)
@@ -1875,6 +1926,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             u32 peer_isn;
 
             if (!phantun_tcp_syn_is_aligned(&view)) {
+                phantun_account_tcp_misaligned_syn_rejected();
                 ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta, true);
                 if (ret)
                     pht_pr_warn_rl("failed to emit RST|ACK for misaligned colliding SYN: %d\n",
@@ -1983,6 +2035,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                     ret = phantun_send_idle_ack(flow, state->net, &tx_meta);
             }
             if (ret) {
+                phantun_discard_queued_udp_translation_failure(flow);
                 pht_pr_warn("failed to finalize initiator open: %d\n", ret);
                 pht_flow_remove(flow);
             }
@@ -1990,6 +2043,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             return NF_DROP;
         }
 
+        phantun_account_tcp_protocol_rejected();
         ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta, false);
         if (ret)
             pht_pr_warn_rl("failed to emit RST|ACK for unexpected SYN_SENT packet: %d\n", ret);
@@ -2016,6 +2070,17 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 pht_flow_put(flow);
                 return NF_DROP;
             }
+            if (phantun_tcp_is_bare_syn(&view) && !phantun_tcp_syn_is_aligned(&view)) {
+                phantun_account_tcp_misaligned_syn_rejected();
+                ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta, true);
+                if (ret)
+                    pht_pr_warn_rl("failed to emit RST|ACK for misaligned SYN_RCVD SYN: %d\n", ret);
+                pht_flow_remove(flow);
+                pht_flow_put(flow);
+                return NF_DROP;
+            }
+
+            phantun_account_tcp_protocol_rejected();
             ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta, false);
             if (ret)
                 pht_pr_warn_rl("failed to emit RST|ACK for bad final ACK: %d\n", ret);
@@ -2076,8 +2141,10 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                                                       true, true, &tx_meta);
                 if (ret) {
                     pht_pr_warn("failed to process responder open payload: %d\n", ret);
-                    if (ret == -EMSGSIZE)
+                    if (ret == -EMSGSIZE) {
+                        phantun_account_tcp_protocol_rejected();
                         phantun_send_rstack(state->net, &ep, &view, &tx_meta, false);
+                    }
                     pht_flow_remove(flow);
                 }
                 pht_flow_put(flow);
@@ -2091,6 +2158,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
              * queued UDP data. */
             ret = phantun_flush_queued_udp(flow, state->net, NULL);
             if (ret) {
+                phantun_discard_queued_udp_translation_failure(flow);
                 pht_pr_warn("failed to flush responder queue: %d\n", ret);
                 pht_flow_remove(flow);
                 pht_flow_put(flow);
@@ -2108,8 +2176,10 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                                                   !drop_open_payload, true, &tx_meta);
             if (ret) {
                 pht_pr_warn("failed to process responder open payload: %d\n", ret);
-                if (ret == -EMSGSIZE)
+                if (ret == -EMSGSIZE) {
+                    phantun_account_tcp_protocol_rejected();
                     phantun_send_rstack(state->net, &ep, &view, &tx_meta, false);
+                }
                 pht_flow_remove(flow);
             }
             pht_flow_put(flow);
@@ -2165,6 +2235,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 quarantine_prev_remote_seq_end = flow->ack;
                 spin_unlock_bh(&flow->lock);
                 carry_quarantine = true;
+                count_replacement_accept = true;
                 pht_pr_info("received bare SYN on ESTABLISHED tuple, replacing generation\n");
                 queued_skb = pht_flow_take_queued_skb(flow, NULL);
                 if (queued_skb)
@@ -2174,6 +2245,10 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 goto process_as_new_syn;
             }
             pht_pr_warn_rl("received invalid SYN on ESTABLISHED tuple, destroying\n");
+            if (phantun_tcp_is_bare_syn(&view))
+                phantun_account_tcp_misaligned_syn_rejected();
+            else
+                phantun_account_tcp_protocol_rejected();
             phantun_send_rstack(state->net, &ep, &view, &tx_meta, true);
             pht_flow_remove(flow);
             pht_flow_put(flow);
@@ -2181,6 +2256,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         }
 
         if (!phantun_tcp_is_established_ack(&view)) {
+            phantun_account_tcp_protocol_rejected();
             ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta, !view.tcp->ack);
             if (ret)
                 pht_pr_warn_rl("failed to emit RST|ACK for unsupported established flags: %d\n",
@@ -2220,6 +2296,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             if (response_unblocked) {
                 ret = phantun_flush_queued_udp(flow, state->net, NULL);
                 if (ret) {
+                    phantun_discard_queued_udp_translation_failure(flow);
                     pht_pr_warn("failed to flush responder queue: %d\n", ret);
                     pht_flow_remove(flow);
                 }
@@ -2232,8 +2309,10 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                                               !drop_payload, true, &tx_meta);
         if (ret) {
             pht_pr_warn("failed to process established inbound payload: %d\n", ret);
-            if (ret == -EMSGSIZE)
+            if (ret == -EMSGSIZE) {
+                phantun_account_tcp_protocol_rejected();
                 phantun_send_rstack(state->net, &ep, &view, &tx_meta, false);
+            }
             pht_flow_remove(flow);
         }
         pht_flow_put(flow);

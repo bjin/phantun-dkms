@@ -1395,6 +1395,7 @@ def test_unknown_ack_payload_is_rejected_with_rstack(phantun_module, vm):
             }
         ],
     )
+    baseline_stats = read_module_stats(vm)
 
     try:
         run_netns_scenario(
@@ -1415,6 +1416,11 @@ def test_unknown_ack_payload_is_rejected_with_rstack(phantun_module, vm):
         time.sleep(0.2)
         if invalid_probe.packets(vm, "unknown_ack_rst") == 0:
             pytest.fail("expected RST|ACK for unknown non-RST fake-TCP packet")
+        stats = read_module_stats(vm)
+        if stats["tcp_protocol_rejected"] <= baseline_stats["tcp_protocol_rejected"]:
+            pytest.fail(f"expected tcp_protocol_rejected to increase, got {stats!r}")
+        if stats["tcp_unknown_tuple_rejected"] <= baseline_stats["tcp_unknown_tuple_rejected"]:
+            pytest.fail(f"expected tcp_unknown_tuple_rejected to increase, got {stats!r}")
     finally:
         invalid_probe.cleanup(vm)
 

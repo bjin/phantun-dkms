@@ -134,7 +134,9 @@ def test_liveness_timeout_recovers(phantun_module, vm):
             ],
         )
         baseline_rst = keepalive_probe.packets(vm, "liveness_rst")
-        baseline_rst_sent = read_module_stats(vm)["rst_sent"]
+        baseline_stats = read_module_stats(vm)
+        baseline_rst_sent = baseline_stats["rst_sent"]
+        baseline_liveness_timeouts = baseline_stats["established_liveness_timeouts"]
         drop_probe = make_netns_ingress_drop_probe(
             vm,
             NS_A,
@@ -164,9 +166,16 @@ def test_liveness_timeout_recovers(phantun_module, vm):
 
         if rst_packets <= 0:
             pytest.fail("expected local RST after liveness teardown, got none")
-        rst_sent = read_module_stats(vm)["rst_sent"] - baseline_rst_sent
+        stats_after_liveness = read_module_stats(vm)
+        rst_sent = stats_after_liveness["rst_sent"] - baseline_rst_sent
         if rst_sent <= 0:
             pytest.fail(f"expected rst_sent to increase after liveness teardown, got {rst_sent}")
+        liveness_timeouts = stats_after_liveness["established_liveness_timeouts"] - baseline_liveness_timeouts
+        if liveness_timeouts <= 0:
+            pytest.fail(
+                "expected established_liveness_timeouts to increase after liveness teardown, "
+                f"got {stats_after_liveness!r}"
+            )
 
         drop_probe.cleanup(vm)
         drop_probe = None
@@ -524,7 +533,13 @@ def test_established_bare_syn_replacement(phantun_module, vm):
 
 def test_replacement_protect_suppresses_initiator_bare_syn_then_expires(phantun_module, vm):
     protect_ms = 5000
-    load_recovery_module(phantun_module, replacement_protect_ms=protect_ms)
+    phantun_module.load(
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        keepalive_interval_sec=60,
+        keepalive_misses=2,
+        handshake_retries=20,
+        replacement_protect_ms=protect_ms,
+    )
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -585,6 +600,7 @@ def test_replacement_protect_suppresses_initiator_bare_syn_then_expires(phantun_
 
         baseline_synack = response_probe.packets(vm, "protect_synack")
         baseline_rst = response_probe.packets(vm, "protect_rst")
+        baseline_stats = read_module_stats(vm)
         stale_syn = run_netns_scenario(
             vm,
             NS_B,
@@ -605,6 +621,9 @@ def test_replacement_protect_suppresses_initiator_bare_syn_then_expires(phantun_
             pytest.fail("protected established-initiator bare SYN should not emit SYN|ACK")
         if response_probe.packets(vm, "protect_rst") != baseline_rst:
             pytest.fail("protected established-initiator bare SYN should not emit RST")
+        stats = read_module_stats(vm)
+        if stats["replacement_protect_dropped"] <= baseline_stats["replacement_protect_dropped"]:
+            pytest.fail(f"expected replacement_protect_dropped to increase, got {stats!r}")
 
         client_result_2 = run_netns_scenario(
             vm,
@@ -625,6 +644,7 @@ def test_replacement_protect_suppresses_initiator_bare_syn_then_expires(phantun_
 
         time.sleep((protect_ms / 1000) + 0.5)
         baseline_expired_synack = response_probe.packets(vm, "protect_synack")
+        replacement_baseline_stats = read_module_stats(vm)
         expired_syn = run_netns_scenario(
             vm,
             NS_B,
@@ -646,6 +666,9 @@ def test_replacement_protect_suppresses_initiator_bare_syn_then_expires(phantun_
             baseline_expired_synack,
             "expired replacement protection",
         )
+        replacement_stats = read_module_stats(vm)
+        if replacement_stats["replacements_accepted"] <= replacement_baseline_stats["replacements_accepted"]:
+            pytest.fail(f"expected replacements_accepted to increase, got {replacement_stats!r}")
 
         server_result = server.communicate(timeout=15)
         assert_completed(server_result, "server")
@@ -979,7 +1002,6 @@ def test_replacement_quarantine_drops_delayed_old_generation_packet(phantun_modu
             },
         )
         assert_completed(stale_packet, "inject stale packet")
-
         client_result_2 = client_result_2.communicate(timeout=15)
         assert_completed(client_result_2, "client send 2")
         client_data = parse_guest_json(client_result_2.stdout, "client send 2 stdout")

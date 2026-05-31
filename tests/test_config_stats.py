@@ -492,6 +492,7 @@ def test_inbound_udp_to_managed_local_port_is_dropped(phantun_module, vm):
 
     phantun_module.load(managed_local_ports=str(dst_port))
     ensure_netns_topology(vm)
+    baseline_stats = read_module_stats(vm)
 
     server = spawn_netns_scenario(
         vm,
@@ -524,6 +525,10 @@ def test_inbound_udp_to_managed_local_port_is_dropped(phantun_module, vm):
             pytest.fail(f"raw-udp client unexpectedly failed before inbound drop: {client.stderr!r}")
         if server_result.returncode == 0:
             pytest.fail("server unexpectedly received raw UDP on a managed local port")
+
+        stats = read_module_stats(vm)
+        if stats["udp_raw_inbound_dropped"] <= baseline_stats["udp_raw_inbound_dropped"]:
+            pytest.fail(f"expected raw inbound UDP drop counter to increase, got {stats!r}")
     finally:
         cleanup_netns_topology(vm)
 

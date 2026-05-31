@@ -185,6 +185,8 @@ static void pht_flow_retransmit_timer(struct timer_list *timer) {
         flow->retransmit_armed = false;
         spin_unlock_bh(&flow->lock);
 
+        pht_stats_inc(PHT_STAT_HANDSHAKE_RETRIES_EXHAUSTED);
+
         pht_flow_untrack_half_open(flow);
         pht_flow_unhash_and_queue_finalize(flow, true);
         pht_flow_put(flow);
@@ -481,7 +483,7 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
             bool expired_flow = false;
             bool send_keepalive = false;
             bool is_liveness_failure = false;
-
+            bool established_liveness_failure = false;
             spin_lock(&flow->lock);
             if (flow->state == PHT_FLOW_STATE_DEAD) {
                 if (time_after_eq(now,
@@ -501,6 +503,7 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
                 } else if (liveness_failed) {
                     expired_flow = true;
                     flow->liveness_failed = flow->state == PHT_FLOW_STATE_ESTABLISHED;
+                    established_liveness_failure = flow->liveness_failed;
                     flow->state = PHT_FLOW_STATE_DEAD;
                     is_liveness_failure = true;
                 } else if (flow->state == PHT_FLOW_STATE_ESTABLISHED &&
@@ -519,6 +522,8 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
 
             if (expired_flow)
                 pht_flow_untrack_half_open(flow);
+            if (established_liveness_failure)
+                pht_stats_inc(PHT_STAT_ESTABLISHED_LIVENESS_TIMEOUTS);
 
             if (is_liveness_failure) {
                 struct sk_buff *queued_skb;
