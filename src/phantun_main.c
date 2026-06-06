@@ -865,6 +865,7 @@ static u32 phantun_tcp_seq_advance(const struct tcphdr *th, unsigned int payload
 }
 
 static bool phantun_tcp_is_bare_syn(const struct pht_l4_view *view);
+static const u32 PHANTUN_SEQ_MAX_SIGNED_WINDOW = 0x7fffffffU;
 
 static bool phantun_seq_after_eq(u32 seq1, u32 seq2) { return (s32)(seq1 - seq2) >= 0; }
 
@@ -872,6 +873,29 @@ static bool phantun_seq_before_eq(u32 seq1, u32 seq2) { return (s32)(seq1 - seq2
 
 static bool phantun_seq_between(u32 seq, u32 start, u32 end) {
     return phantun_seq_after_eq(seq, start) && phantun_seq_before_eq(seq, end);
+}
+
+/* These lower edges are deliberately stateful instead of recomputing from
+ * local_isn/peer_syn_next on demand. Once a generation sends or receives more
+ * than one full u32 wrap of sequence space, (end - initial_base) can look small
+ * again, so a pure modulo calculation would reopen an over-wide signed compare
+ * window. Advancing the stored edge monotonically preserves the bounded window
+ * invariant for arbitrarily long-lived flows.
+ */
+static u32 phantun_seq_window_lower_edge(u32 lower_edge, u32 end) {
+    if (end - lower_edge > PHANTUN_SEQ_MAX_SIGNED_WINDOW)
+        return end - PHANTUN_SEQ_MAX_SIGNED_WINDOW;
+    return lower_edge;
+}
+
+static void phantun_flow_refresh_local_seq_window_locked(struct pht_flow *flow) {
+    flow->local_seq_window_start =
+        phantun_seq_window_lower_edge(flow->local_seq_window_start, flow->seq);
+}
+
+static void phantun_flow_refresh_remote_seq_window_locked(struct pht_flow *flow) {
+    flow->remote_seq_window_start =
+        phantun_seq_window_lower_edge(flow->remote_seq_window_start, flow->ack);
 }
 
 /* Remember only the immediately previous generation on a tuple. During the
@@ -922,22 +946,17 @@ static bool phantun_flow_matches_current_generation_locked(const struct pht_flow
                                                            const struct pht_l4_view *view) {
     u32 seq;
     u32 ack;
-    u32 current_local_end;
-
     seq = ntohl(view->tcp->seq);
     ack = ntohl(view->tcp->ack_seq);
-    current_local_end = flow->seq;
-    if (flow->state == PHT_FLOW_STATE_SYN_RCVD)
-        current_local_end = flow->local_isn + 1;
 
-    if (!phantun_seq_between(seq, flow->peer_syn_next, flow->ack))
+    if (!phantun_seq_between(seq, flow->remote_seq_window_start, flow->ack))
         return false;
     if (view->tcp->rst && !view->tcp->ack)
         return true;
     if (!view->tcp->ack)
         return false;
 
-    return phantun_seq_between(ack, flow->local_isn, current_local_end);
+    return phantun_seq_between(ack, flow->local_seq_window_start, flow->seq);
 }
 
 static bool phantun_flow_should_drop_quarantined_packet(struct pht_flow *flow,
@@ -1098,6 +1117,7 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
                                         bool persist_meta) {
     u32 seq;
     u32 ack;
+    u32 local_seq_window_start;
     int ifindex;
     int ret;
 
@@ -1127,7 +1147,9 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
         flow->local_tx_meta = *meta;
     seq = flow->seq;
     ack = flow->ack;
+    local_seq_window_start = flow->local_seq_window_start;
     flow->seq += view->payload_len;
+    phantun_flow_refresh_local_seq_window_locked(flow);
     spin_unlock_bh(&flow->lock);
 
     ret =
@@ -1145,8 +1167,10 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
     } else {
         spin_lock_bh(&flow->lock);
         if (flow->state == PHT_FLOW_STATE_ESTABLISHED) {
-            if (flow->seq == seq + view->payload_len)
+            if (flow->seq == seq + view->payload_len) {
                 flow->seq = seq;
+                flow->local_seq_window_start = local_seq_window_start;
+            }
             flow->state = PHT_FLOW_STATE_DEAD;
         }
         spin_unlock_bh(&flow->lock);
@@ -1218,6 +1242,7 @@ static int phantun_send_handshake_request(struct pht_flow *flow, struct net *net
     if (!ret) {
         spin_lock_bh(&flow->lock);
         flow->seq = seq + req_len;
+        phantun_flow_refresh_local_seq_window_locked(flow);
         flow->last_ack = ack;
         flow->last_activity_jiffies = jiffies;
         flow->egress_ifindex = ifindex;
@@ -1250,6 +1275,7 @@ static int phantun_send_handshake_response(struct pht_flow *flow, struct net *ne
     if (!ret) {
         spin_lock_bh(&flow->lock);
         flow->seq = seq + resp_len;
+        phantun_flow_refresh_local_seq_window_locked(flow);
         flow->last_ack = ack;
         flow->last_activity_jiffies = jiffies;
         flow->egress_ifindex = ifindex;
@@ -1381,6 +1407,7 @@ static void phantun_refresh_inbound_progress(struct pht_flow *flow, const struct
      */
     if (phantun_seq_after_eq(seq_end, flow->ack))
         flow->ack = seq_end;
+    phantun_flow_refresh_remote_seq_window_locked(flow);
     flow->last_ack = flow->ack;
     flow->last_activity_jiffies = jiffies;
     flow->last_inbound_jiffies = jiffies;
@@ -1618,6 +1645,8 @@ create_initiator:
     new_flow->last_ack = 0;
     new_flow->local_isn = init_seq;
     new_flow->peer_syn_next = 0;
+    new_flow->local_seq_window_start = new_flow->local_isn;
+    new_flow->remote_seq_window_start = new_flow->peer_syn_next;
     new_flow->local_tx_meta = tx_meta;
     spin_unlock_bh(&new_flow->lock);
     pht_flow_set_queued_skb(new_flow, skb, &tx_meta);
@@ -1908,6 +1937,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         new_flow->last_ack = new_flow->ack;
         new_flow->local_isn = responder_seq;
         new_flow->peer_syn_next = new_flow->ack;
+        new_flow->local_seq_window_start = new_flow->local_isn;
+        new_flow->remote_seq_window_start = new_flow->peer_syn_next;
         spin_unlock_bh(&new_flow->lock);
         if (carry_quarantine) {
             phantun_flow_arm_prev_generation_quarantine(
@@ -2016,6 +2047,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             new_flow->last_ack = new_flow->ack;
             new_flow->local_isn = responder_seq;
             new_flow->peer_syn_next = new_flow->ack;
+            new_flow->local_seq_window_start = new_flow->local_isn;
+            new_flow->remote_seq_window_start = new_flow->peer_syn_next;
             /* queued_tx_meta stays tied to the transferred skb. local_tx_meta
              * may be newer when later UDP arrived while the one-skb queue was
              * full, so preserve it separately for retransmits and keepalives.
@@ -2050,6 +2083,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             flow->seq = flow->local_isn + 1;
             flow->ack = ntohl(view.tcp->seq) + 1;
             flow->peer_syn_next = flow->ack;
+            flow->local_seq_window_start = flow->local_isn;
+            flow->remote_seq_window_start = flow->peer_syn_next;
             flow->last_ack = flow->ack;
             flow->drop_next_rx_seq = flow->ack;
             flow->drop_next_rx_payload = phantun_response_enabled();
@@ -2138,6 +2173,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         flow->seq = flow->local_isn + 1;
         flow->ack = flow->peer_syn_next;
         flow->last_ack = flow->ack;
+        flow->local_seq_window_start = flow->local_isn;
+        flow->remote_seq_window_start = flow->peer_syn_next;
         flow->drop_next_rx_seq = flow->ack;
         flow->drop_next_rx_payload = phantun_request_enabled();
         flow->response_pending_ack = false;
@@ -2270,9 +2307,9 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                  * are dropped quietly during the quarantine window.
                  */
                 spin_lock_bh(&flow->lock);
-                quarantine_prev_local_seq_start = flow->local_isn;
+                quarantine_prev_local_seq_start = flow->local_seq_window_start;
                 quarantine_prev_local_seq_end = flow->seq;
-                quarantine_prev_remote_seq_start = flow->peer_syn_next;
+                quarantine_prev_remote_seq_start = flow->remote_seq_window_start;
                 quarantine_prev_remote_seq_end = flow->ack;
                 spin_unlock_bh(&flow->lock);
                 carry_quarantine = true;

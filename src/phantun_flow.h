@@ -51,10 +51,11 @@ struct pht_flow_table;
 struct pht_flow {
     refcount_t refs;
     /*
-     * lock protects mutable protocol state: state/seq/ack tracking, persistent
-     * local-outbound transmit policy metadata, quarantine/drop-next shaping
-     * flags, replacement-protection deadline, the one-skb queue, retry
-     * counters, timestamps, and retransmit bookkeeping.
+     * lock protects mutable protocol state: state/seq/ack tracking, rolling
+     * sequence-window lower edges, persistent local-outbound transmit policy
+     * metadata, quarantine/drop-next shaping flags, replacement-protection
+     * deadline, the one-skb queue, retry counters, timestamps, and retransmit
+     * bookkeeping.
      *
      * It does not protect refs, hash/list membership, the timer object itself,
      * or immutable identity/config fields set at create time.
@@ -84,6 +85,15 @@ struct pht_flow {
     u32 local_isn;
     /* Next remote sequence immediately after the peer's opening SYN. */
     u32 peer_syn_next;
+    /* Rolling lower edges used only by quarantine/current-generation packet
+     * classification. They intentionally do not recompute from local_isn or
+     * peer_syn_next: modulo distance to those fixed starts becomes ambiguous
+     * after a full u32 wrap. Keep these close enough to seq/ack that every
+     * signed TCP sequence comparison spans less than half of the sequence
+     * space.
+     */
+    u32 local_seq_window_start;
+    u32 remote_seq_window_start;
     /* Cached local transmit policy context for synthetic fake-TCP packets that
      * have no current outbound UDP skb to copy from (retransmits, keepalives,
      * local teardown RSTs, and control payloads). This is not generic per-flow

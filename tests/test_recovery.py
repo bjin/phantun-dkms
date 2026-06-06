@@ -1026,6 +1026,192 @@ def test_replacement_quarantine_drops_delayed_old_generation_packet(phantun_modu
         cleanup_netns_topology(vm)
 
 
+def test_replacement_quarantine_drops_half_space_old_generation_packet(phantun_module, vm):
+    phantun_module.load(
+        managed_netns="all",
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        keepalive_interval_sec=30,
+        keepalive_misses=2,
+        handshake_retries=20,
+    )
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    captured_packet = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payload": "msg1",
+            "timeout_sec": 10,
+        },
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst",
+                "comment": "half_space_quarantine_rst",
+            }
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "echo_server",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "timeout_sec": 15,
+        },
+    )
+    synack_drop_probe = None
+
+    try:
+        time.sleep(0.2)
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "echo_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["msg1"],
+            },
+        )
+        assert_completed(client_result, "client send initial packet")
+
+        captured_result = captured_packet.communicate(timeout=10)
+        assert_completed(captured_result, "capture old generation packet")
+        captured_data = parse_guest_json(captured_result.stdout, "captured old packet")
+        server_result = server.communicate(timeout=15)
+        assert_completed(server_result, "server")
+        server_data = parse_guest_json(server_result.stdout, "server stdout")
+        if received_messages(server_data) != ["msg1"]:
+            pytest.fail(f"initial packet did not reach UDP server: {received_messages(server_data)!r}")
+
+        high_seq_1 = (captured_data["seq"] + 0x70000000) & 0xFFFFFFFF
+        high_seq_2 = (high_seq_1 + 0x70000000) & 0xFFFFFFFF
+        for label, seq, payload in (
+            ("advance old generation seq window 1", high_seq_1, "jump1"),
+            ("advance old generation seq window 2", high_seq_2, "jump2"),
+        ):
+            advanced = run_netns_scenario(
+                vm,
+                NS_A,
+                "send_tcp_packet",
+                {
+                    "bind_addr": NS_ADDR_A,
+                    "bind_port": src_port,
+                    "target_addr": NS_ADDR_B,
+                    "target_port": dst_port,
+                    "seq": seq,
+                    "ack": captured_data["ack"],
+                    "flags": "ack",
+                    "payload": payload,
+                },
+            )
+            assert_completed(advanced, label)
+        time.sleep(0.2)
+
+        synack_drop_probe = make_netns_ingress_flag_drop_probe(
+            vm,
+            NS_A,
+            VETH_A,
+            [
+                {
+                    "src_addr": NS_ADDR_B,
+                    "dst_addr": NS_ADDR_A,
+                    "src_port": dst_port,
+                    "dst_port": src_port,
+                    "flags_expr": "syn | ack",
+                    "comment": "half_space_quarantine_synack",
+                }
+            ],
+        )
+
+        baseline_stats = read_module_stats(vm)
+        baseline_rst = rst_probe.packets(vm, "half_space_quarantine_rst")
+        replacement_syn = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "seq": 4095 * 17,
+                "ack": 0,
+                "flags": "syn",
+            },
+        )
+        assert_completed(replacement_syn, "inject replacement SYN")
+
+        deadline = time.time() + 5
+        replacement_stats = baseline_stats
+        while time.time() < deadline:
+            replacement_stats = read_module_stats(vm)
+            if replacement_stats["replacements_accepted"] > baseline_stats["replacements_accepted"]:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(f"expected replacement SYN to be accepted, got {replacement_stats!r}")
+
+        quarantine_baseline = replacement_stats["replacement_quarantine_dropped"]
+        stale_packet = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "seq": high_seq_2,
+                "ack": captured_data["ack"],
+                "flags": "ack",
+                "payload": "stale",
+            },
+        )
+        assert_completed(stale_packet, "inject stale high-sequence packet")
+
+        deadline = time.time() + 5
+        final_stats = replacement_stats
+        while time.time() < deadline:
+            final_stats = read_module_stats(vm)
+            if final_stats["replacement_quarantine_dropped"] > quarantine_baseline:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(f"expected stale high-sequence packet to hit quarantine, got {final_stats!r}")
+
+        if rst_probe.packets(vm, "half_space_quarantine_rst") != baseline_rst:
+            pytest.fail("stale high-sequence old-generation packet should not emit RST")
+    finally:
+        rst_probe.cleanup(vm)
+        if synack_drop_probe is not None:
+            synack_drop_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
 def test_delayed_handshake_request_does_not_regress_ack(phantun_module, vm):
     load_recovery_module(phantun_module, handshake_request=REQ)
     ensure_netns_topology(vm)
