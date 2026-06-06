@@ -920,6 +920,67 @@ def test_netns_old_reinject_mark_constant_does_not_bypass_raw_udp_drop(phantun_m
         cleanup_netns_topology(vm)
 
 
+def test_netns_fragmented_raw_udp_is_dropped_after_defrag(phantun_module, vm):
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    ready_file = f"/tmp/phantun_frag_udp_{uuid.uuid4().hex}"
+
+    phantun_module.load(managed_netns="all", managed_local_ports=str(dst_port), ip_families="ipv4")
+    ensure_netns_topology(vm)
+
+    receiver = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_until_timeout",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "timeout_sec": 1,
+            "ready_file": ready_file,
+        },
+    )
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        wait_for_guest_ready_file(vm, ready_file, timeout=5)
+        sender = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_ipv4_udp_fragments",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payload": "fragmented-raw-udp",
+                "first_fragment_len": 16,
+            },
+        )
+        receiver_result = receiver.communicate(timeout=5)
+
+        assert_completed(sender, "fragmented raw UDP sender")
+        assert_completed(receiver_result, "fragmented raw UDP receiver")
+
+        received = parse_guest_json(receiver_result.stdout, "fragmented raw UDP receiver stdout")
+        if not received.get("timed_out") or received.get("received") != []:
+            pytest.fail(f"fragmented raw UDP should not be delivered: {received!r}")
+
+        stats_after = read_module_stats(vm)
+        if stats_after["udp_raw_inbound_dropped"] != baseline_stats["udp_raw_inbound_dropped"] + 1:
+            pytest.fail(
+                "fragmented raw UDP should increment raw inbound drop stats once: "
+                f"before={baseline_stats!r} after={stats_after!r}"
+            )
+        if stats_after["udp_packets_dropped"] != baseline_stats["udp_packets_dropped"] + 1:
+            pytest.fail(
+                "fragmented raw UDP should increment UDP drop stats once: "
+                f"before={baseline_stats!r} after={stats_after!r}"
+            )
+    finally:
+        cleanup_netns_topology(vm)
+
+
 def test_netns_collision_loser_retransmit_preserves_outbound_metadata(phantun_module, vm):
     phantun_module.load(
         managed_netns="all",

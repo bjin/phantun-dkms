@@ -22,8 +22,12 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
+#include <net/netfilter/ipv4/nf_defrag_ipv4.h>
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_core.h>
+#if IS_ENABLED(CONFIG_IPV6)
+#include <net/netfilter/ipv6/nf_defrag_ipv6.h>
+#endif
 #include <net/netns/generic.h>
 #include <net/route.h>
 #include <net/sock.h>
@@ -138,8 +142,10 @@ struct phantun_net {
     bool active;
     bool netdev_notifier_registered;
     bool hooks_v4_registered;
+    bool defrag_v4_enabled;
 #if IS_ENABLED(CONFIG_IPV6)
     bool hooks_v6_registered;
+    bool defrag_v6_enabled;
 #endif
     struct socket *reserved_local_socks_v4[PHANTUN_MAX_MANAGED_PORTS];
 #if IS_ENABLED(CONFIG_IPV6)
@@ -2358,6 +2364,46 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     return NF_DROP;
 }
 
+static void phantun_net_disable_defrag(struct net *net, struct phantun_net *pnet) {
+#if IS_ENABLED(CONFIG_IPV6)
+    if (pnet->defrag_v6_enabled) {
+        NF_DEFRAG_IPV6_DISABLE_COMPAT(net);
+        pnet->defrag_v6_enabled = false;
+    }
+#endif
+    if (pnet->defrag_v4_enabled) {
+        NF_DEFRAG_IPV4_DISABLE_COMPAT(net);
+        pnet->defrag_v4_enabled = false;
+    }
+}
+
+static int phantun_net_enable_defrag(struct net *net, struct phantun_net *pnet) {
+    int ret;
+
+    if (phantun_cfg.enabled_families & PHT_FAMILY_IPV4) {
+        ret = nf_defrag_ipv4_enable(net);
+        if (ret) {
+            pht_pr_err("failed to enable IPv4 defrag: %d\n", ret);
+            return ret;
+        }
+        pnet->defrag_v4_enabled = true;
+    }
+
+#if IS_ENABLED(CONFIG_IPV6)
+    if (phantun_cfg.enabled_families & PHT_FAMILY_IPV6) {
+        ret = nf_defrag_ipv6_enable(net);
+        if (ret) {
+            pht_pr_err("failed to enable IPv6 defrag: %d\n", ret);
+            phantun_net_disable_defrag(net, pnet);
+            return ret;
+        }
+        pnet->defrag_v6_enabled = true;
+    }
+#endif
+
+    return 0;
+}
+
 static struct nf_hook_ops phantun_nf_ops_v4[] = {
     {
         .hook = phantun_local_out,
@@ -2434,6 +2480,10 @@ static int __net_init phantun_net_init(struct net *net) {
 
     phantun_reserve_configured_local_tcp_ports(pnet, net);
 
+    ret = phantun_net_enable_defrag(net, pnet);
+    if (ret)
+        goto err_attach;
+
     if (phantun_cfg.enabled_families & PHT_FAMILY_IPV4) {
         ret = nf_register_net_hooks(net, phantun_nf_ops_v4, ARRAY_SIZE(phantun_nf_ops_v4));
         if (ret) {
@@ -2479,6 +2529,7 @@ err_attach:
         unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
         pnet->netdev_notifier_registered = false;
     }
+    phantun_net_disable_defrag(net, pnet);
     if (pnet->flow_table_ready) {
         pht_flow_table_destroy(flows);
         pnet->flow_table_ready = false;
@@ -2494,16 +2545,17 @@ static void __net_exit phantun_net_exit(struct net *net) {
         return;
 
     pnet->active = false;
-    if (pnet->hooks_v4_registered) {
-        nf_unregister_net_hooks(net, phantun_nf_ops_v4, ARRAY_SIZE(phantun_nf_ops_v4));
-        pnet->hooks_v4_registered = false;
-    }
 #if IS_ENABLED(CONFIG_IPV6)
     if (pnet->hooks_v6_registered) {
         nf_unregister_net_hooks(net, phantun_nf_ops_v6, ARRAY_SIZE(phantun_nf_ops_v6));
         pnet->hooks_v6_registered = false;
     }
 #endif
+    if (pnet->hooks_v4_registered) {
+        nf_unregister_net_hooks(net, phantun_nf_ops_v4, ARRAY_SIZE(phantun_nf_ops_v4));
+        pnet->hooks_v4_registered = false;
+    }
+    phantun_net_disable_defrag(net, pnet);
     if (pnet->netdev_notifier_registered) {
         unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
         pnet->netdev_notifier_registered = false;

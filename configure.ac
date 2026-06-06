@@ -469,6 +469,102 @@ AS_IF([test "x$ac_cv_have_net_gso_h" = xyes], [
   )
 ])
 
+AC_CACHE_CHECK([for nf_defrag_ipv4_disable], [ac_cv_have_nf_defrag_ipv4_disable], [
+  conftest_dir="$ac_pwd/conftest-kbuild-$$"
+
+  rm -rf "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to remove $conftest_dir])
+  mkdir -p "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to create $conftest_dir])
+
+  trap 'rm -rf "$conftest_dir"' 0 1 2 15
+
+  cat >"$conftest_dir/Makefile" <<'EOF'
+obj-m := conftest.o
+EOF
+
+  cat >"$conftest_dir/conftest.c" <<'EOF'
+#include <linux/module.h>
+#include <net/net_namespace.h>
+#include <net/netfilter/ipv4/nf_defrag_ipv4.h>
+
+static int conftest_nf_defrag_ipv4_disable(void)
+{
+    nf_defrag_ipv4_disable(&init_net);
+    return 0;
+}
+
+module_init(conftest_nf_defrag_ipv4_disable);
+MODULE_LICENSE("GPL");
+EOF
+
+  if ${MAKE-make} -C "$KDIR" M="$conftest_dir" modules \
+      >"$conftest_dir/build.log" 2>&1; then
+    ac_cv_have_nf_defrag_ipv4_disable=yes
+  else
+    cat "$conftest_dir/build.log" >&5
+    ac_cv_have_nf_defrag_ipv4_disable=no
+  fi
+
+  rm -rf "$conftest_dir"
+  trap - 0 1 2 15
+])
+
+AS_IF([test "x$ac_cv_have_nf_defrag_ipv4_disable" = xyes], [
+  AC_DEFINE(
+    [HAVE_NF_DEFRAG_IPV4_DISABLE], [1],
+    [Define to 1 if nf_defrag_ipv4_disable is available]
+  )
+])
+
+AC_CACHE_CHECK([for nf_defrag_ipv6_disable], [ac_cv_have_nf_defrag_ipv6_disable], [
+  conftest_dir="$ac_pwd/conftest-kbuild-$$"
+
+  rm -rf "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to remove $conftest_dir])
+  mkdir -p "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to create $conftest_dir])
+
+  trap 'rm -rf "$conftest_dir"' 0 1 2 15
+
+  cat >"$conftest_dir/Makefile" <<'EOF'
+obj-m := conftest.o
+EOF
+
+  cat >"$conftest_dir/conftest.c" <<'EOF'
+#include <linux/module.h>
+#include <net/net_namespace.h>
+#include <net/netfilter/ipv6/nf_defrag_ipv6.h>
+
+static int conftest_nf_defrag_ipv6_disable(void)
+{
+    nf_defrag_ipv6_disable(&init_net);
+    return 0;
+}
+
+module_init(conftest_nf_defrag_ipv6_disable);
+MODULE_LICENSE("GPL");
+EOF
+
+  if ${MAKE-make} -C "$KDIR" M="$conftest_dir" modules \
+      >"$conftest_dir/build.log" 2>&1; then
+    ac_cv_have_nf_defrag_ipv6_disable=yes
+  else
+    cat "$conftest_dir/build.log" >&5
+    ac_cv_have_nf_defrag_ipv6_disable=no
+  fi
+
+  rm -rf "$conftest_dir"
+  trap - 0 1 2 15
+])
+
+AS_IF([test "x$ac_cv_have_nf_defrag_ipv6_disable" = xyes], [
+  AC_DEFINE(
+    [HAVE_NF_DEFRAG_IPV6_DISABLE], [1],
+    [Define to 1 if nf_defrag_ipv6_disable is available]
+  )
+])
+
 
 
 AC_OUTPUT

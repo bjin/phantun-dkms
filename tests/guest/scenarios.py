@@ -504,6 +504,85 @@ def send_tcp_packet(config):
     _emit({"done": True})
 
 
+def send_ipv4_udp_fragments(config):
+    src_addr = config["bind_addr"]
+    dst_addr = config["target_addr"]
+    src_port = config["bind_port"]
+    dst_port = config["target_port"]
+    payload = config.get("payload", b"fragmented-udp")
+    if isinstance(payload, str):
+        payload = payload.encode()
+
+    udp_len = 8 + len(payload)
+    udp_header = struct.pack("!HHHH", src_port, dst_port, udp_len, 0)
+    pseudo_header = struct.pack(
+        "!4s4sBBH",
+        socket.inet_aton(src_addr),
+        socket.inet_aton(dst_addr),
+        0,
+        socket.IPPROTO_UDP,
+        udp_len,
+    )
+    udp_check = _checksum(pseudo_header + udp_header + payload)
+    if udp_check == 0:
+        udp_check = 0xFFFF
+    udp_header = struct.pack("!HHHH", src_port, dst_port, udp_len, udp_check)
+    udp_datagram = udp_header + payload
+
+    first_fragment_len = config.get("first_fragment_len", 16)
+    if first_fragment_len <= 0 or first_fragment_len >= len(udp_datagram):
+        raise ValueError("first_fragment_len must split the UDP datagram")
+    if first_fragment_len % 8:
+        raise ValueError("first_fragment_len must be a multiple of 8")
+
+    fragments = (udp_datagram[:first_fragment_len], udp_datagram[first_fragment_len:])
+    ip_id = config.get("ip_id", 0x4242)
+    ttl = config.get("ttl", 64)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW) as raw_sock:
+        raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        # The module under test may enable nf_defrag in the source namespace
+        # too. IP_NODEFRAG keeps these raw fragments fragmented on egress so the
+        # destination PRE_ROUTING path must perform the reassembly.
+        raw_sock.setsockopt(socket.IPPROTO_IP, getattr(socket, "IP_NODEFRAG", 22), 1)
+        offset = 0
+        for index, fragment in enumerate(fragments):
+            more_fragments = index < len(fragments) - 1
+            frag_off = (0x2000 if more_fragments else 0) | (offset // 8)
+            total_len = 20 + len(fragment)
+            ip_header = struct.pack(
+                "!BBHHHBBH4s4s",
+                (4 << 4) | 5,
+                0,
+                total_len,
+                ip_id,
+                frag_off,
+                ttl,
+                socket.IPPROTO_UDP,
+                0,
+                socket.inet_aton(src_addr),
+                socket.inet_aton(dst_addr),
+            )
+            ip_check = _checksum(ip_header)
+            ip_header = struct.pack(
+                "!BBHHHBBH4s4s",
+                (4 << 4) | 5,
+                0,
+                total_len,
+                ip_id,
+                frag_off,
+                ttl,
+                socket.IPPROTO_UDP,
+                ip_check,
+                socket.inet_aton(src_addr),
+                socket.inet_aton(dst_addr),
+            )
+            raw_sock.sendto(ip_header + fragment, (dst_addr, 0))
+            offset += len(fragment)
+
+    _emit({"sent": len(fragments)})
+
+
 def send_l2_tcp_packet(config):
     iface = config["device"]
     dst_mac = bytes.fromhex(config["dst_mac"].replace(":", ""))
@@ -696,6 +775,7 @@ SCENARIOS = {
     "hold_tcp_listener": hold_tcp_listener,
     "tcp_bind_listen": tcp_bind_listen,
     "send_tcp_packet": send_tcp_packet,
+    "send_ipv4_udp_fragments": send_ipv4_udp_fragments,
     "send_l2_tcp_packet": send_l2_tcp_packet,
     "capture_tcp_packet": capture_tcp_packet,
     "recv_many_reply": recv_many_reply,

@@ -48,4 +48,29 @@
 #define PHANTUN_HAVE_BASE64_DECODE 0
 #endif
 
+#ifdef HAVE_NF_DEFRAG_IPV4_DISABLE
+#define NF_DEFRAG_IPV4_DISABLE_COMPAT(net) nf_defrag_ipv4_disable(net)
+#else
+/* Older kernels expose nf_defrag_ipv4_enable() without a matching disable
+ * helper. Their enable path is an idempotent per-netns registration; the defrag
+ * module unregisters its hooks from its pernet exit path.
+ */
+#define NF_DEFRAG_IPV4_DISABLE_COMPAT(net)                                                         \
+    do {                                                                                           \
+        (void)(net);                                                                               \
+    } while (0)
+#endif
+
+#ifdef HAVE_NF_DEFRAG_IPV6_DISABLE
+#define NF_DEFRAG_IPV6_DISABLE_COMPAT(net) nf_defrag_ipv6_disable(net)
+#else
+/* Older kernels expose nf_defrag_ipv6_enable() without a matching disable
+ * helper. Their enable path is an idempotent per-netns registration; the defrag
+ * module unregisters its hooks from its pernet exit path.
+ */
+#define NF_DEFRAG_IPV6_DISABLE_COMPAT(net)                                                         \
+    do {                                                                                           \
+        (void)(net);                                                                               \
+    } while (0)
+#endif
 #endif

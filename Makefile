@@ -55,7 +55,7 @@ $(KDIR_STAMP): configure config.h.in
 	fi
 	@mkdir -p '$(KDIR_STAMP_DIR)'
 	./configure --with-kernel='$(KDIR)'
-	@rm -f '$(KDIR_STAMP_DIR)'/config.*.stamp
+	@rm -f '$(KDIR_STAMP_DIR)'/config*.stamp
 	@printf '%s\n' '$(KDIR)' >'$@'
 
 modules: $(KDIR_STAMP)
