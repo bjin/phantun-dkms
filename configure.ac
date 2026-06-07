@@ -469,6 +469,56 @@ AS_IF([test "x$ac_cv_have_net_gso_h" = xyes], [
   )
 ])
 
+AC_CACHE_CHECK([for dst_rt6_info], [ac_cv_have_dst_rt6_info], [
+  conftest_dir="$ac_pwd/conftest-kbuild-$$"
+
+  rm -rf "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to remove $conftest_dir])
+  mkdir -p "$conftest_dir" ||
+    AC_MSG_FAILURE([failed to create $conftest_dir])
+
+  trap 'rm -rf "$conftest_dir"' 0 1 2 15
+
+  cat >"$conftest_dir/Makefile" <<'EOF'
+obj-m := conftest.o
+EOF
+
+  cat >"$conftest_dir/conftest.c" <<'EOF'
+#include <linux/module.h>
+#include <net/ip6_fib.h>
+#include <net/ip6_route.h>
+
+static int conftest_dst_rt6_info(void)
+{
+    struct dst_entry *dst = NULL;
+    const struct rt6_info *rt = dst_rt6_info(dst);
+
+    return rt != NULL;
+}
+
+module_init(conftest_dst_rt6_info);
+MODULE_LICENSE("GPL");
+EOF
+
+  if ${MAKE-make} -C "$KDIR" M="$conftest_dir" modules \
+      >"$conftest_dir/build.log" 2>&1; then
+    ac_cv_have_dst_rt6_info=yes
+  else
+    cat "$conftest_dir/build.log" >&5
+    ac_cv_have_dst_rt6_info=no
+  fi
+
+  rm -rf "$conftest_dir"
+  trap - 0 1 2 15
+])
+
+AS_IF([test "x$ac_cv_have_dst_rt6_info" = xyes], [
+  AC_DEFINE(
+    [HAVE_DST_RT6_INFO], [1],
+    [Define to 1 if dst_rt6_info is available]
+  )
+])
+
 AC_CACHE_CHECK([for nf_defrag_ipv4_disable], [ac_cv_have_nf_defrag_ipv4_disable], [
   conftest_dir="$ac_pwd/conftest-kbuild-$$"
 

@@ -12,6 +12,8 @@ NS_A = "pht-a"
 NS_B = "pht-b"
 VETH_A = "veth-pht-a"
 VETH_B = "veth-pht-b"
+VETH_A_ALT = "veth-pht-a2"
+VETH_B_ALT = "veth-pht-b2"
 NS_ADDR_A = "10.200.0.1"
 NS_ADDR_B = "10.200.0.2"
 NS6_ADDR_A = "fd00:200::1"
@@ -37,6 +39,8 @@ MODULE_STAT_NAMES = (
     "response_payloads_injected",
     "shaping_payloads_dropped",
     "rst_sent",
+    "route_cache_hits",
+    "route_cache_misses",
     "udp_packets_queued",
     "udp_packets_dropped",
     "udp_queue_full_dropped",
@@ -291,6 +295,42 @@ def ensure_netns_topology(vm, with_ipv6=False):
         run_in_netns(vm, NS_B, ["ip", "-6", "route", "add", f"{NS6_ADDR_A}/128", "dev", VETH_B])
 
 
+def netns_link_mac(vm, namespace, dev):
+    res = run_in_netns(vm, namespace, ["ip", "-j", "link", "show", "dev", dev])
+    links = json.loads(res.stdout)
+    if not links:
+        pytest.fail(f"missing link {dev!r} in {namespace}")
+    return links[0]["address"]
+
+
+def ensure_netns_second_path(vm, with_ipv6=False):
+    vm.run(["ip", "link", "add", VETH_A_ALT, "type", "veth", "peer", "name", VETH_B_ALT])
+    vm.run(["ip", "link", "set", VETH_A_ALT, "netns", NS_A])
+    vm.run(["ip", "link", "set", VETH_B_ALT, "netns", NS_B])
+    run_in_netns(vm, NS_A, ["ip", "link", "set", VETH_A_ALT, "up"])
+    run_in_netns(vm, NS_B, ["ip", "link", "set", VETH_B_ALT, "up"])
+
+    mac_a = netns_link_mac(vm, NS_A, VETH_A_ALT)
+    mac_b = netns_link_mac(vm, NS_B, VETH_B_ALT)
+    run_in_netns(
+        vm, NS_A, ["ip", "neigh", "replace", NS_ADDR_B, "lladdr", mac_b, "dev", VETH_A_ALT, "nud", "permanent"]
+    )
+    run_in_netns(
+        vm, NS_B, ["ip", "neigh", "replace", NS_ADDR_A, "lladdr", mac_a, "dev", VETH_B_ALT, "nud", "permanent"]
+    )
+    if with_ipv6:
+        run_in_netns(
+            vm,
+            NS_A,
+            ["ip", "-6", "neigh", "replace", NS6_ADDR_B, "lladdr", mac_b, "dev", VETH_A_ALT, "nud", "permanent"],
+        )
+        run_in_netns(
+            vm,
+            NS_B,
+            ["ip", "-6", "neigh", "replace", NS6_ADDR_A, "lladdr", mac_a, "dev", VETH_B_ALT, "nud", "permanent"],
+        )
+
+
 def nft_ip_prefix(addr):
     return "ip6" if ":" in addr else "ip"
 
@@ -465,7 +505,8 @@ def make_netns_ingress_payload_drop_probe(vm, namespace, device, rules):
         payload_value = payload_hex(rule["payload"])
         lines.append(
             f"nft 'add rule netdev {table_name} ingress "
-            f"ip saddr {rule['src_addr']} ip daddr {rule['dst_addr']} "
+            f"{nft_ip_prefix(rule['src_addr'])} saddr {rule['src_addr']} "
+            f"{nft_ip_prefix(rule['dst_addr'])} daddr {rule['dst_addr']} "
             f"tcp sport {rule['src_port']} tcp dport {rule['dst_port']} "
             f"@th,160,{payload_bits} 0x{payload_value} "
             f"counter {rule.get('action', 'drop')} comment \"{rule['comment']}\"'"

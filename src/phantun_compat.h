@@ -48,6 +48,14 @@
 #define PHANTUN_HAVE_BASE64_DECODE 0
 #endif
 
+/* dst_rt6_info() was added after the oldest supported IPv6 kernels. Older
+ * kernels embed struct dst_entry at offset 0 in struct rt6_info and open-code
+ * the same cast in their IPv6 route helpers.
+ */
+#ifndef HAVE_DST_RT6_INFO
+#define dst_rt6_info(dst) ((struct rt6_info *)(dst))
+#endif
+
 #ifdef HAVE_NF_DEFRAG_IPV4_DISABLE
 #define NF_DEFRAG_IPV4_DISABLE_COMPAT(net) nf_defrag_ipv4_disable(net)
 #else

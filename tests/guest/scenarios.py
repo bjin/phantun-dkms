@@ -1,4 +1,5 @@
 import json
+import os
 import select
 import signal
 import socket
@@ -20,10 +21,36 @@ def _addr_tuple(addr, port, scope_dev=None):
     return (addr, port)
 
 
-def _socket(bind_addr, bind_port, timeout=None, bind_scope_dev=None):
+def _drop_uid(uid):
+    if uid is None:
+        return
+
+    uid = int(uid)
+    os.setgid(uid)
+    os.setuid(uid)
+
+
+def _socket(
+    bind_addr,
+    bind_port,
+    timeout=None,
+    bind_scope_dev=None,
+    mark=None,
+    ipv4_tos=None,
+    ipv6_tclass=None,
+    bind_device=None,
+):
     family = socket.AF_INET6 if ":" in bind_addr else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_DGRAM)
     sock.settimeout(timeout if timeout is not None else TIMEOUT_SEC)
+    if mark is not None:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, int(mark))
+    if bind_device:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, bind_device.encode() + b"\0")
+    if family == socket.AF_INET and ipv4_tos is not None:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, int(ipv4_tos))
+    if family == socket.AF_INET6 and ipv6_tclass is not None:
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_TCLASS, int(ipv6_tclass))
     sock.bind(_addr_tuple(bind_addr, bind_port, bind_scope_dev))
     return sock
 
@@ -45,11 +72,17 @@ def ping_server(config):
 
 
 def ping_client(config):
+    _drop_uid(config.get("run_as_uid"))
+
     with _socket(
         config["bind_addr"],
         config["bind_port"],
         config.get("timeout_sec"),
         config.get("bind_scope_dev"),
+        config.get("mark"),
+        config.get("ipv4_tos"),
+        config.get("ipv6_tclass"),
+        config.get("bind_device"),
     ) as sock:
         sock.sendto(
             config.get("payload", "ping").encode(),
@@ -146,11 +179,17 @@ def send_many(config):
     allow_send_errors = config.get("allow_send_errors", False)
     errors = []
 
+    _drop_uid(config.get("run_as_uid"))
+
     with _socket(
         config["bind_addr"],
         config["bind_port"],
         config.get("timeout_sec"),
         config.get("bind_scope_dev"),
+        config.get("mark"),
+        config.get("ipv4_tos"),
+        config.get("ipv6_tclass"),
+        config.get("bind_device"),
     ) as sock:
         target = _addr_tuple(config["target_addr"], config["target_port"], config.get("target_scope_dev"))
         for payload in payloads:

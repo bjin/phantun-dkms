@@ -12,9 +12,12 @@ from helpers import (
     PORTS_B,
     VETH_A,
     VETH_B,
+    VETH_A_ALT,
+    VETH_B_ALT,
     assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
+    ensure_netns_second_path,
     make_netns_ingress_drop_probe,
     make_netns_ingress_flag_drop_probe,
     make_netns_ingress_payload_drop_probe,
@@ -22,6 +25,7 @@ from helpers import (
     parse_guest_json,
     read_module_stats,
     require_guest_command,
+    run_in_netns,
     run_netns_scenario,
     spawn_netns_scenario,
     wait_for_guest_condition,
@@ -1343,6 +1347,135 @@ def test_delayed_handshake_request_does_not_regress_ack(phantun_module, vm):
     finally:
         drop_request.cleanup(vm)
         vm.run(["rm", "-f", syn_ready_file], check=False)
+        cleanup_netns_topology(vm)
+
+
+def test_route_change_revalidates_cached_dst_without_rst(phantun_module, vm):
+    load_recovery_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    ensure_netns_second_path(vm)
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    path_a_probe = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "route-before",
+                "action": "accept",
+                "comment": "route_before_on_path_a",
+            },
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "route-after",
+                "action": "accept",
+                "comment": "route_after_on_path_a",
+            },
+        ],
+    )
+    path_b_probe = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B_ALT,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "route-before",
+                "action": "accept",
+                "comment": "route_before_on_path_b",
+            },
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "route-after",
+                "action": "accept",
+                "comment": "route_after_on_path_b",
+            },
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "echo_server",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+            "timeout_sec": 20,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        first = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payload": "route-before",
+            },
+            timeout=10,
+        )
+        assert_completed(first, "stale-route first client")
+        if path_a_probe.packets(vm, "route_before_on_path_a") == 0:
+            pytest.fail("initial payload did not use path A before route change")
+
+        baseline_rst_sent = read_module_stats(vm)["rst_sent"]
+        run_in_netns(vm, NS_A, ["ip", "route", "replace", NS_ADDR_B, "dev", VETH_A_ALT, "src", NS_ADDR_A])
+        time.sleep(0.2)
+
+        second = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payload": "route-after",
+            },
+            timeout=10,
+        )
+        assert_completed(second, "stale-route second client")
+
+        server_result = server.communicate(timeout=15)
+        assert_completed(server_result, "stale-route echo server")
+        server_data = parse_guest_json(server_result.stdout, "stale-route server stdout")
+        if server_data.get("received") != ["route-before", "route-after"]:
+            pytest.fail(f"unexpected stale-route server payloads: {server_data.get('received')!r}")
+
+        if path_b_probe.packets(vm, "route_after_on_path_b") == 0:
+            pytest.fail("payload after route change did not use path B")
+        if path_a_probe.packets(vm, "route_after_on_path_a") != 0:
+            pytest.fail("stale cached path A dst was reused after route change")
+        if read_module_stats(vm)["rst_sent"] != baseline_rst_sent:
+            pytest.fail("route-only dst revalidation unexpectedly emitted RST")
+    finally:
+        path_a_probe.cleanup(vm)
+        path_b_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 

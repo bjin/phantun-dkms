@@ -10,13 +10,17 @@ from helpers import (
     NS_B,
     VETH_A,
     VETH_B,
+    VETH_A_ALT,
+    VETH_B_ALT,
     NetnsNftProbe,
     PORTS_A,
     PORTS_B,
     assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
+    ensure_netns_second_path,
     make_netns_ingress_flag_drop_probe,
+    make_netns_ingress_payload_drop_probe,
     make_netns_output_probe,
     parse_guest_json,
     probe_comment,
@@ -509,6 +513,200 @@ def test_netns_outbound_mark_propagates_to_fake_tcp(phantun_module, vm):
     finally:
         mark_setter.cleanup(vm)
         mark_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+@pytest.mark.parametrize(
+    ("rule_match", "second_meta", "metadata_label"),
+    [
+        pytest.param(["fwmark", "0x42"], {"mark": 0x42}, "mark", id="mark"),
+        pytest.param(["tos", "0x10"], {"ipv4_tos": 0x10}, "tos", id="tos"),
+        pytest.param(["uidrange", "4242-4242"], {"run_as_uid": 4242}, "uid", id="uid"),
+        pytest.param(
+            ["fwmark", "0x42", "tos", "0x10"], {"mark": 0x42, "ipv4_tos": 0x10}, "mark-and-tos", id="mark-and-tos"
+        ),
+    ],
+)
+def test_netns_route_cache_key_includes_policy_metadata(phantun_module, vm, rule_match, second_meta, metadata_label):
+    load_netns_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    ensure_netns_second_path(vm)
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    rule = ["ip", "rule", "add", "priority", "100", *rule_match, "table", "200"]
+
+    run_in_netns(vm, NS_A, ["ip", "route", "add", NS_ADDR_B, "dev", VETH_A_ALT, "src", NS_ADDR_A, "table", "200"])
+    run_in_netns(vm, NS_A, rule)
+
+    path_a_probe = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "route-a",
+                "action": "accept",
+                "comment": "route_a_on_path_a",
+            },
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "route-hit",
+                "action": "accept",
+                "comment": "route_hit_on_path_a",
+            },
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "route-b",
+                "action": "accept",
+                "comment": "route_b_on_path_a",
+            },
+        ],
+    )
+    path_b_probe = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B_ALT,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "route-a",
+                "action": "accept",
+                "comment": "route_a_on_path_b",
+            },
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "route-hit",
+                "action": "accept",
+                "comment": "route_hit_on_path_b",
+            },
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "route-b",
+                "action": "accept",
+                "comment": "route_b_on_path_b",
+            },
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "echo_server",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 3,
+            "timeout_sec": 20,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        stats_before = read_module_stats(vm)
+        first = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payload": "route-a",
+            },
+            timeout=10,
+        )
+        assert_completed(first, "route-cache first client")
+
+        stats_after_first = read_module_stats(vm)
+        if stats_after_first["route_cache_misses"] <= stats_before["route_cache_misses"]:
+            pytest.fail(
+                "first established payload should populate the route cache with a miss: "
+                f"before={stats_before!r} after={stats_after_first!r}"
+            )
+
+        hit = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payload": "route-hit",
+            },
+            timeout=10,
+        )
+        assert_completed(hit, "route-cache hit client")
+        stats_after_hit = read_module_stats(vm)
+        if stats_after_hit["route_cache_hits"] <= stats_after_first["route_cache_hits"]:
+            pytest.fail(
+                "second identical established payload should reuse the cached route: "
+                f"before={stats_after_first!r} after={stats_after_hit!r}"
+            )
+
+        second_config = {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payload": "route-b",
+            **second_meta,
+        }
+        second = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            second_config,
+            timeout=10,
+        )
+        assert_completed(second, f"route-cache {metadata_label} client")
+
+        server_result = server.communicate(timeout=15)
+        assert_completed(server_result, "route-cache echo server")
+        server_data = parse_guest_json(server_result.stdout, "route-cache server stdout")
+        if server_data.get("received") != ["route-a", "route-hit", "route-b"]:
+            pytest.fail(f"unexpected route-cache server payloads: {server_data.get('received')!r}")
+
+        if path_a_probe.packets(vm, "route_a_on_path_a") == 0:
+            pytest.fail("initial unmarked payload did not use path A")
+        if path_b_probe.packets(vm, "route_a_on_path_b") != 0:
+            pytest.fail("initial unmarked payload unexpectedly used path B")
+        if path_a_probe.packets(vm, "route_hit_on_path_a") == 0:
+            pytest.fail("second unmarked payload did not use cached path A")
+        if path_b_probe.packets(vm, "route_hit_on_path_b") != 0:
+            pytest.fail("second unmarked payload unexpectedly used path B")
+        if path_b_probe.packets(vm, "route_b_on_path_b") == 0:
+            pytest.fail(f"{metadata_label} payload did not use policy-routed path B")
+        if path_a_probe.packets(vm, "route_b_on_path_a") != 0:
+            pytest.fail(f"cached path A dst was reused for {metadata_label} payload")
+    finally:
+        path_a_probe.cleanup(vm)
+        path_b_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 

@@ -16,10 +16,14 @@ from helpers import (
     PORTS_B,
     VETH_A,
     VETH_B,
+    VETH_A_ALT,
+    VETH_B_ALT,
     assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
+    ensure_netns_second_path,
     make_netns_ingress_flag_drop_probe,
+    make_netns_ingress_payload_drop_probe,
     make_netns_output_flag_probe,
     make_netns_output_probe,
     parse_guest_json,
@@ -168,6 +172,258 @@ def test_ipv6_udp_ping_pong_uses_tcp_output_only(phantun_module, vm):
     finally:
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_ipv6_route_cache_key_includes_bound_oif(phantun_module, vm):
+    load_ipv6_module(phantun_module)
+    ensure_netns_topology(vm, with_ipv6=True)
+    require_nft_or_skip(vm)
+    ensure_netns_second_path(vm, with_ipv6=True)
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    run_in_netns(vm, NS_A, ["ip", "-6", "route", "add", f"{NS6_ADDR_B}/128", "dev", VETH_A_ALT, "table", "200"])
+    run_in_netns(vm, NS_A, ["ip", "-6", "rule", "add", "priority", "100", "oif", VETH_A_ALT, "table", "200"])
+    path_a_probe = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS6_ADDR_A,
+                "dst_addr": NS6_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "v6-path-a",
+                "action": "accept",
+                "comment": "v6_oif_a_on_main",
+            },
+            {
+                "src_addr": NS6_ADDR_A,
+                "dst_addr": NS6_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "v6-path-b",
+                "action": "accept",
+                "comment": "v6_oif_b_on_main",
+            },
+        ],
+    )
+    path_b_probe = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B_ALT,
+        [
+            {
+                "src_addr": NS6_ADDR_A,
+                "dst_addr": NS6_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "v6-path-a",
+                "action": "accept",
+                "comment": "v6_oif_a_on_alt",
+            },
+            {
+                "src_addr": NS6_ADDR_A,
+                "dst_addr": NS6_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "v6-path-b",
+                "action": "accept",
+                "comment": "v6_oif_b_on_alt",
+            },
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "echo_server",
+        {
+            "bind_addr": NS6_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+            "timeout_sec": 20,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        first = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            {
+                "bind_addr": NS6_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS6_ADDR_B,
+                "target_port": dst_port,
+                "payload": "v6-path-a",
+            },
+            timeout=10,
+        )
+        assert_completed(first, "IPv6 main-oif client")
+
+        if path_a_probe.packets(vm, "v6_oif_a_on_main") == 0:
+            pytest.fail("initial IPv6 payload did not use the main path")
+        if path_b_probe.packets(vm, "v6_oif_a_on_alt") != 0:
+            pytest.fail("initial IPv6 payload unexpectedly used the alternate path")
+
+        second = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS6_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS6_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["v6-path-b"],
+                "bind_device": VETH_A_ALT,
+            },
+            timeout=10,
+        )
+        assert_completed(second, "IPv6 bound-oif sender")
+
+        server_result = server.communicate(timeout=15)
+        assert_completed(server_result, "IPv6 oif route-cache server")
+        server_data = parse_guest_json(server_result.stdout, "IPv6 oif server stdout")
+        if server_data.get("received") != ["v6-path-a", "v6-path-b"]:
+            pytest.fail(f"unexpected IPv6 oif server payloads: {server_data.get('received')!r}")
+
+        if path_b_probe.packets(vm, "v6_oif_b_on_alt") == 0:
+            pytest.fail("IPv6 send with bound oif did not use the alternate path")
+        if path_a_probe.packets(vm, "v6_oif_b_on_main") != 0:
+            pytest.fail("cached IPv6 main-path dst was reused despite a different bound oif")
+    finally:
+        path_a_probe.cleanup(vm)
+        path_b_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_ipv6_route_cache_key_includes_tclass(phantun_module, vm):
+    load_ipv6_module(phantun_module)
+    ensure_netns_topology(vm, with_ipv6=True)
+    require_nft_or_skip(vm)
+    ensure_netns_second_path(vm, with_ipv6=True)
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    run_in_netns(vm, NS_A, ["ip", "-6", "route", "add", f"{NS6_ADDR_B}/128", "dev", VETH_A_ALT, "table", "200"])
+    run_in_netns(vm, NS_A, ["ip", "-6", "rule", "add", "priority", "100", "tos", "0x10", "table", "200"])
+
+    path_a_probe = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS6_ADDR_A,
+                "dst_addr": NS6_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "v6-tc-a",
+                "action": "accept",
+                "comment": "v6_tclass_a_on_main",
+            },
+            {
+                "src_addr": NS6_ADDR_A,
+                "dst_addr": NS6_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "v6-tc-b",
+                "action": "accept",
+                "comment": "v6_tclass_b_on_main",
+            },
+        ],
+    )
+    path_b_probe = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B_ALT,
+        [
+            {
+                "src_addr": NS6_ADDR_A,
+                "dst_addr": NS6_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "v6-tc-a",
+                "action": "accept",
+                "comment": "v6_tclass_a_on_alt",
+            },
+            {
+                "src_addr": NS6_ADDR_A,
+                "dst_addr": NS6_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "payload": "v6-tc-b",
+                "action": "accept",
+                "comment": "v6_tclass_b_on_alt",
+            },
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "echo_server",
+        {
+            "bind_addr": NS6_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+            "timeout_sec": 20,
+        },
+    )
+
+    try:
+        time.sleep(0.2)
+        first = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            {
+                "bind_addr": NS6_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS6_ADDR_B,
+                "target_port": dst_port,
+                "payload": "v6-tc-a",
+            },
+            timeout=10,
+        )
+        assert_completed(first, "IPv6 tclass baseline sender")
+
+        second = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            {
+                "bind_addr": NS6_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS6_ADDR_B,
+                "target_port": dst_port,
+                "payload": "v6-tc-b",
+                "ipv6_tclass": 0x10,
+            },
+            timeout=10,
+        )
+        assert_completed(second, "IPv6 tclass policy sender")
+
+        server_result = server.communicate(timeout=15)
+        assert_completed(server_result, "IPv6 tclass route-cache server")
+        server_data = parse_guest_json(server_result.stdout, "IPv6 tclass server stdout")
+        if server_data.get("received") != ["v6-tc-a", "v6-tc-b"]:
+            pytest.fail(f"unexpected IPv6 tclass server payloads: {server_data.get('received')!r}")
+
+        if path_a_probe.packets(vm, "v6_tclass_a_on_main") == 0:
+            pytest.fail("initial IPv6 payload did not use the main path")
+        if path_b_probe.packets(vm, "v6_tclass_a_on_alt") != 0:
+            pytest.fail("initial IPv6 payload unexpectedly used the alternate path")
+        if path_b_probe.packets(vm, "v6_tclass_b_on_alt") == 0:
+            pytest.fail("IPv6 tclass payload did not use the policy-routed path")
+        if path_a_probe.packets(vm, "v6_tclass_b_on_main") != 0:
+            pytest.fail("cached IPv6 main-path dst was reused despite a different traffic class")
+    finally:
+        path_a_probe.cleanup(vm)
+        path_b_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 

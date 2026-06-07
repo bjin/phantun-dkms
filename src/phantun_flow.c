@@ -8,6 +8,7 @@
 #include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <net/dst.h>
 #include <net/ip.h>
 #include <net/route.h>
 #if IS_ENABLED(CONFIG_IPV6)
@@ -30,6 +31,10 @@ struct pht_retired_flow {
     u32 prev_seq;
     unsigned long expires_jiffies;
 };
+
+static void pht_flow_tx_dst_cache_init(struct pht_flow_tx_dst_cache *cache);
+static void pht_flow_tx_dst_cache_reset(struct pht_flow_tx_dst_cache *cache);
+static struct dst_entry *pht_flow_tx_dst_cache_reset_locked(struct pht_flow_tx_dst_cache *cache);
 
 static u32 pht_addr_hash(const struct pht_addr *addr, u32 seed) {
     if (!addr)
@@ -84,7 +89,20 @@ static u32 pht_flow_hash_key(const struct pht_flow_table *table,
     return hash & (PHT_FLOW_BUCKETS - 1);
 }
 
+static void pht_flow_reset_tx_dst_cache(struct pht_flow *flow) {
+    struct dst_entry *dst;
+
+    if (!flow)
+        return;
+
+    spin_lock_bh(&flow->lock);
+    dst = pht_flow_tx_dst_cache_reset_locked(&flow->tx_dst_cache);
+    spin_unlock_bh(&flow->lock);
+    dst_release(dst);
+}
+
 static void pht_flow_free(struct pht_flow *flow) {
+    pht_flow_tx_dst_cache_reset(&flow->tx_dst_cache);
     kfree_skb(flow->queued_skb);
     kfree(flow);
 }
@@ -368,6 +386,7 @@ static void pht_flow_finalize_one(struct pht_flow *flow) {
 
     if (send_rst)
         pht_flow_send_local_rst(flow);
+    pht_flow_reset_tx_dst_cache(flow);
     pht_flow_shutdown_retransmit_sync(flow);
     pht_flow_put(flow);
 }
@@ -679,6 +698,191 @@ void pht_flow_put(struct pht_flow *flow) {
         pht_flow_free(flow);
 }
 
+/*
+ * tx_dst_cache refcount invariant:
+ * - cache owns exactly one dst reference while valid;
+ * - a cache hit calls dst_check() and dst_hold() under flow->lock for the skb;
+ * - a miss performs fresh lookup without holding flow->lock;
+ * - successful publish transfers the lookup reference into the cache and uses
+ *   dst_clone() for the skb;
+ * - reset/replacement returns the old cache ref and releases it after unlock.
+ */
+static void pht_flow_tx_dst_cache_init(struct pht_flow_tx_dst_cache *cache) {
+    if (!cache)
+        return;
+
+    memset(cache, 0, sizeof(*cache));
+}
+
+static struct dst_entry *pht_flow_tx_dst_cache_reset_locked(struct pht_flow_tx_dst_cache *cache) {
+    struct dst_entry *old;
+
+    if (!cache)
+        return NULL;
+
+    old = cache->dst;
+    cache->dst = NULL;
+    memset(&cache->key, 0, sizeof(cache->key));
+    cache->cookie = 0;
+    cache->ifindex = 0;
+    cache->valid = false;
+    return old;
+}
+
+static void pht_flow_tx_dst_cache_reset(struct pht_flow_tx_dst_cache *cache) {
+    struct dst_entry *old = pht_flow_tx_dst_cache_reset_locked(cache);
+
+    dst_release(old);
+}
+
+static struct dst_entry *pht_flow_tx_dst_cache_get_locked(struct pht_flow_tx_dst_cache *cache,
+                                                          const struct pht_tx_route_key *key,
+                                                          struct dst_entry **stale_dst,
+                                                          int *out_ifindex) {
+    struct dst_entry *dst;
+
+    if (stale_dst)
+        *stale_dst = NULL;
+    if (out_ifindex)
+        *out_ifindex = 0;
+    if (!cache || !cache->valid || !cache->dst || !pht_tx_route_key_equal(&cache->key, key))
+        return NULL;
+
+    dst = dst_check(cache->dst, cache->cookie);
+    if (!dst) {
+        dst = pht_flow_tx_dst_cache_reset_locked(cache);
+        if (stale_dst)
+            *stale_dst = dst;
+        else
+            dst_release(dst);
+        return NULL;
+    }
+
+    dst_hold(dst);
+    if (out_ifindex)
+        *out_ifindex = cache->ifindex;
+    return dst;
+}
+
+static struct dst_entry *
+pht_flow_tx_dst_cache_store_locked(struct pht_flow_tx_dst_cache *cache,
+                                   const struct pht_tx_route_key *key,
+                                   const struct pht_tx_route_result *route) {
+    struct dst_entry *old;
+
+    if (!cache || !key || !route || !route->dst)
+        return NULL;
+
+    old = cache->dst;
+    cache->dst = route->dst;
+    cache->key = *key;
+    cache->cookie = route->cookie;
+    cache->ifindex = route->ifindex;
+    cache->valid = true;
+    return old;
+}
+
+static bool pht_flow_tx_cache_key_matches_flow_locked(const struct pht_flow *flow,
+                                                      const struct pht_tx_route_key *key) {
+    struct pht_endpoint_pair ep;
+
+    if (!flow || !key)
+        return false;
+
+    ep.local_addr = key->local_addr;
+    ep.remote_addr = key->remote_addr;
+    ep.local_port = key->local_port;
+    ep.remote_port = key->remote_port;
+    ep.scope_ifindex = key->scope_ifindex;
+    return pht_endpoint_pair_equal(&flow->endpoints, &ep);
+}
+
+static bool pht_flow_tx_cache_generation_matches_locked(const struct pht_flow *flow,
+                                                        const struct pht_tx_route_key *key) {
+    return flow && flow->state == PHT_FLOW_STATE_ESTABLISHED &&
+           pht_flow_tx_cache_key_matches_flow_locked(flow, key);
+}
+
+int pht_flow_emit_established_payload(struct pht_flow *flow, struct net *net,
+                                      const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
+                                      const struct sk_buff *src, unsigned int payload_offset,
+                                      size_t payload_len, const struct pht_tx_meta *meta,
+                                      int *out_ifindex) {
+    struct pht_tx_route_result route;
+    struct pht_tx_route_key key;
+    struct dst_entry *old_dst = NULL;
+    struct dst_entry *send_dst;
+    struct sk_buff *skb;
+    int ifindex = 0;
+    int ret;
+
+    if (out_ifindex)
+        *out_ifindex = 0;
+    if (!flow || !net || !ep)
+        return -EINVAL;
+
+    ret = pht_prepare_fake_tcp_ack_payload_from_skb(ep, seq, ack, src, payload_offset, payload_len,
+                                                    meta, &skb);
+    if (ret)
+        return ret;
+
+    ret = pht_tx_route_key_init(&key, ep, meta);
+    if (ret) {
+        kfree_skb(skb);
+        return ret;
+    }
+
+    /* The local-out caller resolved @flow from @ep before reserving sequence
+     * space. Recheck after skb construction and after lookup publication so a
+     * racing teardown or future tuple-mismatched caller drops this packet as a
+     * stale generation instead of publishing a dst under the wrong flow.
+     */
+    spin_lock_bh(&flow->lock);
+    if (!pht_flow_tx_cache_generation_matches_locked(flow, &key)) {
+        spin_unlock_bh(&flow->lock);
+        kfree_skb(skb);
+        return -EAGAIN;
+    }
+    send_dst = pht_flow_tx_dst_cache_get_locked(&flow->tx_dst_cache, &key, &old_dst, &ifindex);
+    spin_unlock_bh(&flow->lock);
+    dst_release(old_dst);
+    old_dst = NULL;
+    if (send_dst) {
+        pht_stats_inc(PHT_STAT_ROUTE_CACHE_HITS);
+        if (out_ifindex)
+            *out_ifindex = ifindex;
+        return pht_tx_fake_tcp_with_dst(net, skb, key.family, send_dst);
+    }
+
+    pht_stats_inc(PHT_STAT_ROUTE_CACHE_MISSES);
+    ret = pht_tx_fake_tcp_route(net, &key, &route);
+    if (ret) {
+        kfree_skb(skb);
+        return ret;
+    }
+
+    send_dst = NULL;
+    spin_lock_bh(&flow->lock);
+    if (pht_flow_tx_cache_generation_matches_locked(flow, &key)) {
+        old_dst = pht_flow_tx_dst_cache_store_locked(&flow->tx_dst_cache, &key, &route);
+        send_dst = dst_clone(route.dst);
+        ifindex = route.ifindex;
+        route.dst = NULL;
+    }
+    spin_unlock_bh(&flow->lock);
+    dst_release(old_dst);
+
+    if (!send_dst) {
+        dst_release(route.dst);
+        kfree_skb(skb);
+        return -EAGAIN;
+    }
+
+    if (out_ifindex)
+        *out_ifindex = ifindex;
+    return pht_tx_fake_tcp_with_dst(net, skb, key.family, send_dst);
+}
+
 struct pht_flow *pht_flow_lookup(struct pht_flow_table *table, const struct pht_endpoint_pair *ep) {
     struct pht_flow_bucket *bucket;
     struct pht_flow *flow;
@@ -753,6 +957,7 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table, const struct pht_
     flow->table = table;
     flow->endpoints = *ep;
     pht_tx_meta_init(&flow->local_tx_meta);
+    pht_flow_tx_dst_cache_init(&flow->tx_dst_cache);
     pht_tx_meta_init(&flow->queued_tx_meta);
     flow->role = role;
     flow->state = state;
@@ -967,6 +1172,7 @@ void pht_flow_remove(struct pht_flow *flow) {
     pht_flow_untrack_half_open(flow);
     if (!retired) {
         spin_unlock_bh(&bucket->lock);
+        pht_flow_reset_tx_dst_cache(flow);
         pht_pr_warn_rl("keeping DEAD flow tombstone after retired metadata allocation failure\n");
         pht_flow_cancel_retransmit(flow);
         return;
@@ -1166,7 +1372,9 @@ struct pht_flow_invalidate_match {
 
 static bool pht_flow_matches_egress_ifindex_locked(const struct pht_flow *flow,
                                                    const struct pht_flow_invalidate_match *match) {
-    return flow->egress_ifindex > 0 && flow->egress_ifindex == match->egress_ifindex;
+    return (flow->egress_ifindex > 0 && flow->egress_ifindex == match->egress_ifindex) ||
+           (flow->tx_dst_cache.valid && flow->tx_dst_cache.ifindex > 0 &&
+            flow->tx_dst_cache.ifindex == match->egress_ifindex);
 }
 
 static bool pht_flow_matches_local_addr_locked(const struct pht_flow *flow,
@@ -1197,13 +1405,17 @@ pht_flow_invalidate_matching(struct pht_flow_table *table,
 
         spin_lock_bh(&bucket->lock);
         hlist_for_each_entry_safe(flow, tmp, &bucket->head, hnode) {
+            struct dst_entry *dead_dst = NULL;
             bool matched;
 
             spin_lock(&flow->lock);
             matched = flow->state != PHT_FLOW_STATE_DEAD && matches_locked(flow, match);
-            if (matched)
+            if (matched) {
                 flow->state = PHT_FLOW_STATE_DEAD;
+                dead_dst = pht_flow_tx_dst_cache_reset_locked(&flow->tx_dst_cache);
+            }
             spin_unlock(&flow->lock);
+            dst_release(dead_dst);
             if (!matched)
                 continue;
 

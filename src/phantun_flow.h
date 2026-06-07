@@ -48,14 +48,26 @@ enum pht_flow_state {
 struct net;
 struct pht_flow_table;
 
+/* Single-entry route cache for established payload sends. Protected by the
+ * owning flow lock; when valid, @dst owns one reference and @key/@cookie
+ * identify the route generation that produced it.
+ */
+struct pht_flow_tx_dst_cache {
+    struct dst_entry *dst;
+    struct pht_tx_route_key key;
+    u32 cookie;
+    int ifindex;
+    bool valid;
+};
+
 struct pht_flow {
     refcount_t refs;
     /*
      * lock protects mutable protocol state: state/seq/ack tracking, rolling
      * sequence-window lower edges, persistent local-outbound transmit policy
-     * metadata, quarantine/drop-next shaping flags, replacement-protection
-     * deadline, the one-skb queue, retry counters, timestamps, and retransmit
-     * bookkeeping.
+     * metadata, the per-generation fake-TCP dst cache, quarantine/drop-next
+     * shaping flags, replacement-protection deadline, the one-skb queue, retry
+     * counters, timestamps, and retransmit bookkeeping.
      *
      * It does not protect refs, hash/list membership, the timer object itself,
      * or immutable identity/config fields set at create time.
@@ -101,6 +113,10 @@ struct pht_flow {
      * Inbound fake-TCP metadata is reply-scoped and must not be persisted.
      */
     struct pht_tx_meta local_tx_meta;
+    /* Established payload fake-TCP route cache for this live generation.
+     * Low-rate control packets always use fresh uncached route lookup.
+     */
+    struct pht_flow_tx_dst_cache tx_dst_cache;
     /* Sequence window of the immediately previous generation on this tuple.
      * Used only to absorb delayed packets after ESTABLISHED accepts a
      * replacement bare SYN.
@@ -217,6 +233,11 @@ void pht_flow_detach(struct pht_flow *flow);
 
 void pht_flow_get(struct pht_flow *flow);
 void pht_flow_put(struct pht_flow *flow);
+int pht_flow_emit_established_payload(struct pht_flow *flow, struct net *net,
+                                      const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
+                                      const struct sk_buff *src, unsigned int payload_offset,
+                                      size_t payload_len, const struct pht_tx_meta *meta,
+                                      int *out_ifindex);
 void pht_flow_touch(struct pht_flow *flow);
 void pht_flow_touch_inbound(struct pht_flow *flow);
 void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex);

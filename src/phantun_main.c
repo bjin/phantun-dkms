@@ -189,10 +189,11 @@ static bool phantun_netns_selected(const struct net *net) {
     }
 }
 
-/* Invalidate only on topology changes that break the current source identity or
- * cached egress path outright. Route/gateway changes are intentionally ignored:
- * every transmit does a fresh route lookup, so a stable local IPv4 can migrate
- * without tearing the fake-TCP generation down.
+/* Route/gateway changes keep the fake-TCP generation alive: cached dst reuse is
+ * gated by exact route-key equality and dst_check(), so stale routes fall back
+ * to lookup. Topology/source-identity events still invalidate the flow
+ * generation itself because a vanished egress device or local address makes any
+ * final RST best-effort at best.
  */
 static int phantun_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr) {
     struct phantun_net *pnet = container_of(nb, struct phantun_net, netdev_nb);
@@ -1152,9 +1153,8 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
     phantun_flow_refresh_local_seq_window_locked(flow);
     spin_unlock_bh(&flow->lock);
 
-    ret =
-        pht_emit_fake_tcp_payload_from_skb(net, ep, seq, ack, PHT_TCP_FLAG_ACK, skb,
-                                           view->payload_offset, view->payload_len, meta, &ifindex);
+    ret = pht_flow_emit_established_payload(flow, net, ep, seq, ack, skb, view->payload_offset,
+                                            view->payload_len, meta, &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
         if (flow->state == PHT_FLOW_STATE_ESTABLISHED) {
@@ -1165,15 +1165,24 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
         }
         spin_unlock_bh(&flow->lock);
     } else {
+        bool stale_generation = ret == -EAGAIN;
+
         spin_lock_bh(&flow->lock);
         if (flow->state == PHT_FLOW_STATE_ESTABLISHED) {
             if (flow->seq == seq + view->payload_len) {
                 flow->seq = seq;
                 flow->local_seq_window_start = local_seq_window_start;
             }
-            flow->state = PHT_FLOW_STATE_DEAD;
+            if (!stale_generation)
+                flow->state = PHT_FLOW_STATE_DEAD;
         }
         spin_unlock_bh(&flow->lock);
+        /* -EAGAIN is the emit helper's generation guard: the flow stopped
+         * matching this packet while the skb/dst was being prepared. Consume
+         * the UDP skb without converting a stale-generation drop into teardown.
+         */
+        if (stale_generation)
+            ret = 0;
     }
     spin_unlock_bh(&flow->tx_lock);
 

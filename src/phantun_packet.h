@@ -16,6 +16,8 @@
 #include <linux/udp.h>
 #include <linux/uidgid.h>
 
+struct dst_entry;
+struct net;
 #define PHT_V4_DEFAULT_TTL 64
 #define PHT_V4_MAX_PACKET_LEN 1500U
 #define PHT_V4_MAX_TCP_PAYLOAD_LEN                                                                 \
@@ -55,6 +57,12 @@ struct pht_endpoint_pair {
     int scope_ifindex;
 };
 
+/*
+ * Per-send transmit metadata captured at the interception point. These fields
+ * are copied onto the generated fake-TCP skb and, where the kernel route lookup
+ * consumes them, into pht_tx_route_key. priority stays per-skb policy state;
+ * oif is only an explicit socket/device binding, not the resolved egress dev.
+ */
 struct pht_tx_meta {
     u32 mark;
     u32 priority;
@@ -65,6 +73,51 @@ struct pht_tx_meta {
     kuid_t uid;
 };
 
+/*
+ * Exact key for a fake-TCP route lookup. Keep this limited to flowi inputs:
+ * endpoint identity, scope/oif fallback, mark, uid, IPv4 TOS, and IPv6
+ * priority/flowlabel. skb->priority is applied to each emitted skb by
+ * pht_tx_meta but is deliberately not a route-cache discriminator.
+ */
+struct pht_tx_route_key {
+    u8 family;
+    struct pht_addr local_addr;
+    struct pht_addr remote_addr;
+    __be16 local_port;
+    __be16 remote_port;
+    int scope_ifindex;
+    u32 mark;
+    int oif;
+    kuid_t uid;
+
+    union {
+        u8 v4_tos;
+
+        struct {
+            u8 priority;
+            u8 flow_lbl[3];
+        } v6;
+    };
+};
+
+/*
+ * Fresh lookup result. The dst pointer owns the lookup reference until the
+ * caller either attaches it to an skb or transfers it into a flow-owned cache.
+ * IPv6 stores rt6_get_cookie() so dst_check() validates against the same
+ * generation that produced the route; IPv4 uses cookie 0.
+ */
+struct pht_tx_route_result {
+    struct dst_entry *dst;
+    u32 cookie;
+    int ifindex;
+};
+
+/*
+ * Parsed L3/L4 view into an skb. Header pointers and payload offsets borrow
+ * the skb's current linear/nonlinear data; callers must not keep this after
+ * the skb is modified or freed. payload_offset/payload_len describe exactly
+ * the bytes translated between UDP payload and fake-TCP payload.
+ */
 struct pht_l4_view {
     u8 family;
 
@@ -87,6 +140,19 @@ struct pht_l4_view {
 unsigned int pht_fake_tcp_max_payload_len(u8 family);
 unsigned int pht_udp_max_payload_len(u8 family);
 void pht_tx_meta_init(struct pht_tx_meta *meta);
+
+int pht_tx_route_key_init(struct pht_tx_route_key *key, const struct pht_endpoint_pair *ep,
+                          const struct pht_tx_meta *meta);
+bool pht_tx_route_key_equal(const struct pht_tx_route_key *a, const struct pht_tx_route_key *b);
+int pht_tx_fake_tcp_route(struct net *net, const struct pht_tx_route_key *key,
+                          struct pht_tx_route_result *route);
+int pht_tx_fake_tcp_with_dst(struct net *net, struct sk_buff *skb, u8 family,
+                             struct dst_entry *dst);
+int pht_prepare_fake_tcp_ack_payload_from_skb(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
+                                              const struct sk_buff *src,
+                                              unsigned int payload_offset, size_t payload_len,
+                                              const struct pht_tx_meta *meta,
+                                              struct sk_buff **out_skb);
 
 int pht_parse_ipv4_udp(struct sk_buff *skb, struct pht_l4_view *view);
 int pht_parse_ipv4_tcp(struct sk_buff *skb, struct pht_l4_view *view);
@@ -126,10 +192,6 @@ int pht_tx_fake_tcp_v4(struct net *net, struct sk_buff *skb, const struct pht_en
 int pht_emit_fake_tcp_v4(struct net *net, const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                          u8 flags, const void *payload, size_t payload_len,
                          const struct pht_tx_meta *meta, int *out_ifindex);
-int pht_emit_fake_tcp_payload_from_skb_v4(struct net *net, const struct pht_endpoint_pair *ep,
-                                          u32 seq, u32 ack, u8 flags, const struct sk_buff *src,
-                                          unsigned int payload_offset, size_t payload_len,
-                                          const struct pht_tx_meta *meta, int *out_ifindex);
 int pht_reinject_udp_v4(struct sk_buff *skb, struct net_device *dev, u32 reinject_mark);
 int pht_reinject_udp_payload_v4(struct net_device *dev, const struct pht_endpoint_pair *ep,
                                 const void *payload, size_t payload_len, u32 reinject_mark);
@@ -149,10 +211,6 @@ int pht_tx_fake_tcp_v6(struct net *net, struct sk_buff *skb, const struct pht_en
 int pht_emit_fake_tcp_v6(struct net *net, const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                          u8 flags, const void *payload, size_t payload_len,
                          const struct pht_tx_meta *meta, int *out_ifindex);
-int pht_emit_fake_tcp_payload_from_skb_v6(struct net *net, const struct pht_endpoint_pair *ep,
-                                          u32 seq, u32 ack, u8 flags, const struct sk_buff *src,
-                                          unsigned int payload_offset, size_t payload_len,
-                                          const struct pht_tx_meta *meta, int *out_ifindex);
 int pht_reinject_udp_v6(struct sk_buff *skb, struct net_device *dev, u32 reinject_mark);
 int pht_reinject_udp_payload_v6(struct net_device *dev, const struct pht_endpoint_pair *ep,
                                 const void *payload, size_t payload_len, u32 reinject_mark);
@@ -162,10 +220,6 @@ int pht_reinject_udp_payload_from_skb_v6(struct net_device *dev, const struct ph
 int pht_emit_fake_tcp(struct net *net, const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                       u8 flags, const void *payload, size_t payload_len,
                       const struct pht_tx_meta *meta, int *out_ifindex);
-int pht_emit_fake_tcp_payload_from_skb(struct net *net, const struct pht_endpoint_pair *ep, u32 seq,
-                                       u32 ack, u8 flags, const struct sk_buff *src,
-                                       unsigned int payload_offset, size_t payload_len,
-                                       const struct pht_tx_meta *meta, int *out_ifindex);
 int pht_reinject_udp_payload(struct net_device *dev, const struct pht_endpoint_pair *ep,
                              const void *payload, size_t payload_len, u32 reinject_mark);
 int pht_reinject_udp_payload_from_skb(struct net_device *dev, const struct pht_endpoint_pair *ep,
