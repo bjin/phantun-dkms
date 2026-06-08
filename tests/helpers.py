@@ -39,6 +39,7 @@ MODULE_STAT_NAMES = (
     "response_payloads_injected",
     "shaping_payloads_dropped",
     "rst_sent",
+    "idle_acks_suppressed",
     "route_cache_hits",
     "route_cache_misses",
     "udp_packets_queued",
@@ -381,6 +382,25 @@ def make_netns_output_flag_probe(vm, namespace, rules):
             f"counter {rule.get('action', 'accept')} comment \"{rule['comment']}\"'"
         )
 
+    run_in_netns(vm, namespace, "\n".join(lines))
+    return NetnsNftProbe(namespace, "inet", table_name, "output")
+
+
+def make_netns_output_ipv4_pure_ack_probe(vm, namespace, src_addr, src_port, dst_addr, dst_port):
+    table_name = f"phantun_pure_ack_{uuid.uuid4().hex[:8]}"
+    lines = [
+        f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
+        f"nft add table inet {table_name}",
+        (f"nft 'add chain inet {table_name} output " "{ type filter hook output priority 0; policy accept; }'"),
+        (
+            f"nft 'add rule inet {table_name} output "
+            f"ip saddr {src_addr} ip daddr {dst_addr} "
+            f"tcp sport {src_port} tcp dport {dst_port} "
+            "tcp flags & (fin|syn|rst|ack) == ack "
+            "ip length 40 "
+            'counter accept comment "pure_ipv4_ack"\''
+        ),
+    ]
     run_in_netns(vm, namespace, "\n".join(lines))
     return NetnsNftProbe(namespace, "inet", table_name, "output")
 

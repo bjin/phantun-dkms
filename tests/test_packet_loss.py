@@ -1,4 +1,6 @@
+import json
 import time
+import uuid
 
 import pytest
 
@@ -17,12 +19,14 @@ from helpers import (
     make_netns_ingress_flag_drop_probe,
     make_netns_ingress_payload_drop_probe,
     make_netns_output_flag_probe,
+    make_netns_output_ipv4_pure_ack_probe,
     make_netns_tcp_payload_probe,
     parse_guest_json,
     read_module_stats,
     require_guest_command,
     run_netns_scenario,
     spawn_netns_scenario,
+    wait_for_guest_ready_file,
 )
 
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
@@ -44,6 +48,10 @@ def reply_messages(payload):
 
 def count_nonzero_probe_hits(vm, probe, comments):
     return sum(1 for comment in comments if probe.packets(vm, comment) > 0)
+
+
+def write_guest_text(vm, path, content):
+    vm.run(["python3", "-c", f"from pathlib import Path; Path({path!r}).write_text({content!r})"])
 
 
 def wait_for_half_open_drain(vm, baseline_stats, expected_rst, timeout=15):
@@ -772,6 +780,189 @@ def test_handshake_response_loss_does_not_drop_later_replies(phantun_module, vm)
             )
     finally:
         probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_delayed_handshake_response_control_drop_acks_after_recent_tx(phantun_module, vm):
+    load_loss_module(phantun_module, handshake_request=REQ, handshake_response=RESP)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    prefix = f"/tmp/phantun-control-drop-ack-{uuid.uuid4().hex}"
+    syn_ready = f"{prefix}-syn-ready"
+    synack_ready = f"{prefix}-synack-ready"
+    server_ready = f"{prefix}-server-ready"
+    continue_file = f"{prefix}-continue"
+    inject_config_file = f"{prefix}-inject.json"
+    syn_capture = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payload": "",
+            "ready_file": syn_ready,
+            "timeout_sec": 20,
+        },
+    )
+    synack_capture = spawn_netns_scenario(
+        vm,
+        NS_A,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "payload": "",
+            "ready_file": synack_ready,
+            "timeout_sec": 20,
+        },
+    )
+    drop_response = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "payload": RESP,
+                "comment": "drop_resp_before_control_inject",
+            }
+        ],
+    )
+    ack_probe = make_netns_output_ipv4_pure_ack_probe(
+        vm,
+        NS_A,
+        NS_ADDR_A,
+        src_port,
+        NS_ADDR_B,
+        dst_port,
+    )
+    server = None
+    client = None
+
+    try:
+        wait_for_guest_ready_file(vm, syn_ready, timeout=5)
+        wait_for_guest_ready_file(vm, synack_ready, timeout=5)
+        server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_many_then_inject_tcp",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 2,
+                "inject_after_count": 2,
+                "inject_config_file": inject_config_file,
+                "ready_file": server_ready,
+                "barrier_timeout_sec": 12,
+                "timeout_sec": 20,
+            },
+        )
+        wait_for_guest_ready_file(vm, server_ready, timeout=5)
+        client = spawn_netns_scenario(
+            vm,
+            NS_A,
+            "send_many_with_barrier",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["client-0", "client-1"],
+                "continue_file": continue_file,
+                "barrier_timeout_sec": 12,
+                "timeout_sec": 20,
+            },
+        )
+
+        syn_result = syn_capture.communicate(timeout=20)
+        synack_result = synack_capture.communicate(timeout=20)
+        assert_completed(syn_result, "capture initiator SYN")
+        assert_completed(synack_result, "capture responder SYN|ACK")
+        syn_data = parse_guest_json(syn_result.stdout, "captured initiator SYN")
+        synack_data = parse_guest_json(synack_result.stdout, "captured responder SYN|ACK")
+        if (syn_data.get("flags", 0) & 0x12) != 0x02:
+            pytest.fail(f"expected bare SYN, got {syn_data!r}")
+        if (synack_data.get("flags", 0) & 0x12) != 0x12:
+            pytest.fail(f"expected SYN|ACK, got {synack_data!r}")
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if drop_response.packets(vm, "drop_resp_before_control_inject") > 0:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("failed to drop the original handshake_response before delayed injection")
+
+        drop_response.cleanup(vm)
+        baseline_ack = ack_probe.packets(vm, "pure_ipv4_ack")
+        baseline_stats = read_module_stats(vm)
+        inject_config = {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "flags": "ack",
+            "seq": synack_data["seq"] + 1,
+            "ack": syn_data["seq"] + 1 + len(REQ),
+            "payload": RESP,
+        }
+        write_guest_text(vm, inject_config_file, json.dumps(inject_config))
+        write_guest_text(vm, continue_file, "ready\n")
+
+        client_result = client.communicate(timeout=20)
+        server_result = server.communicate(timeout=20)
+        assert_completed(client_result, "control-drop ACK sender")
+        assert_completed(server_result, "control-drop ACK receiver")
+        client_data = parse_guest_json(client_result.stdout, "control-drop ACK sender stdout")
+        server_data = parse_guest_json(server_result.stdout, "control-drop ACK receiver stdout")
+        if client_data.get("sent") != ["client-0", "client-1"]:
+            pytest.fail(f"control-drop ACK sender sent unexpected payloads: {client_data!r}")
+        if received_messages(server_data) != ["client-0", "client-1"]:
+            pytest.fail(f"control-drop ACK receiver saw unexpected payloads: {server_data!r}")
+        if not server_data.get("injected"):
+            pytest.fail(f"control-drop ACK receiver did not inject delayed response: {server_data!r}")
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            final_ack = ack_probe.packets(vm, "pure_ipv4_ack")
+            if final_ack > baseline_ack:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("delayed control-payload drop did not emit its immediate pure ACK")
+
+        final_stats = read_module_stats(vm)
+        if final_stats["idle_acks_suppressed"] != baseline_stats["idle_acks_suppressed"]:
+            pytest.fail(
+                "control-payload drops must not use the idle ACK suppression path: "
+                f"before={baseline_stats!r} after={final_stats!r}"
+            )
+        if final_stats["shaping_payloads_dropped"] <= baseline_stats["shaping_payloads_dropped"]:
+            pytest.fail(
+                "delayed handshake_response was not accounted as a dropped shaping payload: "
+                f"before={baseline_stats!r} after={final_stats!r}"
+            )
+    finally:
+        for process in (client, server, syn_capture, synack_capture):
+            if process is not None and process.proc.poll() is None:
+                process.terminate()
+        drop_response.cleanup(vm)
+        ack_probe.cleanup(vm)
+        vm.run(["rm", "-f", syn_ready, synack_ready, server_ready, continue_file, inject_config_file], check=False)
         cleanup_netns_topology(vm)
 
 

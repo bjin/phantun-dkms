@@ -21,6 +21,8 @@
 #include "phantun_packet.h"
 #include "phantun_stats.h"
 
+#define PHT_FLOW_IDLE_ACK_SUPPRESSION_WINDOW_MS 250U
+
 /* Terminal teardown normally frees the full flow immediately. This tiny
  * per-bucket cache is the only state kept behind: enough for local reopen to
  * choose an ISN outside the previous generation's sequence window.
@@ -430,6 +432,10 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
     table->handshake_timeout_jiffies = msecs_to_jiffies(cfg->handshake_timeout_ms);
     table->replacement_protect_jiffies = msecs_to_jiffies(cfg->effective_replacement_protect_ms);
     table->keepalive_interval_jiffies = msecs_to_jiffies(cfg->keepalive_interval_sec * 1000U);
+    table->idle_ack_suppression_window_jiffies =
+        msecs_to_jiffies(PHT_FLOW_IDLE_ACK_SUPPRESSION_WINDOW_MS);
+    if (table->idle_ack_suppression_window_jiffies == 0)
+        table->idle_ack_suppression_window_jiffies = 1;
     table->keepalive_misses = cfg->keepalive_misses;
     table->hard_idle_timeout_jiffies = msecs_to_jiffies(cfg->hard_idle_timeout_sec * 1000U);
     table->reopen_guard_bytes = cfg->reopen_guard_bytes;
@@ -964,6 +970,7 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table, const struct pht_
     flow->max_retries = table->handshake_retries;
     flow->last_activity_jiffies = jiffies;
     flow->last_inbound_jiffies = jiffies;
+    flow->last_established_payload_tx_jiffies = 0;
     flow->keepalives_sent = 0;
     flow->retransmit_at_jiffies = jiffies;
     flow->retransmit_armed = false;

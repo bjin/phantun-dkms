@@ -134,6 +134,10 @@ struct pht_flow {
     unsigned int max_retries;
     unsigned long last_activity_jiffies;
     unsigned long last_inbound_jiffies;
+    /* 64-bit so an expired ACK-suppression marker can never become recent
+     * again when 32-bit jiffies wraps on long-lived receive-heavy flows.
+     */
+    u64 last_established_payload_tx_jiffies;
     unsigned long retransmit_at_jiffies;
     unsigned long quarantine_until_jiffies;
     unsigned long replacement_protect_until_jiffies;
@@ -187,6 +191,7 @@ struct pht_flow_table {
     struct list_head finalize_list;
     spinlock_t finalize_lock;
     unsigned long keepalive_interval_jiffies;
+    unsigned long idle_ack_suppression_window_jiffies;
     unsigned long hard_idle_timeout_jiffies;
     unsigned long handshake_timeout_jiffies;
     unsigned long replacement_protect_jiffies;

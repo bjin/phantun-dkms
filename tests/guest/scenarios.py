@@ -59,6 +59,20 @@ def _emit(payload):
     print(json.dumps(payload))
 
 
+def _wait_for_file(path, timeout_sec=TIMEOUT_SEC):
+    if not path:
+        return
+
+    marker = Path(path)
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if marker.exists():
+            return
+        time.sleep(0.02)
+
+    raise TimeoutError(f"timed out waiting for {path}")
+
+
 def ping_server(config):
     with _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec")) as sock:
         data, addr = sock.recvfrom(2048)
@@ -263,6 +277,121 @@ def send_many_recv(config):
     _emit({"sent": payloads, "replies": replies})
 
 
+def ack_suppression_barrier_server(config):
+    received = []
+    ready_file = config.get("ready_file")
+    first_received_file = config["first_received_file"]
+    send_reply_file = config["send_reply_file"]
+    immediate_received_file = config["immediate_received_file"]
+    barrier_timeout_sec = config.get("barrier_timeout_sec", TIMEOUT_SEC)
+    reply_delay_ms = config.get("reply_delay_ms", 350)
+    reply_payload = config.get("reply_payload", "reply")
+
+    with _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec")) as sock:
+        if ready_file:
+            Path(ready_file).write_text("ready\n")
+        try:
+            data, addr = sock.recvfrom(2048)
+            received.append({"message": data.decode(), "peer": [addr[0], addr[1]]})
+            Path(first_received_file).write_text("ready\n")
+
+            _wait_for_file(send_reply_file, barrier_timeout_sec)
+            Path(send_reply_file).unlink(missing_ok=True)
+            if reply_delay_ms:
+                time.sleep(reply_delay_ms / 1000.0)
+            sock.sendto(reply_payload.encode(), addr)
+
+            data, addr = sock.recvfrom(2048)
+            received.append({"message": data.decode(), "peer": [addr[0], addr[1]]})
+            Path(immediate_received_file).write_text("ready\n")
+
+            data, addr = sock.recvfrom(2048)
+            received.append({"message": data.decode(), "peer": [addr[0], addr[1]]})
+        finally:
+            if ready_file:
+                Path(ready_file).unlink(missing_ok=True)
+            Path(first_received_file).unlink(missing_ok=True)
+            Path(immediate_received_file).unlink(missing_ok=True)
+
+    _emit({"received": received, "reply": reply_payload})
+
+
+def ack_suppression_barrier_client(config):
+    payloads = config["payloads"]
+    replies = []
+    send_delayed_file = config["send_delayed_file"]
+    barrier_timeout_sec = config.get("barrier_timeout_sec", TIMEOUT_SEC)
+    delayed_payload_delay_ms = config.get("delayed_payload_delay_ms", 350)
+
+    with _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec")) as sock:
+        target = _addr_tuple(config["target_addr"], config["target_port"], config.get("target_scope_dev"))
+        sock.sendto(payloads[0].encode(), target)
+
+        reply, addr = sock.recvfrom(2048)
+        replies.append({"message": reply.decode(), "peer": [addr[0], addr[1]]})
+        sock.sendto(payloads[1].encode(), target)
+
+        _wait_for_file(send_delayed_file, barrier_timeout_sec)
+        Path(send_delayed_file).unlink(missing_ok=True)
+        if delayed_payload_delay_ms:
+            time.sleep(delayed_payload_delay_ms / 1000.0)
+        sock.sendto(payloads[2].encode(), target)
+
+    _emit({"sent": payloads, "replies": replies})
+
+
+def send_many_with_barrier(config):
+    payloads = config["payloads"]
+    initial_count = config.get("initial_count", 1)
+    continue_file = config["continue_file"]
+    barrier_timeout_sec = config.get("barrier_timeout_sec", TIMEOUT_SEC)
+    sent = []
+
+    with _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec")) as sock:
+        target = _addr_tuple(config["target_addr"], config["target_port"], config.get("target_scope_dev"))
+        for payload in payloads[:initial_count]:
+            sock.sendto(payload.encode(), target)
+            sent.append(payload)
+
+        _wait_for_file(continue_file, barrier_timeout_sec)
+        Path(continue_file).unlink(missing_ok=True)
+
+        for payload in payloads[initial_count:]:
+            sock.sendto(payload.encode(), target)
+            sent.append(payload)
+
+    _emit({"sent": sent})
+
+
+def recv_many_then_inject_tcp(config):
+    received = []
+    target_count = config["count"]
+    inject_after_count = config.get("inject_after_count", target_count)
+    inject_config_file = config["inject_config_file"]
+    ready_file = config.get("ready_file")
+    barrier_timeout_sec = config.get("barrier_timeout_sec", TIMEOUT_SEC)
+    injected = False
+
+    with _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec")) as sock:
+        if ready_file:
+            Path(ready_file).write_text("ready\n")
+        try:
+            while len(received) < target_count:
+                data, addr = sock.recvfrom(2048)
+                received.append({"message": data.decode(), "peer": [addr[0], addr[1]]})
+                if not injected and len(received) >= inject_after_count:
+                    _wait_for_file(inject_config_file, barrier_timeout_sec)
+                    inject_config = json.loads(Path(inject_config_file).read_text())
+                    _send_ipv4_tcp_packet(inject_config)
+                    injected = True
+        finally:
+            if ready_file:
+                Path(ready_file).unlink(missing_ok=True)
+            Path(inject_config_file).unlink(missing_ok=True)
+
+    _emit({"received": received, "injected": injected})
+
+
 def multi_server(config):
     received = []
     target_count = config["count"]
@@ -447,9 +576,7 @@ def _tcp_flags_expr(expr):
     return value
 
 
-def send_tcp_packet(config):
-    import struct
-
+def _send_ipv4_tcp_packet(config):
     src_addr = config["bind_addr"]
     dst_addr = config["target_addr"]
     src_port = config["bind_port"]
@@ -540,6 +667,9 @@ def send_tcp_packet(config):
         raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
         raw_sock.sendto(ip_header + tcp_header + payload, (dst_addr, 0))
 
+
+def send_tcp_packet(config):
+    _send_ipv4_tcp_packet(config)
     _emit({"done": True})
 
 
@@ -818,8 +948,12 @@ SCENARIOS = {
     "send_l2_tcp_packet": send_l2_tcp_packet,
     "capture_tcp_packet": capture_tcp_packet,
     "recv_many_reply": recv_many_reply,
+    "send_many_with_barrier": send_many_with_barrier,
+    "recv_many_then_inject_tcp": recv_many_then_inject_tcp,
     "recv_until_timeout": recv_until_timeout,
     "send_many_recv": send_many_recv,
+    "ack_suppression_barrier_server": ack_suppression_barrier_server,
+    "ack_suppression_barrier_client": ack_suppression_barrier_client,
     "multi_server": multi_server,
     "multi_client": multi_client,
 }

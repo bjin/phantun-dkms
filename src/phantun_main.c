@@ -1156,9 +1156,12 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
     ret = pht_flow_emit_established_payload(flow, net, ep, seq, ack, skb, view->payload_offset,
                                             view->payload_len, meta, &ifindex);
     if (!ret) {
+        unsigned long now = jiffies;
+        u64 now64 = get_jiffies_64();
         spin_lock_bh(&flow->lock);
         if (flow->state == PHT_FLOW_STATE_ESTABLISHED) {
-            flow->last_activity_jiffies = jiffies;
+            flow->last_activity_jiffies = now;
+            flow->last_established_payload_tx_jiffies = now64;
             flow->egress_ifindex = ifindex;
             if (persist_meta && meta)
                 flow->local_tx_meta = *meta;
@@ -1430,6 +1433,33 @@ static void phantun_note_inbound_payload(struct pht_flow *flow, const struct pht
     phantun_refresh_inbound_progress(flow, view, NULL);
 }
 
+/* Immediate inbound-data ACK suppression is deliberately a short, local
+ * bidirectional burst optimization.  Expire stale timestamps under the flow
+ * lock so old local sends cannot re-enter the window after jiffies wrap.
+ */
+static bool phantun_should_suppress_idle_ack(struct pht_flow *flow) {
+    u64 last_tx;
+    u64 now;
+    unsigned long window;
+    u64 deadline;
+    bool suppress;
+
+    spin_lock_bh(&flow->lock);
+    last_tx = flow->last_established_payload_tx_jiffies;
+    suppress = false;
+    if (last_tx != 0) {
+        now = get_jiffies_64();
+        window = flow->table->idle_ack_suppression_window_jiffies;
+        deadline = last_tx + window;
+        suppress = time_after_eq64(now, last_tx) && time_before64(now, deadline);
+        if (!suppress && time_after_eq64(now, deadline))
+            flow->last_established_payload_tx_jiffies = 0;
+    }
+    spin_unlock_bh(&flow->lock);
+
+    return suppress;
+}
+
 static int
 phantun_finalize_established_rx(struct pht_flow *flow, const struct pht_endpoint_pair *ep,
                                 const struct sk_buff *skb, const struct pht_l4_view *view,
@@ -1464,8 +1494,15 @@ phantun_finalize_established_rx(struct pht_flow *flow, const struct pht_endpoint
         }
     }
 
-    if (send_idle_ack && view->payload_len)
-        ret = phantun_send_idle_ack(flow, net, reply_meta);
+    if (send_idle_ack && view->payload_len) {
+        /* Reserved first-payload control drops are not application data; they
+         * still need the prompt pure ACK that releases control-response state.
+         */
+        if (reinject_payload && phantun_should_suppress_idle_ack(flow))
+            pht_stats_inc(PHT_STAT_IDLE_ACKS_SUPPRESSED);
+        else
+            ret = phantun_send_idle_ack(flow, net, reply_meta);
+    }
     return ret;
 }
 

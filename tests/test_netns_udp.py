@@ -22,6 +22,7 @@ from helpers import (
     make_netns_ingress_flag_drop_probe,
     make_netns_ingress_payload_drop_probe,
     make_netns_output_probe,
+    make_netns_output_ipv4_pure_ack_probe,
     parse_guest_json,
     probe_comment,
     read_module_stat,
@@ -40,6 +41,10 @@ SECONDARY_ADDR_B = "10.200.0.20"
 
 def load_netns_module(phantun_module):
     phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
+
+
+def write_guest_marker(vm, path):
+    vm.run(["python3", "-c", f"from pathlib import Path; Path({path!r}).write_text('ready\\n')"])
 
 
 # Build small INPUT policies that mimic stateful host firewalls. The reply path
@@ -876,6 +881,7 @@ def test_netns_established_payload_ack_uses_inbound_reply_metadata(phantun_modul
             dscp,
         )
         probes.append(ack_probe)
+        stats_before_marked = read_module_stats(vm)
 
         marked_server = spawn_netns_scenario(
             vm,
@@ -913,9 +919,156 @@ def test_netns_established_payload_ack_uses_inbound_reply_metadata(phantun_modul
             pytest.fail("test rule did not mark established inbound fake-TCP payload metadata")
         if ack_probe.packets(vm, "inbound_marked_ack") == 0:
             pytest.fail("pure ACK reply did not copy inbound fake-TCP metadata")
+        stats_after_marked = read_module_stats(vm)
+        if stats_after_marked["idle_acks_suppressed"] != stats_before_marked["idle_acks_suppressed"]:
+            pytest.fail(
+                "receive-only established payload should still emit an immediate ACK: "
+                f"before={stats_before_marked!r} after={stats_after_marked!r}"
+            )
     finally:
         for probe in probes:
             probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_netns_recent_bidirectional_payload_suppresses_idle_ack(phantun_module, vm):
+    load_netns_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    prefix = f"/tmp/phantun_ack_suppress_{uuid.uuid4().hex}"
+    server_ready = f"{prefix}_server_ready"
+    first_received = f"{prefix}_first_received"
+    send_reply = f"{prefix}_send_reply"
+    immediate_received = f"{prefix}_immediate_received"
+    send_delayed = f"{prefix}_send_delayed"
+    ack_probe = make_netns_output_ipv4_pure_ack_probe(
+        vm,
+        NS_B,
+        NS_ADDR_B,
+        dst_port,
+        NS_ADDR_A,
+        src_port,
+    )
+    server = None
+    client = None
+
+    try:
+        server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "ack_suppression_barrier_server",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "timeout_sec": 20,
+                "ready_file": server_ready,
+                "first_received_file": first_received,
+                "send_reply_file": send_reply,
+                "immediate_received_file": immediate_received,
+                "barrier_timeout_sec": 12,
+                "reply_delay_ms": 400,
+                "reply_payload": "reply",
+            },
+        )
+        wait_for_guest_ready_file(vm, server_ready, timeout=5)
+
+        pure_before = ack_probe.packets(vm, "pure_ipv4_ack")
+        stats_before = read_module_stats(vm)
+        client = spawn_netns_scenario(
+            vm,
+            NS_A,
+            "ack_suppression_barrier_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "timeout_sec": 20,
+                "payloads": ["receive-only", "immediate", "delayed"],
+                "send_delayed_file": send_delayed,
+                "barrier_timeout_sec": 12,
+                "delayed_payload_delay_ms": 400,
+            },
+        )
+
+        wait_for_guest_ready_file(vm, first_received, timeout=10)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            pure_after_receive_only = ack_probe.packets(vm, "pure_ipv4_ack")
+            if pure_after_receive_only > pure_before:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("receive-only established payload did not emit a pure ACK")
+
+        stats_after_receive_only = read_module_stats(vm)
+        if stats_after_receive_only["idle_acks_suppressed"] != stats_before["idle_acks_suppressed"]:
+            pytest.fail(
+                "receive-only established payload should not suppress its ACK: "
+                f"before={stats_before!r} after={stats_after_receive_only!r}"
+            )
+
+        write_guest_marker(vm, send_reply)
+        wait_for_guest_ready_file(vm, immediate_received, timeout=10)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            stats_after_immediate = read_module_stats(vm)
+            if stats_after_immediate["idle_acks_suppressed"] > stats_after_receive_only["idle_acks_suppressed"]:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("recent bidirectional payload did not increment idle_acks_suppressed")
+
+        pure_after_immediate = ack_probe.packets(vm, "pure_ipv4_ack")
+        if pure_after_immediate != pure_after_receive_only:
+            pytest.fail(
+                "recent bidirectional payload should suppress the pure ACK: "
+                f"receive_only={pure_after_receive_only} immediate={pure_after_immediate}"
+            )
+
+        write_guest_marker(vm, send_delayed)
+        server_result = server.communicate(timeout=20)
+        client_result = client.communicate(timeout=20)
+        assert_completed(server_result, "ACK suppression barrier receiver")
+        assert_completed(client_result, "ACK suppression barrier sender")
+
+        server_data = parse_guest_json(server_result.stdout, "ACK suppression receiver stdout")
+        client_data = parse_guest_json(client_result.stdout, "ACK suppression sender stdout")
+        if [entry["message"] for entry in server_data.get("received", [])] != [
+            "receive-only",
+            "immediate",
+            "delayed",
+        ]:
+            pytest.fail(f"ACK suppression receiver saw unexpected payloads: {server_data!r}")
+        if [entry["message"] for entry in client_data.get("replies", [])] != ["reply"]:
+            pytest.fail(f"ACK suppression sender saw unexpected replies: {client_data!r}")
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            pure_after_delayed = ack_probe.packets(vm, "pure_ipv4_ack")
+            if pure_after_delayed > pure_after_immediate:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("payload outside ACK suppression window did not emit a pure ACK")
+
+        stats_after_delayed = read_module_stats(vm)
+        if stats_after_delayed["idle_acks_suppressed"] != stats_after_immediate["idle_acks_suppressed"]:
+            pytest.fail(
+                "payload outside ACK suppression window should not increment suppressed ACK stats: "
+                f"immediate={stats_after_immediate!r} delayed={stats_after_delayed!r}"
+            )
+    finally:
+        for process in (client, server):
+            if process is not None and process.proc.poll() is None:
+                process.terminate()
+        ack_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 

@@ -256,7 +256,8 @@ Each flow stores:
 - reserved first-payload ignore slot
 - responder control-response pending-ACK / pending-release flag
 - retransmit timer state
-- idle timestamp
+- idle and inbound-liveness timestamps
+- last successful established local-payload transmit timestamp for ACK suppression
 - initiator bare-`SYN` replacement-protection deadline
 - refcount and lock
 
@@ -299,7 +300,12 @@ Behavior:
 - later higher-sequence responder payloads deliver normally
 - normal UDP ↔ fake-TCP translation follows
 - accepted inbound packet refreshes liveness suspicion, including pure `ACK` and handshake-response acknowledgement traffic
+- accepted inbound payload normally sends an immediate pure `ACK`
+- that immediate payload `ACK` may be skipped only when this endpoint sent established fake-TCP payload data on the same flow within the fixed 250 ms suppression window
+- reserved first-payload control drops still send the immediate pure `ACK`; they are not eligible for suppression
+- receive-only flows and flows outside that window keep the previous immediate pure-`ACK` behavior
 - after `keepalive_interval_sec` without valid inbound traffic: send pure `ACK` keepalive
+- the suppression window does not change this inbound-driven liveness rule
 - after `keepalive_misses * keepalive_interval_sec` without valid inbound traffic: send a best-effort `RST` if the stored route/source identity can still transmit, then destroy local state
   - if RST emission fails, destroy local state silently
   - if one outbound UDP skb is already queued, create fresh `SYN_SENT`, carry that skb, send `SYN`
@@ -360,6 +366,11 @@ Behavior:
 - `ack` tracks peer `seq + payload_len`
 - if injected responder `handshake_response` still awaits acknowledgement, responder UDP follows the one-skb queue/drop rule until release
 - accepted inbound packet refreshes liveness suspicion
+- accepted inbound payload normally sends an immediate pure `ACK`
+- that immediate payload `ACK` may be skipped only when this endpoint sent established fake-TCP payload data on the same flow within the fixed 250 ms suppression window
+- reserved first-payload control drops still send the immediate pure `ACK`; they are not eligible for suppression
+- receive-only flows and flows outside that window keep the previous immediate pure-`ACK` behavior
+- if a payload-bearing final `ACK` transitions the responder to established and also flushes queued responder UDP first, the flushed data can carry the pre-payload `ack`; suppressing the follow-up pure `ACK` briefly leaves that acknowledgement lagging until later traffic because the protocol has no data retransmit
 - keepalive, liveness failure, and hard idle teardown use the same policy as initiator-established flows
 
 Inbound flag priority:

@@ -34,6 +34,7 @@ PHT_STAT_ATTR(request_payloads_injected, PHT_STAT_REQUEST_PAYLOADS_INJECTED);
 PHT_STAT_ATTR(response_payloads_injected, PHT_STAT_RESPONSE_PAYLOADS_INJECTED);
 PHT_STAT_ATTR(shaping_payloads_dropped, PHT_STAT_SHAPING_PAYLOADS_DROPPED);
 PHT_STAT_ATTR(rst_sent, PHT_STAT_RST_SENT);
+PHT_STAT_ATTR(idle_acks_suppressed, PHT_STAT_IDLE_ACKS_SUPPRESSED);
 PHT_STAT_ATTR(route_cache_hits, PHT_STAT_ROUTE_CACHE_HITS);
 PHT_STAT_ATTR(route_cache_misses, PHT_STAT_ROUTE_CACHE_MISSES);
 PHT_STAT_ATTR(udp_packets_queued, PHT_STAT_UDP_PACKETS_QUEUED);
@@ -63,6 +64,7 @@ static struct attribute *pht_stats_attrs[] = {
     &response_payloads_injected_attr.attr,
     &shaping_payloads_dropped_attr.attr,
     &rst_sent_attr.attr,
+    &idle_acks_suppressed_attr.attr,
     &route_cache_hits_attr.attr,
     &route_cache_misses_attr.attr,
     &udp_packets_queued_attr.attr,
