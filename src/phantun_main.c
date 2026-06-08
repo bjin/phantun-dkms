@@ -1112,13 +1112,18 @@ static int phantun_send_flow_rst(struct pht_flow *flow, struct net *net) {
     return ret;
 }
 
+/* Returns 0 for a successful emit, or for a stale-generation drop where the
+ * UDP skb is intentionally consumed. -EMSGSIZE is non-terminal. Any other
+ * error owns terminal established-send teardown before returning.
+ */
 static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_endpoint_pair *ep,
                                         const struct pht_l4_view *view, const struct sk_buff *skb,
                                         const struct pht_tx_meta *meta, struct net *net,
-                                        bool persist_meta) {
+                                        bool persist_meta, bool send_rst_on_fatal_failure) {
+    u32 local_seq_window_start;
+    bool fatal_failure = false;
     u32 seq;
     u32 ack;
-    u32 local_seq_window_start;
     int ifindex;
     int ret;
 
@@ -1142,7 +1147,7 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
     if (flow->state != PHT_FLOW_STATE_ESTABLISHED) {
         spin_unlock_bh(&flow->lock);
         spin_unlock_bh(&flow->tx_lock);
-        return -EAGAIN;
+        return 0;
     }
     if (persist_meta && meta)
         flow->local_tx_meta = *meta;
@@ -1171,13 +1176,13 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
         bool stale_generation = ret == -EAGAIN;
 
         spin_lock_bh(&flow->lock);
-        if (flow->state == PHT_FLOW_STATE_ESTABLISHED) {
-            if (flow->seq == seq + view->payload_len) {
-                flow->seq = seq;
-                flow->local_seq_window_start = local_seq_window_start;
-            }
-            if (!stale_generation)
-                flow->state = PHT_FLOW_STATE_DEAD;
+        if (flow->state == PHT_FLOW_STATE_ESTABLISHED && flow->seq == seq + view->payload_len) {
+            flow->seq = seq;
+            flow->local_seq_window_start = local_seq_window_start;
+        }
+        if (!stale_generation) {
+            flow->state = PHT_FLOW_STATE_DEAD;
+            fatal_failure = true;
         }
         spin_unlock_bh(&flow->lock);
         /* -EAGAIN is the emit helper's generation guard: the flow stopped
@@ -1188,6 +1193,12 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
             ret = 0;
     }
     spin_unlock_bh(&flow->tx_lock);
+
+    if (fatal_failure) {
+        if (send_rst_on_fatal_failure)
+            phantun_send_flow_rst(flow, net);
+        pht_flow_remove(flow);
+    }
 
     return ret;
 }
@@ -1353,9 +1364,10 @@ static int phantun_flush_queued_udp(struct pht_flow *flow, struct net *net, bool
 
     phantun_fill_udp_endpoint_pair(&qview, &qep);
     qep.scope_ifindex = flow->endpoints.scope_ifindex;
-    ret = phantun_send_established_udp(flow, &qep, &qview, queued_skb, &meta, net, false);
+    ret = phantun_send_established_udp(flow, &qep, &qview, queued_skb, &meta, net, false, false);
     if (ret && ret != -EMSGSIZE) {
-        pht_flow_set_queued_skb(flow, queued_skb, &meta);
+        phantun_account_udp_translation_failure();
+        kfree_skb(queued_skb);
         return ret;
     }
 
@@ -1633,12 +1645,11 @@ retry_lookup:
                 return NF_STOLEN;
             }
 
-            ret = phantun_send_established_udp(flow, &ep, &view, skb, &tx_meta, state->net, true);
+            ret = phantun_send_established_udp(flow, &ep, &view, skb, &tx_meta, state->net, true,
+                                               true);
             if (ret && ret != -EMSGSIZE) {
                 phantun_account_udp_translation_failure();
                 pht_pr_warn("failed to emit fake-TCP payload for established flow: %d\n", ret);
-                phantun_send_flow_rst(flow, state->net);
-                pht_flow_remove(flow);
             }
             pht_flow_put(flow);
             kfree_skb(skb);

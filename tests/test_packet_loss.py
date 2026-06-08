@@ -82,6 +82,40 @@ def wait_for_flows_current(vm, expected, timeout=10):
     pytest.fail(f"flows_current did not reach {expected}: current={stats!r}")
 
 
+def wait_for_flows_above(vm, baseline, timeout=5):
+    stats = read_module_stats(vm)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if stats["flows_current"] > baseline:
+            return stats
+        time.sleep(0.1)
+        stats = read_module_stats(vm)
+    pytest.fail(f"flows_current did not exceed {baseline}: current={stats!r}")
+
+
+def wait_for_flows_below(vm, baseline, timeout=10):
+    stats = read_module_stats(vm)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if stats["flows_current"] < baseline:
+            return stats
+        time.sleep(0.1)
+        stats = read_module_stats(vm)
+    pytest.fail(f"flows_current did not fall below {baseline}: current={stats!r}")
+
+
+def wait_for_probe_packets(vm, probe, comment, timeout=5):
+    packets = 0
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        packets = probe.packets(vm, comment)
+        if packets > 0:
+            return packets
+        time.sleep(0.1)
+
+    pytest.fail(f"probe {comment!r} did not observe packets: packets={packets}")
+
+
 def test_initial_syn_emit_failure_releases_flow_slot_and_queue(phantun_module, vm):
     load_loss_module(phantun_module)
     ensure_netns_topology(vm)
@@ -167,6 +201,131 @@ def test_initial_syn_emit_failure_releases_flow_slot_and_queue(phantun_module, v
             pytest.fail(f"failed initial SYN retained or delivered queued skb: {server_data!r}")
     finally:
         probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_established_payload_emit_failure_tears_down_flow_and_allows_reopen(phantun_module, vm):
+    load_loss_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    baseline_stats = read_module_stats(vm)
+    continue_file = f"/tmp/phantun-established-drop-{uuid.uuid4().hex}"
+    drop_probe = None
+    client = None
+    first_server = None
+    fresh_server = None
+
+    try:
+        first_server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_many",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 1,
+                "timeout_sec": 10,
+            },
+        )
+        time.sleep(0.2)
+        client = spawn_netns_scenario(
+            vm,
+            NS_A,
+            "send_many_with_barrier",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["establish-ok", "fatal-established-drop"],
+                "initial_count": 1,
+                "continue_file": continue_file,
+                "barrier_timeout_sec": 10,
+            },
+        )
+
+        first_result = first_server.communicate(timeout=15)
+        assert_completed(first_result, "established-send failure first receiver")
+        first_data = parse_guest_json(first_result.stdout, "established-send failure first stdout")
+        if received_messages(first_data) != ["establish-ok"]:
+            pytest.fail(f"expected established first payload before drop, got {first_data!r}")
+
+        wait_for_flows_above(vm, baseline_stats["flows_current"])
+        drop_probe = make_netns_output_flag_probe(
+            vm,
+            NS_A,
+            [
+                {
+                    "src_addr": NS_ADDR_A,
+                    "src_port": src_port,
+                    "dst_addr": NS_ADDR_B,
+                    "dst_port": dst_port,
+                    "flags_expr": "ack",
+                    "action": "drop",
+                    "comment": "drop_established_payload_emit",
+                }
+            ],
+        )
+
+        write_guest_text(vm, continue_file, "continue\n")
+        client_result = client.communicate(timeout=15)
+        assert_completed(client_result, "established-send failure sender")
+        wait_for_probe_packets(vm, drop_probe, "drop_established_payload_emit")
+
+        failure_stats = wait_for_flows_current(vm, baseline_stats["flows_current"])
+        translation_failures = (
+            failure_stats["udp_translation_failed_dropped"] - baseline_stats["udp_translation_failed_dropped"]
+        )
+        if translation_failures != 1:
+            pytest.fail(f"expected exactly one established UDP translation failure, got {failure_stats!r}")
+        if failure_stats["rst_sent"] <= baseline_stats["rst_sent"]:
+            pytest.fail(f"expected established-send failure to emit a best-effort RST, got {failure_stats!r}")
+
+        drop_probe.cleanup(vm)
+        drop_probe = None
+
+        fresh_server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_many",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 1,
+                "timeout_sec": 10,
+            },
+        )
+        time.sleep(0.2)
+        fresh_client = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["fresh-flow"],
+            },
+        )
+        assert_completed(fresh_client, "fresh flow sender after established-send failure")
+        fresh_result = fresh_server.communicate(timeout=15)
+        assert_completed(fresh_result, "fresh flow receiver after established-send failure")
+        fresh_data = parse_guest_json(fresh_result.stdout, "fresh flow receiver stdout")
+        if received_messages(fresh_data) != ["fresh-flow"]:
+            pytest.fail(f"established-send failure retained a stale flow: {fresh_data!r}")
+    finally:
+        if drop_probe is not None:
+            drop_probe.cleanup(vm)
+        for proc in (client, first_server, fresh_server):
+            if proc is not None and proc.proc.poll() is None:
+                proc.terminate()
         cleanup_netns_topology(vm)
 
 
@@ -1269,6 +1428,188 @@ def test_duplicate_outbound_udp_while_half_open_queues_only_one_skb(phantun_modu
             pytest.fail(f"expected later duplicate UDP to count as queue-full drop, got {final_stats!r}")
     finally:
         probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_queued_established_payload_emit_failure_frees_skb_and_does_not_send_rst(phantun_module, vm):
+    load_loss_module(phantun_module, handshake_timeout_ms=3000, handshake_retries=1)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    initial_stats = read_module_stats(vm)
+    drop_synack = None
+    drop_queued = None
+    payload_probe = None
+    server = None
+    fresh_server = None
+
+    try:
+        drop_synack = make_netns_ingress_flag_drop_probe(
+            vm,
+            NS_A,
+            VETH_A,
+            [
+                {
+                    "src_addr": NS_ADDR_B,
+                    "src_port": dst_port,
+                    "dst_addr": NS_ADDR_A,
+                    "dst_port": src_port,
+                    "flags_expr": "syn | ack",
+                    "comment": "drop_synack_before_queue_flush",
+                }
+            ],
+        )
+        server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_until_timeout",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 1,
+                "timeout_sec": 8,
+            },
+        )
+        time.sleep(0.2)
+        client = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["queued-fatal-drop"],
+            },
+        )
+        assert_completed(client, "queued established-send failure sender")
+
+        queued_stats = read_module_stats(vm)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if queued_stats["udp_packets_queued"] - initial_stats["udp_packets_queued"] == 1:
+                break
+            time.sleep(0.1)
+            queued_stats = read_module_stats(vm)
+        else:
+            pytest.fail(f"expected one half-open queued UDP skb, got {queued_stats!r}")
+
+        wait_for_probe_packets(vm, drop_synack, "drop_synack_before_queue_flush")
+        queued_stats = read_module_stats(vm)
+        drop_queued = make_netns_output_flag_probe(
+            vm,
+            NS_A,
+            [
+                {
+                    "src_addr": NS_ADDR_A,
+                    "src_port": src_port,
+                    "dst_addr": NS_ADDR_B,
+                    "dst_port": dst_port,
+                    "flags_expr": "ack",
+                    "action": "drop",
+                    "comment": "drop_queued_payload_emit",
+                },
+                {
+                    "src_addr": NS_ADDR_A,
+                    "src_port": src_port,
+                    "dst_addr": NS_ADDR_B,
+                    "dst_port": dst_port,
+                    "flags_expr": "rst | ack",
+                    "action": "drop",
+                    "comment": "drop_unrelated_unknown_tuple_rstack",
+                },
+            ],
+        )
+
+        drop_synack.cleanup(vm)
+        drop_synack = None
+        wait_for_probe_packets(vm, drop_queued, "drop_queued_payload_emit", timeout=6)
+
+        failure_stats = read_module_stats(vm)
+        translation_failures = (
+            failure_stats["udp_translation_failed_dropped"] - queued_stats["udp_translation_failed_dropped"]
+        )
+        if translation_failures != 1:
+            pytest.fail(f"expected exactly one queued UDP translation failure, got {failure_stats!r}")
+        if failure_stats["rst_sent"] != queued_stats["rst_sent"]:
+            pytest.fail(f"queued established-send failure must not emit RST, got {failure_stats!r}")
+
+        wait_for_flows_below(vm, queued_stats["flows_current"])
+
+        server_result = server.communicate(timeout=12)
+        assert_completed(server_result, "queued established-send failure receiver")
+        server_data = parse_guest_json(server_result.stdout, "queued failure receiver stdout")
+        if not server_data.get("timed_out") or received_messages(server_data):
+            pytest.fail(f"queued payload was unexpectedly delivered: {server_data!r}")
+
+        payload_probe = make_netns_tcp_payload_probe(
+            vm,
+            NS_A,
+            [
+                {
+                    "src_addr": NS_ADDR_A,
+                    "src_port": src_port,
+                    "dst_addr": NS_ADDR_B,
+                    "dst_port": dst_port,
+                    "payload": "queued-fatal-drop",
+                    "comment": "queued_payload_replayed",
+                    "action": "accept",
+                }
+            ],
+        )
+        drop_queued.cleanup(vm)
+        drop_queued = None
+
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            if payload_probe.packets(vm, "queued_payload_replayed") != 0:
+                pytest.fail("queued payload was retained and replayed after the drop rule was removed")
+            time.sleep(0.1)
+
+        wait_for_flows_current(vm, initial_stats["flows_current"], timeout=12)
+        fresh_server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_many",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 1,
+                "timeout_sec": 10,
+            },
+        )
+        time.sleep(0.2)
+        fresh_client = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["fresh-after-queued-failure"],
+            },
+        )
+        assert_completed(fresh_client, "fresh sender after queued established-send failure")
+        fresh_result = fresh_server.communicate(timeout=15)
+        assert_completed(fresh_result, "fresh receiver after queued established-send failure")
+        fresh_data = parse_guest_json(fresh_result.stdout, "fresh queued-failure receiver stdout")
+        if received_messages(fresh_data) != ["fresh-after-queued-failure"]:
+            pytest.fail(f"queued established-send failure retained a stale flow: {fresh_data!r}")
+    finally:
+        for probe in (drop_synack, drop_queued, payload_probe):
+            if probe is not None:
+                probe.cleanup(vm)
+        for proc in (server, fresh_server):
+            if proc is not None and proc.proc.poll() is None:
+                proc.terminate()
         cleanup_netns_topology(vm)
 
 

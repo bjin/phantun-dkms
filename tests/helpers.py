@@ -453,11 +453,19 @@ def make_netns_ingress_drop_probe(vm, namespace, dev, rules):
     return NetnsNftProbe(namespace, "netdev", table_name, "ingress")
 
 
-def payload_hex(payload):
+def payload_bytes(payload):
     if isinstance(payload, str):
-        payload = payload.encode()
+        return payload.encode()
+    return payload
 
-    return payload.hex()
+
+def tcp_payload_match_expr(payload):
+    chunks = []
+    payload = payload_bytes(payload)
+    for offset in range(0, len(payload), 8):
+        chunk = payload[offset : offset + 8]
+        chunks.append(f"@th,{160 + offset * 8},{len(chunk) * 8} 0x{chunk.hex()}")
+    return " ".join(chunks)
 
 
 def make_netns_tcp_payload_probe(vm, namespace, payload_rules):
@@ -469,14 +477,13 @@ def make_netns_tcp_payload_probe(vm, namespace, payload_rules):
     ]
 
     for rule in payload_rules:
-        payload_bits = len(rule["payload"].encode() if isinstance(rule["payload"], str) else rule["payload"]) * 8
-        payload_value = payload_hex(rule["payload"])
+        payload_match = tcp_payload_match_expr(rule["payload"])
         action = rule.get("action", "accept")
         lines.append(
             f"nft add rule inet {table_name} output "
             f'ip saddr {rule["src_addr"]} ip daddr {rule["dst_addr"]} '
             f'tcp sport {rule["src_port"]} tcp dport {rule["dst_port"]} '
-            f"@th,160,{payload_bits} 0x{payload_value} "
+            f"{payload_match} "
             f'counter {action} comment "{rule["comment"]}"'
         )
 
@@ -521,14 +528,13 @@ def make_netns_ingress_payload_drop_probe(vm, namespace, device, rules):
     ]
 
     for rule in rules:
-        payload_bits = len(rule["payload"].encode() if isinstance(rule["payload"], str) else rule["payload"]) * 8
-        payload_value = payload_hex(rule["payload"])
+        payload_match = tcp_payload_match_expr(rule["payload"])
         lines.append(
             f"nft 'add rule netdev {table_name} ingress "
             f"{nft_ip_prefix(rule['src_addr'])} saddr {rule['src_addr']} "
             f"{nft_ip_prefix(rule['dst_addr'])} daddr {rule['dst_addr']} "
             f"tcp sport {rule['src_port']} tcp dport {rule['dst_port']} "
-            f"@th,160,{payload_bits} 0x{payload_value} "
+            f"{payload_match} "
             f"counter {rule.get('action', 'drop')} comment \"{rule['comment']}\"'"
         )
 
