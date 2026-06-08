@@ -783,6 +783,133 @@ def test_handshake_response_loss_does_not_drop_later_replies(phantun_module, vm)
         cleanup_netns_topology(vm)
 
 
+def test_final_ack_shaping_payload_drop_is_one_shot(phantun_module, vm):
+    load_loss_module(phantun_module, handshake_request=REQ)
+    ensure_netns_topology(vm)
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    prefix = f"/tmp/phantun-final-ack-control-drop-{uuid.uuid4().hex}"
+    final_ack_ready = f"{prefix}-capture-ready"
+    server_ready = f"{prefix}-server-ready"
+    replay_ready = f"{prefix}-replay-ready"
+    final_ack_capture = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payload": REQ,
+            "ready_file": final_ack_ready,
+            "timeout_sec": 20,
+        },
+    )
+    server = None
+    replay_receiver = None
+    try:
+        wait_for_guest_ready_file(vm, final_ack_ready, timeout=5)
+        server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_until_timeout",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 1,
+                "ready_file": server_ready,
+                "timeout_sec": 20,
+            },
+        )
+        wait_for_guest_ready_file(vm, server_ready, timeout=5)
+        baseline_stats = read_module_stats(vm)
+
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["client-final-ack"],
+            },
+        )
+        capture_result = final_ack_capture.communicate(timeout=20)
+        server_result = server.communicate(timeout=20)
+        assert_completed(client_result, "final-ACK sender")
+        assert_completed(capture_result, "capture final ACK control payload")
+        assert_completed(server_result, "final-ACK receiver")
+
+        final_ack_data = parse_guest_json(capture_result.stdout, "captured final ACK control payload")
+        if (final_ack_data.get("flags", 0) & 0x12) != 0x10:
+            pytest.fail(f"expected final ACK control payload, got {final_ack_data!r}")
+
+        server_data = parse_guest_json(server_result.stdout, "final-ACK receiver stdout")
+        if received_messages(server_data) != ["client-final-ack"]:
+            pytest.fail(f"final-ACK receiver saw unexpected payloads: {server_data!r}")
+
+        expected_drops = baseline_stats["shaping_payloads_dropped"] + 1
+        first_stats = read_module_stats(vm)
+        if first_stats["shaping_payloads_dropped"] != expected_drops:
+            pytest.fail(
+                "final ACK handshake_request must be accounted exactly once as a dropped shaping payload: "
+                f"before={baseline_stats!r} after={first_stats!r}"
+            )
+
+        replay_receiver = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_until_timeout",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 1,
+                "ready_file": replay_ready,
+                "timeout_sec": 20,
+            },
+        )
+        wait_for_guest_ready_file(vm, replay_ready, timeout=5)
+
+        replay_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack",
+                "seq": final_ack_data["seq"],
+                "ack": final_ack_data["ack"],
+                "payload": REQ,
+            },
+        )
+        replay_receiver_result = replay_receiver.communicate(timeout=20)
+        assert_completed(replay_result, "final-ACK replay sender")
+        assert_completed(replay_receiver_result, "final-ACK replay receiver")
+        replay_data = parse_guest_json(replay_receiver_result.stdout, "final-ACK replay receiver stdout")
+        if received_messages(replay_data) != [REQ]:
+            pytest.fail(f"final-ACK replay was not delivered after consuming the reservation: {replay_data!r}")
+        time.sleep(0.2)
+        replay_stats = read_module_stats(vm)
+        if replay_stats["shaping_payloads_dropped"] != expected_drops:
+            pytest.fail(
+                "replayed final ACK handshake_request reused a consumed shaping reservation: "
+                f"baseline={baseline_stats!r} first={first_stats!r} replay={replay_stats!r}"
+            )
+    finally:
+        for process in (server, replay_receiver, final_ack_capture):
+            if process is not None and process.proc.poll() is None:
+                process.terminate()
+        vm.run(["rm", "-f", final_ack_ready, server_ready, replay_ready], check=False)
+        cleanup_netns_topology(vm)
+
+
 def test_delayed_handshake_response_control_drop_acks_after_recent_tx(phantun_module, vm):
     load_loss_module(phantun_module, handshake_request=REQ, handshake_response=RESP)
     ensure_netns_topology(vm)
@@ -798,6 +925,7 @@ def test_delayed_handshake_response_control_drop_acks_after_recent_tx(phantun_mo
     synack_ready = f"{prefix}-synack-ready"
     server_ready = f"{prefix}-server-ready"
     continue_file = f"{prefix}-continue"
+    replay_ready = f"{prefix}-replay-ready"
     inject_config_file = f"{prefix}-inject.json"
     syn_capture = spawn_netns_scenario(
         vm,
@@ -852,7 +980,7 @@ def test_delayed_handshake_response_control_drop_acks_after_recent_tx(phantun_mo
     )
     server = None
     client = None
-
+    replay_receiver = None
     try:
         wait_for_guest_ready_file(vm, syn_ready, timeout=5)
         wait_for_guest_ready_file(vm, synack_ready, timeout=5)
@@ -951,18 +1079,53 @@ def test_delayed_handshake_response_control_drop_acks_after_recent_tx(phantun_mo
                 "control-payload drops must not use the idle ACK suppression path: "
                 f"before={baseline_stats!r} after={final_stats!r}"
             )
-        if final_stats["shaping_payloads_dropped"] <= baseline_stats["shaping_payloads_dropped"]:
+        expected_drops = baseline_stats["shaping_payloads_dropped"] + 1
+        if final_stats["shaping_payloads_dropped"] != expected_drops:
             pytest.fail(
-                "delayed handshake_response was not accounted as a dropped shaping payload: "
+                "delayed handshake_response must be accounted exactly once as a dropped shaping payload: "
                 f"before={baseline_stats!r} after={final_stats!r}"
             )
+
+        replay_receiver = spawn_netns_scenario(
+            vm,
+            NS_A,
+            "recv_until_timeout",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "count": 1,
+                "ready_file": replay_ready,
+                "timeout_sec": 20,
+            },
+        )
+        wait_for_guest_ready_file(vm, replay_ready, timeout=5)
+
+        replay_result = run_netns_scenario(vm, NS_B, "send_tcp_packet", inject_config)
+        replay_receiver_result = replay_receiver.communicate(timeout=20)
+        assert_completed(replay_result, "control-drop replay sender")
+        assert_completed(replay_receiver_result, "control-drop replay receiver")
+        replay_data = parse_guest_json(replay_receiver_result.stdout, "control-drop replay receiver stdout")
+        if received_messages(replay_data) != [RESP]:
+            pytest.fail(
+                f"delayed handshake_response replay was not delivered after consuming the reservation: {replay_data!r}"
+            )
+        time.sleep(0.2)
+        replay_stats = read_module_stats(vm)
+        if replay_stats["shaping_payloads_dropped"] != expected_drops:
+            pytest.fail(
+                "replayed delayed handshake_response reused a consumed shaping reservation: "
+                f"baseline={baseline_stats!r} first={final_stats!r} replay={replay_stats!r}"
+            )
     finally:
-        for process in (client, server, syn_capture, synack_capture):
+        for process in (client, server, replay_receiver, syn_capture, synack_capture):
             if process is not None and process.proc.poll() is None:
                 process.terminate()
         drop_response.cleanup(vm)
         ack_probe.cleanup(vm)
-        vm.run(["rm", "-f", syn_ready, synack_ready, server_ready, continue_file, inject_config_file], check=False)
+        vm.run(
+            ["rm", "-f", syn_ready, synack_ready, server_ready, replay_ready, continue_file, inject_config_file],
+            check=False,
+        )
         cleanup_netns_topology(vm)
 
 

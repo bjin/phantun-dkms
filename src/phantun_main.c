@@ -1433,6 +1433,18 @@ static void phantun_note_inbound_payload(struct pht_flow *flow, const struct pht
     phantun_refresh_inbound_progress(flow, view, NULL);
 }
 
+/* Caller holds flow->lock. */
+static bool phantun_consume_drop_next_rx_payload_locked(struct pht_flow *flow,
+                                                        const struct pht_l4_view *view) {
+    if (!view->payload_len || !flow->drop_next_rx_payload ||
+        ntohl(view->tcp->seq) != flow->drop_next_rx_seq)
+        return false;
+
+    flow->drop_next_rx_payload = false;
+    flow->drop_next_rx_seq = 0;
+    return true;
+}
+
 /* Immediate inbound-data ACK suppression is deliberately a short, local
  * bidirectional burst optimization.  Expire stale timestamps under the flow
  * lock so old local sends cannot re-enter the window after jiffies wrap.
@@ -1880,6 +1892,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     bool carry_quarantine = false;
     bool count_replacement_accept = false;
     bool had_queued;
+    bool drop_open_payload;
     int ret;
 
     if (!state || !skb)
@@ -2223,13 +2236,11 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         flow->remote_seq_window_start = flow->peer_syn_next;
         flow->drop_next_rx_seq = flow->ack;
         flow->drop_next_rx_payload = phantun_request_enabled();
+        drop_open_payload = phantun_consume_drop_next_rx_payload_locked(flow, &view);
         flow->response_pending_ack = false;
         spin_unlock_bh(&flow->lock);
 
         {
-            bool drop_open_payload = view.payload_len && phantun_request_enabled() &&
-                                     ntohl(view.tcp->seq) == peer_syn_next;
-
             /* Injected handshake_response occupies responder_seq + 1.
              * Keep responder-owned UDP blocked until the peer ACKs that
              * range or later initiator payload proves the control slot was
@@ -2408,8 +2419,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 response_unblocked = true;
             }
         }
-        if (view.payload_len && flow->drop_next_rx_payload &&
-            ntohl(view.tcp->seq) == flow->drop_next_rx_seq) {
+        if (phantun_consume_drop_next_rx_payload_locked(flow, &view)) {
             drop_payload = true;
             pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
         }
@@ -3121,10 +3131,12 @@ static int __init phantun_init(void) {
     if (ret)
         goto err_sysfs;
 
-    phantun_inetaddr_nb.notifier_call = phantun_inetaddr_event;
-    ret = register_inetaddr_notifier(&phantun_inetaddr_nb);
-    if (ret)
-        goto err_pernet;
+    if (phantun_cfg.enabled_families & PHT_FAMILY_IPV4) {
+        phantun_inetaddr_nb.notifier_call = phantun_inetaddr_event;
+        ret = register_inetaddr_notifier(&phantun_inetaddr_nb);
+        if (ret)
+            goto err_pernet;
+    }
 #if IS_ENABLED(CONFIG_IPV6)
     if (phantun_cfg.enabled_families & PHT_FAMILY_IPV6) {
         phantun_inet6addr_nb.notifier_call = phantun_inet6addr_event;
@@ -3138,7 +3150,8 @@ static int __init phantun_init(void) {
 
 #if IS_ENABLED(CONFIG_IPV6)
 err_inetaddr:
-    unregister_inetaddr_notifier(&phantun_inetaddr_nb);
+    if (phantun_cfg.enabled_families & PHT_FAMILY_IPV4)
+        unregister_inetaddr_notifier(&phantun_inetaddr_nb);
 #endif
 err_pernet:
     unregister_pernet_subsys(&phantun_pernet_ops);
@@ -3155,7 +3168,8 @@ static void __exit phantun_exit(void) {
     if (phantun_cfg.enabled_families & PHT_FAMILY_IPV6)
         unregister_inet6addr_notifier(&phantun_inet6addr_nb);
 #endif
-    unregister_inetaddr_notifier(&phantun_inetaddr_nb);
+    if (phantun_cfg.enabled_families & PHT_FAMILY_IPV4)
+        unregister_inetaddr_notifier(&phantun_inetaddr_nb);
     unregister_pernet_subsys(&phantun_pernet_ops);
     pht_stats_exit_sysfs();
     kfree(phantun_alloc_req);

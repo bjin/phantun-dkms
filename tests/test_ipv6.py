@@ -558,7 +558,7 @@ def test_ipv6_link_local_endpoints_are_rejected(phantun_module, vm):
         cleanup_netns_topology(vm)
 
 
-def test_ip_families_can_disable_one_family(phantun_module, vm):
+def test_ip_families_can_disable_one_family(phantun_module, dmesg, vm):
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
 
@@ -579,6 +579,10 @@ def test_ip_families_can_disable_one_family(phantun_module, vm):
         probe_v6_plain.cleanup(vm)
         cleanup_netns_topology(vm)
 
+    phantun_module.unload()
+    dmesg.get_new_lines()
+    dmesg.clear()
+
     phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, ip_families="ipv6")
     ensure_netns_topology(vm, with_ipv6=True)
     require_nft_or_skip(vm)
@@ -589,6 +593,7 @@ def test_ip_families_can_disable_one_family(phantun_module, vm):
         udp_action="accept",
     )
     probe_v6 = make_netns_output_probe(vm, NS_A, [(NS6_ADDR_A, src_port, NS6_ADDR_B, dst_port)])
+    bad_lines = []
     try:
         run_ping_pong(vm, NS_ADDR_A, NS_ADDR_B, src_port, dst_port)
         assert probe_v4_plain.packets(vm, probe_comment("udp", NS_ADDR_A, src_port, NS_ADDR_B, dst_port)) > 0
@@ -599,6 +604,14 @@ def test_ip_families_can_disable_one_family(phantun_module, vm):
         probe_v4_plain.cleanup(vm)
         probe_v6.cleanup(vm)
         cleanup_netns_topology(vm)
+        phantun_module.unload()
+        time.sleep(0.5)
+        bad_lines = [
+            line for line in dmesg.get_new_lines() if any(marker in line for marker in ("WARNING:", "Oops", "BUG:"))
+        ]
+
+    if bad_lines:
+        pytest.fail("IPv6-only module load/unload emitted kernel diagnostics:\n" + "\n".join(bad_lines))
 
 
 def test_reserved_local_ports_respect_ipv6_family_mode(phantun_module, vm):

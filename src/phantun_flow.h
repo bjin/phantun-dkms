@@ -146,10 +146,11 @@ struct pht_flow {
      * for best-effort invalidation when that device goes away.
      */
     int egress_ifindex;
-    /* Optional first-payload shaping state. drop_next_rx_* suppresses exactly
-     * one reserved inbound payload sequence; response_pending_ack blocks
-     * responder-owned local UDP until the injected response is ACKed or
-     * bypassed by later initiator traffic.
+    /* Optional first-payload shaping state. drop_next_rx_* arms a one-shot
+     * reserved inbound payload sequence and is cleared as soon as that payload
+     * is suppressed; response_pending_ack blocks responder-owned local UDP
+     * until the injected response is ACKed or bypassed by later initiator
+     * traffic.
      */
     u32 drop_next_rx_seq;
     bool drop_next_rx_payload;
@@ -206,9 +207,10 @@ struct pht_flow_table {
      * module reloads.
      */
     u32 hash_seed;
-    /* Per-netns cookie used as a private reinjection mark. It is randomized at
-     * table init with the high bit set so it stays out of the low mark range
-     * commonly used by firewall rules and other applications.
+    /* Per-netns cookie used as a private reinjection mark in shared skb->mark
+     * space. The random high-bit value avoids common low firewall marks but
+     * cannot prevent collisions; an externally marked skb with the same value
+     * is treated as reinjected and has its mark cleared.
      */
     u32 reinject_mark;
     /* Serializes half-open admission and exact insert->established/dead
