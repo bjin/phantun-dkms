@@ -41,6 +41,24 @@ enum pht_flow_state {
     PHT_FLOW_STATE_DEAD,
 };
 
+enum pht_flow_complete_result {
+    PHT_FLOW_COMPLETE_WON = 0,
+    PHT_FLOW_COMPLETE_ALREADY_ESTABLISHED,
+    PHT_FLOW_COMPLETE_STALE,
+};
+
+struct pht_flow_handshake_complete_args {
+    enum pht_flow_state expected_state;
+    u32 local_seq_start;
+    u32 ack;
+    u32 peer_syn_next;
+    u32 remote_payload_seq;
+    size_t remote_payload_len;
+    size_t local_control_len;
+    bool arm_drop_next_rx_payload;
+    bool response_pending_ack;
+};
+
 /* Flow identity is already local-oriented at packet boundaries: local is this
  * host/netns and remote is the peer, independent of packet direction.
  */
@@ -148,12 +166,17 @@ struct pht_flow {
     int egress_ifindex;
     /* Optional first-payload shaping state. drop_next_rx_* arms a one-shot
      * reserved inbound payload sequence and is cleared as soon as that payload
-     * is suppressed; response_pending_ack blocks responder-owned local UDP
-     * until the injected response is ACKed or bypassed by later initiator
-     * traffic.
+     * is suppressed. opening_rx_* marks the exact payload carried by the
+     * winning responder final ACK so stale SYN_RCVD snapshots cannot reinject
+     * the same skb while the winner is still finalizing it. response_pending_ack
+     * blocks responder-owned local UDP until the injected response is ACKed or
+     * bypassed by later initiator traffic.
      */
     u32 drop_next_rx_seq;
+    u32 opening_rx_seq_start;
+    u32 opening_rx_seq_end;
     bool drop_next_rx_payload;
+    bool opening_rx_payload_claimed;
     bool response_pending_ack;
     bool retransmit_armed;
     bool quarantine_prev_active;
@@ -253,7 +276,14 @@ bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb,
                              const struct pht_tx_meta *meta);
 struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow, struct pht_tx_meta *meta);
-void pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state);
+/* False means the flow was absent or already DEAD; callers must treat that as
+ * a stale generation and drop without resurrecting or tearing it down again.
+ */
+bool pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state);
+enum pht_flow_complete_result
+pht_flow_complete_handshake(struct pht_flow *flow,
+                            const struct pht_flow_handshake_complete_args *args,
+                            bool *drop_open_payload);
 void pht_flow_arm_retransmit(struct pht_flow *flow);
 void pht_flow_cancel_retransmit(struct pht_flow *flow);
 unsigned int pht_flow_invalidate_egress_ifindex(struct pht_flow_table *table, int ifindex);

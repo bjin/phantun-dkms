@@ -1264,8 +1264,6 @@ static int phantun_send_handshake_request(struct pht_flow *flow, struct net *net
                             req_len, &meta, &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
-        flow->seq = seq + req_len;
-        phantun_flow_refresh_local_seq_window_locked(flow);
         flow->last_ack = ack;
         flow->last_activity_jiffies = jiffies;
         flow->egress_ifindex = ifindex;
@@ -1297,8 +1295,6 @@ static int phantun_send_handshake_response(struct pht_flow *flow, struct net *ne
                             resp_len, &meta, &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
-        flow->seq = seq + resp_len;
-        phantun_flow_refresh_local_seq_window_locked(flow);
         flow->last_ack = ack;
         flow->last_activity_jiffies = jiffies;
         flow->egress_ifindex = ifindex;
@@ -2144,23 +2140,35 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         }
 
         if (phantun_tcp_is_clean_synack(&view, expected_ack)) {
-            /* Handshake establishment is complete even if the responder later
-             * sends an injected handshake_response. Reserve responder_seq + 1
-             * so that optional control payload is ignored by sequence instead
-             * of being treated as required handshake data.
-             */
-            spin_lock_bh(&flow->lock);
-            flow->seq = flow->local_isn + 1;
-            flow->ack = ntohl(view.tcp->seq) + 1;
-            flow->peer_syn_next = flow->ack;
-            flow->local_seq_window_start = flow->local_isn;
-            flow->remote_seq_window_start = flow->peer_syn_next;
-            flow->last_ack = flow->ack;
-            flow->drop_next_rx_seq = flow->ack;
-            flow->drop_next_rx_payload = phantun_response_enabled();
-            flow->response_pending_ack = false;
-            spin_unlock_bh(&flow->lock);
+            const u32 ack = ntohl(view.tcp->seq) + 1;
+            struct pht_flow_handshake_complete_args complete_args = {
+                .expected_state = PHT_FLOW_STATE_SYN_SENT,
+                .local_seq_start = local_isn + 1,
+                .ack = ack,
+                .peer_syn_next = ack,
+                .remote_payload_seq = ntohl(view.tcp->seq),
+                .remote_payload_len = view.payload_len,
+                .local_control_len =
+                    phantun_request_enabled() ? phantun_cfg.handshake_request_len : 0,
+                .arm_drop_next_rx_payload = phantun_response_enabled(),
+                .response_pending_ack = false,
+            };
+            enum pht_flow_complete_result complete;
 
+            complete = pht_flow_complete_handshake(flow, &complete_args, NULL);
+            if (complete == PHT_FLOW_COMPLETE_STALE) {
+                pht_flow_put(flow);
+                return NF_DROP;
+            }
+            if (complete == PHT_FLOW_COMPLETE_ALREADY_ESTABLISHED) {
+                ret = phantun_send_idle_ack(flow, state->net, &tx_meta);
+                if (ret)
+                    pht_pr_warn("failed to ACK duplicate SYN|ACK: %d\n", ret);
+                pht_flow_put(flow);
+                return NF_DROP;
+            }
+
+            pht_flow_touch_inbound(flow);
             if (phantun_request_enabled()) {
                 ret = phantun_send_handshake_request(flow, state->net);
                 if (ret) {
@@ -2171,8 +2179,6 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 }
             }
 
-            pht_flow_touch_inbound(flow);
-            pht_flow_update_state(flow, PHT_FLOW_STATE_ESTABLISHED);
             {
                 bool flushed_payload = false;
 
@@ -2235,23 +2241,100 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             return NF_DROP;
         }
 
-        /* request shaping reserves initiator_seq + 1. If the final ACK already
-         * carries payload at that exact sequence, drop it now; otherwise arm
-         * the ignore slot for the later packet with that starting sequence.
-         */
-        spin_lock_bh(&flow->lock);
-        flow->seq = flow->local_isn + 1;
-        flow->ack = flow->peer_syn_next;
-        flow->last_ack = flow->ack;
-        flow->local_seq_window_start = flow->local_isn;
-        flow->remote_seq_window_start = flow->peer_syn_next;
-        flow->drop_next_rx_seq = flow->ack;
-        flow->drop_next_rx_payload = phantun_request_enabled();
-        drop_open_payload = phantun_consume_drop_next_rx_payload_locked(flow, &view);
-        flow->response_pending_ack = false;
-        spin_unlock_bh(&flow->lock);
-
         {
+            struct pht_flow_handshake_complete_args complete_args = {
+                .expected_state = PHT_FLOW_STATE_SYN_RCVD,
+                .local_seq_start = local_isn + 1,
+                .ack = peer_syn_next,
+                .peer_syn_next = peer_syn_next,
+                .remote_payload_seq = ntohl(view.tcp->seq),
+                .remote_payload_len = view.payload_len,
+                .local_control_len =
+                    phantun_response_enabled() ? phantun_cfg.handshake_response_len : 0,
+                .arm_drop_next_rx_payload = phantun_request_enabled(),
+                .response_pending_ack = phantun_response_enabled(),
+            };
+            enum pht_flow_complete_result complete;
+
+            complete = pht_flow_complete_handshake(flow, &complete_args, &drop_open_payload);
+            if (complete == PHT_FLOW_COMPLETE_STALE) {
+                pht_flow_put(flow);
+                return NF_DROP;
+            }
+            if (complete == PHT_FLOW_COMPLETE_ALREADY_ESTABLISHED) {
+                u32 payload_seq = ntohl(view.tcp->seq);
+                u32 payload_end = payload_seq + view.payload_len;
+                bool response_unblocked = false;
+                bool duplicate_opening_payload = false;
+                bool drop_payload = false;
+                bool payload_already_acked = false;
+
+                spin_lock_bh(&flow->lock);
+                if (flow->response_pending_ack) {
+                    if (view.tcp->ack &&
+                        phantun_seq_after_eq(ntohl(view.tcp->ack_seq),
+                                             flow->local_isn + 1 +
+                                                 phantun_cfg.handshake_response_len)) {
+                        flow->response_pending_ack = false;
+                        response_unblocked = true;
+                    } else if (view.payload_len > 0) {
+                        flow->response_pending_ack = false;
+                        response_unblocked = true;
+                    }
+                }
+                if (view.payload_len > 0 && flow->opening_rx_payload_claimed &&
+                    payload_seq == flow->opening_rx_seq_start &&
+                    payload_end == flow->opening_rx_seq_end)
+                    duplicate_opening_payload = true;
+                if (view.payload_len > 0 && phantun_seq_after_eq(flow->ack, payload_end))
+                    payload_already_acked = true;
+                if (phantun_consume_drop_next_rx_payload_locked(flow, &view)) {
+                    drop_payload = true;
+                    pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
+                }
+                spin_unlock_bh(&flow->lock);
+
+                if (payload_already_acked || duplicate_opening_payload) {
+                    if (response_unblocked) {
+                        ret = phantun_flush_queued_udp(flow, state->net, NULL);
+                        if (ret) {
+                            phantun_discard_queued_udp_translation_failure(flow);
+                            pht_pr_warn("failed to flush responder queue: %d\n", ret);
+                            pht_flow_remove(flow);
+                        }
+                    }
+                    pht_flow_put(flow);
+                    return NF_DROP;
+                }
+
+                if (view.payload_len == 0) {
+                    pht_flow_touch_inbound(flow);
+                    if (response_unblocked) {
+                        ret = phantun_flush_queued_udp(flow, state->net, NULL);
+                        if (ret) {
+                            phantun_discard_queued_udp_translation_failure(flow);
+                            pht_pr_warn("failed to flush responder queue: %d\n", ret);
+                            pht_flow_remove(flow);
+                        }
+                    }
+                    pht_flow_put(flow);
+                    return NF_DROP;
+                }
+
+                ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
+                                                      !drop_payload, true, &tx_meta);
+                if (ret) {
+                    pht_pr_warn("failed to process raced responder payload: %d\n", ret);
+                    if (ret == -EMSGSIZE) {
+                        phantun_account_tcp_protocol_rejected();
+                        phantun_send_rstack(state->net, &ep, &view, &tx_meta, false);
+                    }
+                    pht_flow_remove(flow);
+                }
+                pht_flow_put(flow);
+                return NF_DROP;
+            }
+
             /* Injected handshake_response occupies responder_seq + 1.
              * Keep responder-owned UDP blocked until the peer ACKs that
              * range or later initiator payload proves the control slot was
@@ -2271,13 +2354,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                     return NF_DROP;
                 }
 
-                spin_lock_bh(&flow->lock);
-                flow->response_pending_ack = true;
-                spin_unlock_bh(&flow->lock);
-
                 if (view.payload_len == 0)
                     pht_flow_touch_inbound(flow);
-                pht_flow_update_state(flow, PHT_FLOW_STATE_ESTABLISHED);
                 if (view.payload_len == 0 || drop_open_payload) {
                     pht_flow_put(flow);
                     return NF_DROP;
@@ -2298,7 +2376,6 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             }
 
             pht_flow_touch_inbound(flow);
-            pht_flow_update_state(flow, PHT_FLOW_STATE_ESTABLISHED);
 
             /* The responder transitions to ESTABLISHED. We must flush any
              * queued UDP data. */

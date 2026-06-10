@@ -1297,17 +1297,22 @@ struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow, struct pht_tx_me
     return skb;
 }
 
-void pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state) {
+bool pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state) {
     bool half_open;
     enum pht_flow_state old_state;
     unsigned long now;
 
     if (!flow)
-        return;
+        return false;
 
     spin_lock_bh(&flow->lock);
-    now = jiffies;
     old_state = flow->state;
+    if (old_state == PHT_FLOW_STATE_DEAD) {
+        spin_unlock_bh(&flow->lock);
+        return false;
+    }
+
+    now = jiffies;
     if (state == PHT_FLOW_STATE_ESTABLISHED && old_state == PHT_FLOW_STATE_SYN_SENT &&
         flow->role == PHT_FLOW_ROLE_INITIATOR && flow->table &&
         flow->table->replacement_protect_jiffies) {
@@ -1330,6 +1335,74 @@ void pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state) {
         pht_flow_arm_retransmit(flow);
     else
         pht_flow_cancel_retransmit(flow);
+
+    return true;
+}
+
+enum pht_flow_complete_result
+pht_flow_complete_handshake(struct pht_flow *flow,
+                            const struct pht_flow_handshake_complete_args *args,
+                            bool *drop_open_payload) {
+    bool drop_payload = false;
+    unsigned long now;
+
+    if (drop_open_payload)
+        *drop_open_payload = false;
+    if (!flow || !args)
+        return PHT_FLOW_COMPLETE_STALE;
+
+    now = jiffies;
+    spin_lock_bh(&flow->lock);
+    if (flow->state != args->expected_state) {
+        enum pht_flow_state state = flow->state;
+
+        spin_unlock_bh(&flow->lock);
+        return state == PHT_FLOW_STATE_ESTABLISHED ? PHT_FLOW_COMPLETE_ALREADY_ESTABLISHED
+                                                   : PHT_FLOW_COMPLETE_STALE;
+    }
+
+    flow->seq = args->local_seq_start + args->local_control_len;
+    flow->ack = args->ack;
+    flow->last_ack = args->ack;
+    flow->peer_syn_next = args->peer_syn_next;
+    flow->local_seq_window_start = flow->local_isn;
+    flow->remote_seq_window_start = args->peer_syn_next;
+    flow->drop_next_rx_seq = args->ack;
+    flow->drop_next_rx_payload = args->arm_drop_next_rx_payload;
+    flow->opening_rx_payload_claimed = args->remote_payload_len > 0;
+    if (flow->opening_rx_payload_claimed) {
+        flow->opening_rx_seq_start = args->remote_payload_seq;
+        flow->opening_rx_seq_end = args->remote_payload_seq + args->remote_payload_len;
+    } else {
+        flow->opening_rx_seq_start = 0;
+        flow->opening_rx_seq_end = 0;
+    }
+    flow->response_pending_ack = args->response_pending_ack;
+    flow->state = PHT_FLOW_STATE_ESTABLISHED;
+    flow->last_activity_jiffies = now;
+    flow->retries_done = 0;
+    if (args->expected_state == PHT_FLOW_STATE_SYN_SENT && flow->role == PHT_FLOW_ROLE_INITIATOR &&
+        flow->table && flow->table->replacement_protect_jiffies) {
+        flow->replacement_protect_until_jiffies = now + flow->table->replacement_protect_jiffies;
+        flow->replacement_protect_active = true;
+    } else {
+        flow->replacement_protect_active = false;
+    }
+
+    if (args->arm_drop_next_rx_payload && args->remote_payload_len > 0 &&
+        args->remote_payload_seq == args->ack) {
+        flow->drop_next_rx_payload = false;
+        flow->drop_next_rx_seq = 0;
+        drop_payload = true;
+    }
+    spin_unlock_bh(&flow->lock);
+
+    if (drop_open_payload)
+        *drop_open_payload = drop_payload;
+    pht_stats_inc(PHT_STAT_FLOWS_ESTABLISHED);
+    pht_flow_untrack_half_open(flow);
+    pht_flow_cancel_retransmit(flow);
+    return PHT_FLOW_COMPLETE_WON;
 }
 
 void pht_flow_arm_retransmit(struct pht_flow *flow) {

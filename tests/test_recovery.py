@@ -22,6 +22,7 @@ from helpers import (
     make_netns_ingress_flag_drop_probe,
     make_netns_ingress_payload_drop_probe,
     make_netns_output_flag_probe,
+    make_netns_output_ipv4_pure_ack_probe,
     parse_guest_json,
     read_module_stats,
     require_guest_command,
@@ -34,6 +35,7 @@ from helpers import (
 
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
 REQ = "HSREQ42"
+RESP = "HSRESP42"
 
 
 def load_recovery_module(phantun_module, **kwargs):
@@ -871,6 +873,279 @@ def test_established_duplicate_current_generation_syn_dispatch(phantun_module, v
     finally:
         initiator_probe.cleanup(vm)
         responder_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_duplicate_synack_during_completion_does_not_rewind_sequence(phantun_module, vm):
+    phantun_module.load(
+        managed_netns="all",
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        keepalive_interval_sec=60,
+        handshake_timeout_ms=800,
+        handshake_retries=20,
+    )
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "tc"):
+        cleanup_netns_topology(vm)
+        pytest.skip("tc is not available in the guest")
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    payloads = ["race1", "race2", "race3", "race4"]
+    synack_ready = f"/tmp/phantun-capture-synack-race-{uuid.uuid4().hex}"
+    capture_synack = spawn_netns_scenario(
+        vm,
+        NS_A,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "ready_file": synack_ready,
+            "timeout_sec": 15,
+        },
+    )
+    ack_probe = make_netns_output_ipv4_pure_ack_probe(vm, NS_A, NS_ADDR_A, src_port, NS_ADDR_B, dst_port)
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "dst_addr": NS_ADDR_B,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "flags_expr": "rst",
+                "comment": "duplicate_completion_synack_rst",
+            },
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "echo_server",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": len(payloads),
+            "timeout_sec": 20,
+        },
+    )
+
+    try:
+        wait_for_guest_ready_file(vm, synack_ready, timeout=5)
+        run_in_netns(vm, NS_A, ["tc", "qdisc", "replace", "dev", VETH_A, "root", "netem", "delay", "150ms"])
+        baseline_stats = read_module_stats(vm)
+        client = spawn_netns_scenario(
+            vm,
+            NS_A,
+            "send_many_recv",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": payloads,
+                "recv_count": len(payloads),
+                "delay_ms": 300,
+                "timeout_sec": 20,
+            },
+        )
+
+        synack_result = capture_synack.communicate(timeout=20)
+        assert_completed(synack_result, "capture opening SYN|ACK")
+        synack_data = parse_guest_json(synack_result.stdout, "opening SYN|ACK")
+        if synack_data.get("flags") != 0x12:
+            pytest.fail(f"expected captured opening SYN|ACK, got {synack_data!r}")
+
+        baseline_ack = ack_probe.packets(vm, "pure_ipv4_ack")
+        baseline_rst = rst_probe.packets(vm, "duplicate_completion_synack_rst")
+        duplicate_baseline = read_module_stats(vm)
+        for _ in range(5):
+            duplicate = run_netns_scenario(
+                vm,
+                NS_B,
+                "send_tcp_packet",
+                {
+                    "bind_addr": NS_ADDR_B,
+                    "bind_port": dst_port,
+                    "target_addr": NS_ADDR_A,
+                    "target_port": src_port,
+                    "seq": synack_data["seq"],
+                    "ack": synack_data["ack"],
+                    "flags": "syn|ack",
+                },
+            )
+            assert_completed(duplicate, "inject duplicate SYN|ACK during completion")
+
+        wait_for_probe_packets_after(
+            vm,
+            ack_probe,
+            "pure_ipv4_ack",
+            baseline_ack,
+            "duplicate SYN|ACK completion ACK",
+        )
+        if rst_probe.packets(vm, "duplicate_completion_synack_rst") != baseline_rst:
+            pytest.fail("duplicate SYN|ACK during completion should not emit RST")
+        if read_module_stats(vm)["flows_created"] != duplicate_baseline["flows_created"]:
+            pytest.fail("duplicate SYN|ACK during completion should not create another flow")
+
+        client_result = client.communicate(timeout=30)
+        server_result = server.communicate(timeout=30)
+        assert_completed(client_result, "duplicate SYN|ACK completion client")
+        assert_completed(server_result, "duplicate SYN|ACK completion server")
+        client_data = parse_guest_json(client_result.stdout, "duplicate SYN|ACK completion client stdout")
+        server_data = parse_guest_json(server_result.stdout, "duplicate SYN|ACK completion server stdout")
+        client_replies = [reply["message"] for reply in client_data.get("replies", [])]
+        if client_replies != payloads:
+            pytest.fail(f"unexpected echoed payloads after duplicate SYN|ACKs: {client_data!r}")
+        if received_messages(server_data) != payloads:
+            pytest.fail(f"unexpected server payloads after duplicate SYN|ACKs: {server_data!r}")
+
+        stats = read_module_stats(vm)
+        if stats["flows_established"] != baseline_stats["flows_established"] + 2:
+            pytest.fail(f"expected both endpoint flows to establish, before={baseline_stats!r} after={stats!r}")
+    finally:
+        run_in_netns(vm, NS_A, ["tc", "qdisc", "del", "dev", VETH_A, "root"], check=False)
+        ack_probe.cleanup(vm)
+        rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_duplicate_final_ack_during_responder_completion_is_single_winner(phantun_module, vm):
+    phantun_module.load(
+        managed_netns="all",
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        keepalive_interval_sec=60,
+        handshake_timeout_ms=800,
+        handshake_retries=20,
+        handshake_request=REQ,
+        handshake_response=RESP,
+    )
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "tc"):
+        cleanup_netns_topology(vm)
+        pytest.skip("tc is not available in the guest")
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[1]
+    dst_port = PORTS_B[1]
+    open_payload = "final-open"
+    final_ack_ready = f"/tmp/phantun-capture-final-ack-race-{uuid.uuid4().hex}"
+    capture_final_ack = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payload": REQ,
+            "ready_file": final_ack_ready,
+            "timeout_sec": 20,
+        },
+    )
+    rst_probe = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "dst_addr": NS_ADDR_A,
+                "src_port": dst_port,
+                "dst_port": src_port,
+                "flags_expr": "rst",
+                "comment": "duplicate_final_ack_rst",
+            },
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "timeout_sec": 20,
+        },
+    )
+
+    try:
+        wait_for_guest_ready_file(vm, final_ack_ready, timeout=5)
+        run_in_netns(vm, NS_A, ["tc", "qdisc", "replace", "dev", VETH_A, "root", "netem", "delay", "150ms"])
+        baseline_stats = read_module_stats(vm)
+        client = spawn_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": [open_payload],
+                "timeout_sec": 20,
+            },
+        )
+
+        final_ack_result = capture_final_ack.communicate(timeout=25)
+        assert_completed(final_ack_result, "capture final ACK handshake request")
+        final_ack_data = parse_guest_json(final_ack_result.stdout, "final ACK handshake request")
+        if final_ack_data.get("flags") & 0x10 == 0:
+            pytest.fail(f"expected captured final ACK, got {final_ack_data!r}")
+
+        baseline_rst = rst_probe.packets(vm, "duplicate_final_ack_rst")
+
+        for _ in range(5):
+            duplicate = run_netns_scenario(
+                vm,
+                NS_A,
+                "send_tcp_packet",
+                {
+                    "bind_addr": NS_ADDR_A,
+                    "bind_port": src_port,
+                    "target_addr": NS_ADDR_B,
+                    "target_port": dst_port,
+                    "seq": final_ack_data["seq"],
+                    "ack": final_ack_data["ack"],
+                    "flags": "ack",
+                },
+            )
+            assert_completed(duplicate, "inject duplicate final ACK during completion")
+
+        client_result = client.communicate(timeout=30)
+        server_result = server.communicate(timeout=30)
+        assert_completed(client_result, "duplicate final ACK completion opener")
+        assert_completed(server_result, "duplicate final ACK completion receiver")
+        server_data = parse_guest_json(server_result.stdout, "duplicate final ACK completion receiver stdout")
+        opener_messages = [item["message"] for item in server_data.get("received", [])]
+        if opener_messages != [open_payload]:
+            pytest.fail(f"unexpected opener payloads after duplicate final ACKs: {server_data!r}")
+
+        stats = read_module_stats(vm)
+        if stats["flows_established"] != baseline_stats["flows_established"] + 2:
+            pytest.fail(f"expected both endpoint flows to establish, before={baseline_stats!r} after={stats!r}")
+        if stats["response_payloads_injected"] != baseline_stats["response_payloads_injected"] + 1:
+            pytest.fail(f"expected one injected response, before={baseline_stats!r} after={stats!r}")
+        if rst_probe.packets(vm, "duplicate_final_ack_rst") != baseline_rst:
+            pytest.fail("duplicate final ACK during responder completion should not emit RST")
+        if stats["flows_created"] != baseline_stats["flows_created"] + 2:
+            pytest.fail(
+                f"duplicate final ACKs should not create another flow, before={baseline_stats!r} after={stats!r}"
+            )
+    finally:
+        run_in_netns(vm, NS_A, ["tc", "qdisc", "del", "dev", VETH_A, "root"], check=False)
+        rst_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 
