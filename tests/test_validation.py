@@ -1705,6 +1705,7 @@ def test_retired_record_cache_evicts_under_tuple_churn(phantun_module, vm):
         )
         run_in_netns(vm, NS_B, ["ip", "route", "replace", alias_route, "dev", VETH_B])
 
+        mac_a = netns_link_mac(vm, NS_A, VETH_A)
         baseline_stats = read_module_stats(vm)
         churn = run_netns_scenario(
             vm,
@@ -1716,6 +1717,8 @@ def test_retired_record_cache_evicts_under_tuple_churn(phantun_module, vm):
                 "target_base_addr": alias_base,
                 "target_ports": [PORTS_A[0]],
                 "count": churn_count,
+                "device": VETH_B,
+                "dst_mac": mac_a,
             },
         )
         assert_completed(churn, "retired-record churn")
@@ -1727,7 +1730,6 @@ def test_retired_record_cache_evicts_under_tuple_churn(phantun_module, vm):
             timeout=10,
         )
         wait_for_flows_current(vm, baseline_stats["flows_current"], timeout=10)
-        mac_a = netns_link_mac(vm, NS_A, VETH_A)
         mac_b = netns_link_mac(vm, NS_B, VETH_B)
         run_in_netns(
             vm,

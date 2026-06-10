@@ -115,13 +115,20 @@ def ping_client(config):
 def echo_server(config):
     payloads = []
     target_count = config["count"]
+    ready_file = config.get("ready_file")
 
     with _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec")) as sock:
-        while len(payloads) < target_count:
-            data, addr = sock.recvfrom(2048)
-            text = data.decode()
-            payloads.append(text)
-            sock.sendto(data, addr)
+        if ready_file:
+            Path(ready_file).write_text("ready\n")
+        try:
+            while len(payloads) < target_count:
+                data, addr = sock.recvfrom(2048)
+                text = data.decode()
+                payloads.append(text)
+                sock.sendto(data, addr)
+        finally:
+            if ready_file:
+                Path(ready_file).unlink(missing_ok=True)
 
     _emit({"received": payloads})
 
@@ -671,7 +678,10 @@ def _send_ipv4_tcp_packet(config):
 
 def _ipv4_add_offset(addr, offset):
     value = struct.unpack("!I", socket.inet_aton(addr))[0]
-    return socket.inet_ntoa(struct.pack("!I", (value + offset) & 0xFFFFFFFF))
+    host_base = (value & 0xFF) - 1
+    base = value & ~0xFF
+    block, host = divmod(host_base + offset, 254)
+    return socket.inet_ntoa(struct.pack("!I", base + block * 256 + host + 1))
 
 
 def configure_ipv4_aliases(config):
@@ -705,6 +715,8 @@ def churn_retired_records(config):
     target_base_addr = config["target_base_addr"]
     target_ports = config.get("target_ports") or [config["target_port"]]
     count = int(config["count"])
+    device = config.get("device")
+    dst_mac = config.get("dst_mac")
     seq_base = int(config.get("seq_base", 4095 * 1024))
 
     for offset in range(count):
@@ -718,8 +730,14 @@ def churn_retired_records(config):
             "target_port": target_port,
             "seq": seq,
         }
-        _send_ipv4_tcp_packet({**packet, "flags": "syn"})
-        _send_ipv4_tcp_packet({**packet, "seq": (seq + 1) & 0xFFFFFFFF, "flags": "rst"})
+        if device and dst_mac:
+            _send_l2_tcp_packet_no_emit({**packet, "flags": "syn", "device": device, "dst_mac": dst_mac})
+            _send_l2_tcp_packet_no_emit(
+                {**packet, "seq": (seq + 1) & 0xFFFFFFFF, "flags": "rst", "device": device, "dst_mac": dst_mac}
+            )
+        else:
+            _send_ipv4_tcp_packet({**packet, "flags": "syn"})
+            _send_ipv4_tcp_packet({**packet, "seq": (seq + 1) & 0xFFFFFFFF, "flags": "rst"})
 
     _emit({"sent": count})
 
@@ -808,7 +826,7 @@ def send_ipv4_udp_fragments(config):
     _emit({"sent": len(fragments)})
 
 
-def send_l2_tcp_packet(config):
+def _send_l2_tcp_packet_no_emit(config):
     iface = config["device"]
     dst_mac = bytes.fromhex(config["dst_mac"].replace(":", ""))
     src_mac = config.get("src_mac")
@@ -908,6 +926,9 @@ def send_l2_tcp_packet(config):
         raw_sock.bind((iface, 0))
         raw_sock.send(eth_header + ip_header + tcp_header + payload)
 
+
+def send_l2_tcp_packet(config):
+    _send_l2_tcp_packet_no_emit(config)
     _emit({"done": True})
 
 

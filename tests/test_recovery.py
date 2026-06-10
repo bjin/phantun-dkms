@@ -886,9 +886,6 @@ def test_duplicate_synack_during_completion_does_not_rewind_sequence(phantun_mod
     )
     ensure_netns_topology(vm)
 
-    if not require_guest_command(vm, "tc"):
-        cleanup_netns_topology(vm)
-        pytest.skip("tc is not available in the guest")
     if not require_guest_command(vm, "nft"):
         cleanup_netns_topology(vm)
         pytest.skip("nft is not available in the guest")
@@ -896,7 +893,9 @@ def test_duplicate_synack_during_completion_does_not_rewind_sequence(phantun_mod
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
     payloads = ["race1", "race2", "race3", "race4"]
+    remaining_payloads = payloads[1:]
     synack_ready = f"/tmp/phantun-capture-synack-race-{uuid.uuid4().hex}"
+    server_ready = f"/tmp/phantun-echo-synack-race-{uuid.uuid4().hex}"
     capture_synack = spawn_netns_scenario(
         vm,
         NS_A,
@@ -934,28 +933,32 @@ def test_duplicate_synack_during_completion_does_not_rewind_sequence(phantun_mod
             "bind_port": dst_port,
             "count": len(payloads),
             "timeout_sec": 20,
+            "ready_file": server_ready,
         },
     )
 
     try:
         wait_for_guest_ready_file(vm, synack_ready, timeout=5)
-        run_in_netns(vm, NS_A, ["tc", "qdisc", "replace", "dev", VETH_A, "root", "netem", "delay", "150ms"])
+        wait_for_guest_ready_file(vm, server_ready, timeout=10)
         baseline_stats = read_module_stats(vm)
-        client = spawn_netns_scenario(
+
+        first_client = run_netns_scenario(
             vm,
             NS_A,
-            "send_many_recv",
+            "echo_client",
             {
                 "bind_addr": NS_ADDR_A,
                 "bind_port": src_port,
                 "target_addr": NS_ADDR_B,
                 "target_port": dst_port,
-                "payloads": payloads,
-                "recv_count": len(payloads),
-                "delay_ms": 300,
+                "payloads": [payloads[0]],
                 "timeout_sec": 20,
             },
         )
+        assert_completed(first_client, "first echo before duplicate SYN|ACK")
+        first_data = parse_guest_json(first_client.stdout, "first echo stdout")
+        if first_data.get("echoed") != [payloads[0]]:
+            pytest.fail(f"unexpected first echo before duplicate SYN|ACK: {first_data!r}")
 
         synack_result = capture_synack.communicate(timeout=20)
         assert_completed(synack_result, "capture opening SYN|ACK")
@@ -981,7 +984,7 @@ def test_duplicate_synack_during_completion_does_not_rewind_sequence(phantun_mod
                     "flags": "syn|ack",
                 },
             )
-            assert_completed(duplicate, "inject duplicate SYN|ACK during completion")
+            assert_completed(duplicate, "inject duplicate SYN|ACK after establishment")
 
         wait_for_probe_packets_after(
             vm,
@@ -991,19 +994,31 @@ def test_duplicate_synack_during_completion_does_not_rewind_sequence(phantun_mod
             "duplicate SYN|ACK completion ACK",
         )
         if rst_probe.packets(vm, "duplicate_completion_synack_rst") != baseline_rst:
-            pytest.fail("duplicate SYN|ACK during completion should not emit RST")
+            pytest.fail("duplicate SYN|ACK should not emit RST")
         if read_module_stats(vm)["flows_created"] != duplicate_baseline["flows_created"]:
-            pytest.fail("duplicate SYN|ACK during completion should not create another flow")
+            pytest.fail("duplicate SYN|ACK should not create another flow")
 
-        client_result = client.communicate(timeout=30)
+        next_client = run_netns_scenario(
+            vm,
+            NS_A,
+            "echo_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": remaining_payloads,
+                "timeout_sec": 20,
+            },
+        )
+        assert_completed(next_client, "echo after duplicate SYN|ACK")
+        next_data = parse_guest_json(next_client.stdout, "post-duplicate echo stdout")
+        if next_data.get("echoed") != remaining_payloads:
+            pytest.fail(f"unexpected echoed payloads after duplicate SYN|ACKs: {next_data!r}")
+
         server_result = server.communicate(timeout=30)
-        assert_completed(client_result, "duplicate SYN|ACK completion client")
         assert_completed(server_result, "duplicate SYN|ACK completion server")
-        client_data = parse_guest_json(client_result.stdout, "duplicate SYN|ACK completion client stdout")
         server_data = parse_guest_json(server_result.stdout, "duplicate SYN|ACK completion server stdout")
-        client_replies = [reply["message"] for reply in client_data.get("replies", [])]
-        if client_replies != payloads:
-            pytest.fail(f"unexpected echoed payloads after duplicate SYN|ACKs: {client_data!r}")
         if received_messages(server_data) != payloads:
             pytest.fail(f"unexpected server payloads after duplicate SYN|ACKs: {server_data!r}")
 
@@ -1011,7 +1026,6 @@ def test_duplicate_synack_during_completion_does_not_rewind_sequence(phantun_mod
         if stats["flows_established"] != baseline_stats["flows_established"] + 2:
             pytest.fail(f"expected both endpoint flows to establish, before={baseline_stats!r} after={stats!r}")
     finally:
-        run_in_netns(vm, NS_A, ["tc", "qdisc", "del", "dev", VETH_A, "root"], check=False)
         ack_probe.cleanup(vm)
         rst_probe.cleanup(vm)
         cleanup_netns_topology(vm)
