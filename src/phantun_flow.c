@@ -1355,20 +1355,24 @@ void pht_flow_arm_retransmit(struct pht_flow *flow) {
 
 void pht_flow_cancel_retransmit(struct pht_flow *flow) {
     bool drop_ref = false;
-    int deleted;
 
     if (!flow)
         return;
 
     spin_lock_bh(&flow->lock);
-    if (flow->retransmit_armed) {
+    /*
+     * Cancel callers first move the flow out of half-open state.  If the
+     * timer is already running, timer_delete() returns 0 and the callback
+     * will observe the non-half-open/DEAD state under flow->lock, clear
+     * retransmit_armed, and release the timer-owned flow reference.
+     */
+    if (flow->retransmit_armed && timer_delete(&flow->retransmit_timer) > 0) {
         flow->retransmit_armed = false;
         drop_ref = true;
     }
     spin_unlock_bh(&flow->lock);
 
-    deleted = timer_delete(&flow->retransmit_timer);
-    if (deleted > 0 && drop_ref)
+    if (drop_ref)
         pht_flow_put(flow);
 }
 
