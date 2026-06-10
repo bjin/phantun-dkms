@@ -17,6 +17,7 @@ from helpers import (
     make_netns_ingress_flag_drop_probe,
     make_netns_output_flag_probe,
     make_netns_prerouting_flag_drop_probe,
+    netns_link_mac,
     parse_guest_json,
     read_module_stats,
     require_guest_command,
@@ -1660,4 +1661,150 @@ def test_oversized_final_ack_payload_is_rejected_and_counted(phantun_module, vm)
     finally:
         drop_synack.cleanup(vm)
         rst_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_retired_record_cache_evicts_under_tuple_churn(phantun_module, vm):
+    alias_base = "10.210.0.1"
+    alias_route = "10.210.0.0/20"
+    churn_count = 2049
+    payload = "post-retired-churn"
+    server = None
+
+    phantun_module.load(
+        managed_netns="all",
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        hard_idle_timeout_sec=600,
+        keepalive_interval_sec=60,
+    )
+    ensure_netns_topology(vm)
+
+    try:
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "configure_ipv4_aliases",
+            {
+                "device": VETH_A,
+                "base_addr": alias_base,
+                "count": churn_count,
+                "action": "del",
+            },
+            check=False,
+        )
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "configure_ipv4_aliases",
+            {
+                "device": VETH_A,
+                "base_addr": alias_base,
+                "count": churn_count,
+                "action": "add",
+            },
+        )
+        run_in_netns(vm, NS_B, ["ip", "route", "replace", alias_route, "dev", VETH_B])
+
+        baseline_stats = read_module_stats(vm)
+        churn = run_netns_scenario(
+            vm,
+            NS_B,
+            "churn_retired_records",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": 61000,
+                "target_base_addr": alias_base,
+                "target_ports": [PORTS_A[0]],
+                "count": churn_count,
+            },
+        )
+        assert_completed(churn, "retired-record churn")
+
+        wait_for_stat_greater(
+            vm,
+            "retired_evicted",
+            baseline_stats["retired_evicted"],
+            timeout=10,
+        )
+        wait_for_flows_current(vm, baseline_stats["flows_current"], timeout=10)
+        mac_a = netns_link_mac(vm, NS_A, VETH_A)
+        mac_b = netns_link_mac(vm, NS_B, VETH_B)
+        run_in_netns(
+            vm,
+            NS_A,
+            ["ip", "neigh", "replace", NS_ADDR_B, "lladdr", mac_b, "dev", VETH_A, "nud", "permanent"],
+        )
+        run_in_netns(
+            vm,
+            NS_B,
+            ["ip", "neigh", "replace", NS_ADDR_A, "lladdr", mac_a, "dev", VETH_B, "nud", "permanent"],
+        )
+        run_in_netns(vm, NS_B, ["ip", "route", "del", alias_route, "dev", VETH_B], check=False)
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "configure_ipv4_aliases",
+            {
+                "device": VETH_A,
+                "base_addr": alias_base,
+                "count": churn_count,
+                "action": "del",
+            },
+            check=False,
+        )
+        time.sleep(3.0)
+
+        server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "echo_server",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": PORTS_B[1],
+                "count": 1,
+                "timeout_sec": 30,
+            },
+        )
+        time.sleep(0.2)
+        client = run_netns_scenario(
+            vm,
+            NS_A,
+            "echo_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": PORTS_A[1],
+                "target_addr": NS_ADDR_B,
+                "target_port": PORTS_B[1],
+                "timeout_sec": 30,
+                "payloads": [payload],
+            },
+            check=False,
+        )
+        if client.returncode != 0:
+            pytest.fail(f"post-churn echo client failed: stderr={client.stderr!r} stats={read_module_stats(vm)!r}")
+        client_data = parse_guest_json(client.stdout, "post-churn echo stdout")
+        if client_data.get("echoed") != [payload]:
+            pytest.fail(f"post-churn echo failed: {client_data!r}")
+
+        server_result = server.communicate(timeout=10)
+        assert_completed(server_result, "post-churn echo server")
+        server_data = parse_guest_json(server_result.stdout, "post-churn server stdout")
+        if received_messages(server_data) != [payload]:
+            pytest.fail(f"unexpected post-churn server messages: {server_data!r}")
+    finally:
+        if server is not None and server.proc.poll() is None:
+            server.terminate()
+        run_in_netns(vm, NS_B, ["ip", "route", "del", alias_route, "dev", VETH_B], check=False)
+        run_netns_scenario(
+            vm,
+            NS_A,
+            "configure_ipv4_aliases",
+            {
+                "device": VETH_A,
+                "base_addr": alias_base,
+                "count": churn_count,
+                "action": "del",
+            },
+            check=False,
+        )
         cleanup_netns_topology(vm)

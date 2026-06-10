@@ -28,6 +28,7 @@ PHT_STAT_ATTR(established_liveness_timeouts, PHT_STAT_ESTABLISHED_LIVENESS_TIMEO
 PHT_STAT_ATTR(replacements_accepted, PHT_STAT_REPLACEMENTS_ACCEPTED);
 PHT_STAT_ATTR(replacement_quarantine_dropped, PHT_STAT_REPLACEMENT_QUARANTINE_DROPPED);
 PHT_STAT_ATTR(replacement_protect_dropped, PHT_STAT_REPLACEMENT_PROTECT_DROPPED);
+PHT_STAT_ATTR(retired_evicted, PHT_STAT_RETIRED_EVICTED);
 PHT_STAT_ATTR(collisions_won, PHT_STAT_COLLISIONS_WON);
 PHT_STAT_ATTR(collisions_lost, PHT_STAT_COLLISIONS_LOST);
 PHT_STAT_ATTR(request_payloads_injected, PHT_STAT_REQUEST_PAYLOADS_INJECTED);
@@ -59,6 +60,7 @@ static struct attribute *pht_stats_attrs[] = {
     &replacements_accepted_attr.attr,
     &replacement_quarantine_dropped_attr.attr,
     &replacement_protect_dropped_attr.attr,
+    &retired_evicted_attr.attr,
     &collisions_won_attr.attr,
     &collisions_lost_attr.attr,
     &request_payloads_injected_attr.attr,

@@ -3,6 +3,7 @@ import os
 import select
 import signal
 import socket
+import subprocess
 import struct
 import sys
 import time
@@ -668,6 +669,61 @@ def _send_ipv4_tcp_packet(config):
         raw_sock.sendto(ip_header + tcp_header + payload, (dst_addr, 0))
 
 
+def _ipv4_add_offset(addr, offset):
+    value = struct.unpack("!I", socket.inet_aton(addr))[0]
+    return socket.inet_ntoa(struct.pack("!I", (value + offset) & 0xFFFFFFFF))
+
+
+def configure_ipv4_aliases(config):
+    device = config["device"]
+    base_addr = config["base_addr"]
+    count = int(config["count"])
+    action = config.get("action", "add")
+    prefix_len = int(config.get("prefix_len", 32))
+    ignore_missing = bool(config.get("ignore_missing", action == "del"))
+
+    for offset in range(count):
+        addr = _ipv4_add_offset(base_addr, offset)
+        res = subprocess.run(
+            ["ip", "addr", action, f"{addr}/{prefix_len}", "dev", device],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            continue
+        if ignore_missing and action == "del":
+            continue
+        raise RuntimeError(f"ip addr {action} failed for {addr}/{prefix_len} on {device}: {res.stderr}")
+
+    _emit({"action": action, "count": count})
+
+
+def churn_retired_records(config):
+    src_addr = config["bind_addr"]
+    src_port = config["bind_port"]
+    target_base_addr = config["target_base_addr"]
+    target_ports = config.get("target_ports") or [config["target_port"]]
+    count = int(config["count"])
+    seq_base = int(config.get("seq_base", 4095 * 1024))
+
+    for offset in range(count):
+        seq = (seq_base + 4095 * offset) & 0xFFFFFFFF
+        target_addr = _ipv4_add_offset(target_base_addr, offset)
+        target_port = target_ports[offset % len(target_ports)]
+        packet = {
+            "bind_addr": src_addr,
+            "bind_port": src_port,
+            "target_addr": target_addr,
+            "target_port": target_port,
+            "seq": seq,
+        }
+        _send_ipv4_tcp_packet({**packet, "flags": "syn"})
+        _send_ipv4_tcp_packet({**packet, "seq": (seq + 1) & 0xFFFFFFFF, "flags": "rst"})
+
+    _emit({"sent": count})
+
+
 def send_tcp_packet(config):
     _send_ipv4_tcp_packet(config)
     _emit({"done": True})
@@ -944,6 +1000,8 @@ SCENARIOS = {
     "hold_tcp_listener": hold_tcp_listener,
     "tcp_bind_listen": tcp_bind_listen,
     "send_tcp_packet": send_tcp_packet,
+    "configure_ipv4_aliases": configure_ipv4_aliases,
+    "churn_retired_records": churn_retired_records,
     "send_ipv4_udp_fragments": send_ipv4_udp_fragments,
     "send_l2_tcp_packet": send_l2_tcp_packet,
     "capture_tcp_packet": capture_tcp_packet,

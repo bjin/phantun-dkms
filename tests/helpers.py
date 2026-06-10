@@ -33,6 +33,7 @@ MODULE_STAT_NAMES = (
     "replacements_accepted",
     "replacement_quarantine_dropped",
     "replacement_protect_dropped",
+    "retired_evicted",
     "collisions_won",
     "collisions_lost",
     "request_payloads_injected",

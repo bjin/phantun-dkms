@@ -22,10 +22,13 @@
 #include "phantun_stats.h"
 
 #define PHT_FLOW_IDLE_ACK_SUPPRESSION_WINDOW_MS 250U
+#define PHT_RETIRED_PER_BUCKET_MAX 8U
 
-/* Terminal teardown normally frees the full flow immediately. This tiny
- * per-bucket cache is the only state kept behind: enough for local reopen to
- * choose an ISN outside the previous generation's sequence window.
+/* Terminal teardown normally frees the full flow immediately. This bounded
+ * best-effort per-bucket cache is the only state kept behind: enough for local
+ * reopen to choose an ISN outside the previous generation's sequence window.
+ * Bucket-targeted eviction is attacker-influenceable, so this is a recovery
+ * hint rather than a security boundary.
  */
 struct pht_retired_flow {
     struct hlist_node hnode;
@@ -328,15 +331,26 @@ static void pht_flow_retired_publish_locked(struct pht_flow_bucket *bucket,
                                             const struct pht_endpoint_pair *ep, u32 prev_seq,
                                             unsigned long expires_jiffies) {
     struct pht_retired_flow *retired;
+    struct pht_retired_flow *evict = NULL;
+    unsigned int count = 0;
 
     hlist_for_each_entry(retired, &bucket->retired_head, hnode) {
-        if (!pht_endpoint_pair_equal(&retired->endpoints, ep))
-            continue;
+        if (pht_endpoint_pair_equal(&retired->endpoints, ep)) {
+            retired->prev_seq = prev_seq;
+            retired->expires_jiffies = expires_jiffies;
+            kfree(record);
+            return;
+        }
 
-        retired->prev_seq = prev_seq;
-        retired->expires_jiffies = expires_jiffies;
-        kfree(record);
-        return;
+        count++;
+        if (!evict || time_before(retired->expires_jiffies, evict->expires_jiffies))
+            evict = retired;
+    }
+
+    if (count >= PHT_RETIRED_PER_BUCKET_MAX && evict) {
+        hlist_del(&evict->hnode);
+        kfree(evict);
+        pht_stats_inc(PHT_STAT_RETIRED_EVICTED);
     }
 
     record->endpoints = *ep;
@@ -1185,6 +1199,7 @@ void pht_flow_remove(struct pht_flow *flow) {
         return;
     }
 
+    pht_flow_retired_purge_expired_locked(bucket, jiffies);
     pht_flow_retired_publish_locked(bucket, retired, &ep, prev_seq, expires_jiffies);
     hlist_del_init(&flow->hnode);
     pht_stats_dec(PHT_STAT_FLOWS_CURRENT);

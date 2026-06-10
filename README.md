@@ -388,6 +388,7 @@ can increment both an aggregate and a more specific reason counter:
 | `replacements_accepted` | Established flows that accepted a valid bare, aligned replacement SYN on the same tuple. |
 | `replacement_quarantine_dropped` | Delayed previous-generation packets silently dropped during the replacement quarantine window. Bare SYNs are not quarantine drops. |
 | `replacement_protect_dropped` | Established initiator replacement SYNs silently dropped while the replacement-protect window was active. |
+| `retired_evicted` | Best-effort retired flow metadata records evicted because a hash bucket reached its cap. |
 | `collisions_won` | Simultaneous-initiation collisions where the local side kept initiator role. |
 | `collisions_lost` | Simultaneous-initiation collisions where the local side switched to responder role. |
 | **Shaping and control payloads** | |
