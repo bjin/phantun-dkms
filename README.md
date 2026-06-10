@@ -364,8 +364,9 @@ cat /sys/module/phantun/stats/rst_sent
 Counters are monotonic. Some counters are aggregates and a single packet/event
 can increment both an aggregate and a more specific reason counter:
 
-- `udp_queue_full_dropped`, `udp_raw_inbound_dropped`, and
-  `udp_translation_failed_dropped` are also counted in `udp_packets_dropped`.
+- `udp_queue_full_dropped`, `udp_raw_inbound_dropped`,
+  `udp_translation_failed_dropped`, and `udp_reinject_failed_dropped` are also
+  counted in `udp_packets_dropped`.
 - `tcp_misaligned_syn_rejected` and `tcp_unknown_tuple_rejected` are also
   counted in `tcp_protocol_rejected`.
 - `oversized_payloads_dropped` covers both directions: outbound oversized UDP is
@@ -402,6 +403,7 @@ can increment both an aggregate and a more specific reason counter:
 | `udp_queue_full_dropped` | Selected outbound UDP dropped because the flow's one-skb queue was already occupied. Also increments `udp_packets_dropped`. |
 | `udp_raw_inbound_dropped` | Selector-owned raw inbound UDP intentionally dropped in `PRE_ROUTING` to avoid raw and translated duplicate delivery. Also increments `udp_packets_dropped`. |
 | `udp_translation_failed_dropped` | Selected outbound UDP consumed after local translation/open/send plumbing failed. Also increments `udp_packets_dropped`; half-open admission-limit rejects are counted by `half_open_rejected` instead. |
+| `udp_reinject_failed_dropped` | Inbound fake-TCP payloads dropped because local UDP reinjection failed under transient pressure. Also increments `udp_packets_dropped`. |
 | **Fake-TCP rejection and validation** | |
 | `tcp_protocol_rejected` | Aggregate owned fake-TCP packets rejected as invalid for the current protocol/state-machine context. Check narrower counters below for common reasons. |
 | `tcp_misaligned_syn_rejected` | Owned bare SYNs rejected because `seq % 4095 != 0`. Also increments `tcp_protocol_rejected`. |

@@ -204,7 +204,7 @@ def test_initial_syn_emit_failure_releases_flow_slot_and_queue(phantun_module, v
         cleanup_netns_topology(vm)
 
 
-def test_established_payload_emit_failure_tears_down_flow_and_allows_reopen(phantun_module, vm):
+def test_established_payload_terminal_output_error_tears_down_flow_and_allows_reopen(phantun_module, vm):
     load_loss_module(phantun_module)
     ensure_netns_topology(vm)
 

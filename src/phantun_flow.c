@@ -219,7 +219,7 @@ static void pht_flow_retransmit_timer(struct timer_list *timer) {
     spin_unlock_bh(&flow->lock);
 
     if (pht_flow_retransmit_now(flow))
-        pht_pr_warn("failed to retransmit half-open flow packet\n");
+        pht_pr_warn_rl("failed to retransmit half-open flow packet\n");
 
     spin_lock_bh(&flow->lock);
     if (!flow->retransmit_armed || !pht_flow_state_is_half_open(flow->state) ||

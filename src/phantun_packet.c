@@ -272,6 +272,8 @@ int pht_tx_fake_tcp_route(struct net *net, const struct pht_tx_route_key *key,
 
 int pht_tx_fake_tcp_with_dst(struct net *net, struct sk_buff *skb, u8 family,
                              struct dst_entry *dst) {
+    int ret;
+
     if (!net || !skb || !dst) {
         dst_release(dst);
         kfree_skb(skb);
@@ -283,11 +285,13 @@ int pht_tx_fake_tcp_with_dst(struct net *net, struct sk_buff *skb, u8 family,
     switch (family) {
     case AF_INET:
         skb->protocol = htons(ETH_P_IP);
-        return ip_local_out(net, NULL, skb);
+        ret = ip_local_out(net, NULL, skb);
+        return net_xmit_eval(ret);
 #if IS_ENABLED(CONFIG_IPV6)
     case AF_INET6:
         skb->protocol = htons(ETH_P_IPV6);
-        return ip6_local_out(net, NULL, skb);
+        ret = ip6_local_out(net, NULL, skb);
+        return net_xmit_eval(ret);
 #endif
     default:
         kfree_skb(skb);

@@ -412,6 +412,15 @@ The translator must tolerate loss of handshake-path packets within retry budget:
 - lost `handshake_request` or `handshake_response` → establishment still stands; later higher-sequence payloads may proceed
 - retry exhaustion before three-way handshake completes → tear down half-open flow and signal with `RST`
 
+### 7.4 Local I/O pressure
+
+Transient local queue or memory pressure (`NET_XMIT_DROP`, `-ENOBUFS`, or
+`-ENOMEM`) drops only the affected payload or control packet and keeps the flow
+generation live. Half-open handshake packets remain armed for timer retry, and
+established payload sequence space is not reused. Terminal routing or structural
+errors such as unreachable routes, unsupported families, access denial, or
+invalid packet construction still tear down the affected generation.
+
 ## 8. Packet path in kernel
 
 ### 8.1 Outbound UDP interception

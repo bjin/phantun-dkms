@@ -571,6 +571,10 @@ static void phantun_account_udp_translation_failure(void) {
     pht_stats_inc(PHT_STAT_UDP_TRANSLATION_FAILED_DROPPED);
 }
 
+static bool phantun_io_error_is_transient(int ret) {
+    return ret == NET_XMIT_DROP || ret == -ENOBUFS || ret == -ENOMEM;
+}
+
 static void phantun_account_tcp_protocol_rejected(void) {
     pht_stats_inc(PHT_STAT_TCP_PROTOCOL_REJECTED);
 }
@@ -1112,20 +1116,25 @@ static int phantun_send_flow_rst(struct pht_flow *flow, struct net *net) {
     return ret;
 }
 
-/* Returns 0 for a successful emit, or for a stale-generation drop where the
- * UDP skb is intentionally consumed. -EMSGSIZE is non-terminal. Any other
- * error owns terminal established-send teardown before returning.
+/* Returns 0 for a successful emit, a stale-generation drop, or a transient
+ * local I/O drop where the UDP skb is intentionally consumed. -EMSGSIZE is
+ * non-terminal. Any other error owns terminal established-send teardown before
+ * returning.
  */
 static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_endpoint_pair *ep,
                                         const struct pht_l4_view *view, const struct sk_buff *skb,
                                         const struct pht_tx_meta *meta, struct net *net,
-                                        bool persist_meta, bool send_rst_on_fatal_failure) {
+                                        bool persist_meta, bool send_rst_on_fatal_failure,
+                                        bool *emitted_payload) {
     u32 local_seq_window_start;
     bool fatal_failure = false;
     u32 seq;
     u32 ack;
     int ifindex;
     int ret;
+
+    if (emitted_payload)
+        *emitted_payload = false;
 
     if (view->payload_len > pht_fake_tcp_max_payload_len(view->family)) {
         pht_stats_inc(PHT_STAT_OVERSIZED_PAYLOADS_DROPPED);
@@ -1134,8 +1143,9 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
     }
 
     /* Reserve sequence space before emitting so concurrent local senders stay
-     * ordered. If emit fails, roll back only when nothing advanced flow->seq
-     * in the meantime.
+     * ordered. Stale-generation and terminal failures roll the reservation back
+     * when safe; transient local pressure consumes the sequence range exactly
+     * like on-path packet loss.
      *
      * For immediate local-out sends, the current UDP skb's metadata is also the
      * best local transmit policy context for later synthetic packets. Queued
@@ -1172,25 +1182,34 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
                 flow->local_tx_meta = *meta;
         }
         spin_unlock_bh(&flow->lock);
+        if (emitted_payload)
+            *emitted_payload = true;
     } else {
         bool stale_generation = ret == -EAGAIN;
+        bool transient_failure = phantun_io_error_is_transient(ret);
 
         spin_lock_bh(&flow->lock);
-        if (flow->state == PHT_FLOW_STATE_ESTABLISHED && flow->seq == seq + view->payload_len) {
+        if (!transient_failure && flow->state == PHT_FLOW_STATE_ESTABLISHED &&
+            flow->seq == seq + view->payload_len) {
             flow->seq = seq;
             flow->local_seq_window_start = local_seq_window_start;
         }
-        if (!stale_generation) {
+        if (!stale_generation && !transient_failure) {
             flow->state = PHT_FLOW_STATE_DEAD;
             fatal_failure = true;
         }
         spin_unlock_bh(&flow->lock);
         /* -EAGAIN is the emit helper's generation guard: the flow stopped
-         * matching this packet while the skb/dst was being prepared. Consume
-         * the UDP skb without converting a stale-generation drop into teardown.
+         * matching this packet while the skb/dst was being prepared. Transient
+         * queue/memory pressure consumes only this UDP payload; the established
+         * generation remains live and later packets continue in sequence.
          */
-        if (stale_generation)
+        if (stale_generation) {
             ret = 0;
+        } else if (transient_failure) {
+            phantun_account_udp_translation_failure();
+            ret = 0;
+        }
     }
     spin_unlock_bh(&flow->tx_lock);
 
@@ -1336,6 +1355,7 @@ static int phantun_flush_queued_udp(struct pht_flow *flow, struct net *net, bool
     struct pht_l4_view qview;
     struct pht_endpoint_pair qep;
     struct pht_tx_meta meta;
+    bool payload_emitted = false;
     int ret;
 
     if (emitted_payload)
@@ -1360,14 +1380,15 @@ static int phantun_flush_queued_udp(struct pht_flow *flow, struct net *net, bool
 
     phantun_fill_udp_endpoint_pair(&qview, &qep);
     qep.scope_ifindex = flow->endpoints.scope_ifindex;
-    ret = phantun_send_established_udp(flow, &qep, &qview, queued_skb, &meta, net, false, false);
+    ret = phantun_send_established_udp(flow, &qep, &qview, queued_skb, &meta, net, false, false,
+                                       &payload_emitted);
     if (ret && ret != -EMSGSIZE) {
         phantun_account_udp_translation_failure();
         kfree_skb(queued_skb);
         return ret;
     }
 
-    if (!ret && emitted_payload)
+    if (payload_emitted && emitted_payload)
         *emitted_payload = true;
 
     kfree_skb(queued_skb);
@@ -1502,8 +1523,13 @@ phantun_finalize_established_rx(struct pht_flow *flow, const struct pht_endpoint
 
     if (reinject_payload) {
         ret = phantun_reinject_inbound_payload(ep, skb, view, net, dev);
-        if (ret)
+        if (ret == -ENOBUFS || ret == -ENOMEM) {
+            pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+            pht_stats_inc(PHT_STAT_UDP_REINJECT_FAILED_DROPPED);
+            ret = 0;
+        } else if (ret) {
             return ret;
+        }
     }
 
     if (allow_flush) {
@@ -1518,10 +1544,13 @@ phantun_finalize_established_rx(struct pht_flow *flow, const struct pht_endpoint
         /* Reserved first-payload control drops are not application data; they
          * still need the prompt pure ACK that releases control-response state.
          */
-        if (reinject_payload && phantun_should_suppress_idle_ack(flow))
+        if (reinject_payload && phantun_should_suppress_idle_ack(flow)) {
             pht_stats_inc(PHT_STAT_IDLE_ACKS_SUPPRESSED);
-        else
+        } else {
             ret = phantun_send_idle_ack(flow, net, reply_meta);
+            if (phantun_io_error_is_transient(ret))
+                ret = 0;
+        }
     }
     return ret;
 }
@@ -1642,7 +1671,7 @@ retry_lookup:
             }
 
             ret = phantun_send_established_udp(flow, &ep, &view, skb, &tx_meta, state->net, true,
-                                               true);
+                                               true, NULL);
             if (ret && ret != -EMSGSIZE) {
                 phantun_account_udp_translation_failure();
                 pht_pr_warn("failed to emit fake-TCP payload for established flow: %d\n", ret);
@@ -1754,13 +1783,15 @@ create_initiator:
             pht_flow_set_egress_ifindex(new_flow, ifindex);
     }
     if (ret) {
-        phantun_account_udp_translation_failure();
         pht_pr_warn("failed to emit fake-TCP SYN: %d\n", ret);
-        pht_flow_detach(new_flow);
-        pht_flow_put(new_flow);
-        if (dead_flow)
-            pht_flow_put(dead_flow);
-        return NF_STOLEN;
+        if (!phantun_io_error_is_transient(ret)) {
+            phantun_account_udp_translation_failure();
+            pht_flow_detach(new_flow);
+            pht_flow_put(new_flow);
+            if (dead_flow)
+                pht_flow_put(dead_flow);
+            return NF_STOLEN;
+        }
     }
 
     pht_flow_put(new_flow);
@@ -2027,7 +2058,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         ret = phantun_send_synack(new_flow, state->net, &tx_meta);
         if (ret) {
             pht_pr_warn("failed to emit SYN|ACK: %d\n", ret);
-            pht_flow_detach(new_flow);
+            if (!phantun_io_error_is_transient(ret))
+                pht_flow_detach(new_flow);
         } else if (count_replacement_accept) {
             pht_stats_inc(PHT_STAT_REPLACEMENTS_ACCEPTED);
         }
@@ -2133,7 +2165,8 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             ret = phantun_send_synack(new_flow, state->net, &tx_meta);
             if (ret) {
                 pht_pr_warn("failed to emit SYN|ACK after collision handoff: %d\n", ret);
-                pht_flow_detach(new_flow);
+                if (!phantun_io_error_is_transient(ret))
+                    pht_flow_detach(new_flow);
             }
             pht_flow_put(new_flow);
             return NF_DROP;
@@ -2173,9 +2206,11 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 ret = phantun_send_handshake_request(flow, state->net);
                 if (ret) {
                     pht_pr_warn("failed to emit handshake request: %d\n", ret);
-                    pht_flow_remove(flow);
-                    pht_flow_put(flow);
-                    return NF_DROP;
+                    if (!phantun_io_error_is_transient(ret)) {
+                        pht_flow_remove(flow);
+                        pht_flow_put(flow);
+                        return NF_DROP;
+                    }
                 }
             }
 
@@ -2183,8 +2218,11 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 bool flushed_payload = false;
 
                 ret = phantun_flush_queued_udp(flow, state->net, &flushed_payload);
-                if (!ret && !phantun_request_enabled() && (!had_queued || !flushed_payload))
+                if (!ret && !phantun_request_enabled() && (!had_queued || !flushed_payload)) {
                     ret = phantun_send_idle_ack(flow, state->net, &tx_meta);
+                    if (phantun_io_error_is_transient(ret))
+                        ret = 0;
+                }
             }
             if (ret) {
                 phantun_discard_queued_udp_translation_failure(flow);
@@ -2349,9 +2387,11 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 ret = phantun_send_handshake_response(flow, state->net, &tx_meta);
                 if (ret) {
                     pht_pr_warn("failed to emit handshake response: %d\n", ret);
-                    pht_flow_remove(flow);
-                    pht_flow_put(flow);
-                    return NF_DROP;
+                    if (!phantun_io_error_is_transient(ret)) {
+                        pht_flow_remove(flow);
+                        pht_flow_put(flow);
+                        return NF_DROP;
+                    }
                 }
 
                 if (view.payload_len == 0)

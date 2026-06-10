@@ -42,6 +42,7 @@ PHT_STAT_ATTR(udp_packets_dropped, PHT_STAT_UDP_PACKETS_DROPPED);
 PHT_STAT_ATTR(udp_queue_full_dropped, PHT_STAT_UDP_QUEUE_FULL_DROPPED);
 PHT_STAT_ATTR(udp_raw_inbound_dropped, PHT_STAT_UDP_RAW_INBOUND_DROPPED);
 PHT_STAT_ATTR(udp_translation_failed_dropped, PHT_STAT_UDP_TRANSLATION_FAILED_DROPPED);
+PHT_STAT_ATTR(udp_reinject_failed_dropped, PHT_STAT_UDP_REINJECT_FAILED_DROPPED);
 PHT_STAT_ATTR(tcp_protocol_rejected, PHT_STAT_TCP_PROTOCOL_REJECTED);
 PHT_STAT_ATTR(tcp_misaligned_syn_rejected, PHT_STAT_TCP_MISALIGNED_SYN_REJECTED);
 PHT_STAT_ATTR(tcp_unknown_tuple_rejected, PHT_STAT_TCP_UNKNOWN_TUPLE_REJECTED);
@@ -72,6 +73,7 @@ static struct attribute *pht_stats_attrs[] = {
     &udp_queue_full_dropped_attr.attr,
     &udp_raw_inbound_dropped_attr.attr,
     &udp_translation_failed_dropped_attr.attr,
+    &udp_reinject_failed_dropped_attr.attr,
     &tcp_protocol_rejected_attr.attr,
     &tcp_misaligned_syn_rejected_attr.attr,
     &tcp_unknown_tuple_rejected_attr.attr,

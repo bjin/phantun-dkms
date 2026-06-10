@@ -47,6 +47,7 @@ MODULE_STAT_NAMES = (
     "udp_queue_full_dropped",
     "udp_raw_inbound_dropped",
     "udp_translation_failed_dropped",
+    "udp_reinject_failed_dropped",
     "tcp_protocol_rejected",
     "tcp_misaligned_syn_rejected",
     "tcp_unknown_tuple_rejected",
