@@ -397,6 +397,7 @@ can increment both an aggregate and a more specific reason counter:
 | `shaping_payloads_dropped` | Reserved first-payload slots hidden from the UDP app by handshake shaping. |
 | **RST and UDP packet accounting** | |
 | `rst_sent` | Fake-TCP RST packets successfully sent. A RST is often a reaction to a rejection or teardown; use the rejection/drop counters to tell why it was sent. |
+| `idle_acks_suppressed` | Immediate pure ACKs skipped for inbound established payloads because the flow recently sent local UDP payload within the short idle-ACK suppression window. |
 | `route_cache_hits` | Established fake-TCP payload sends that reused the per-flow dst cache after `dst_check()` accepted it. |
 | `route_cache_misses` | Established fake-TCP payload sends that needed a fresh route lookup because no matching valid cached dst was available. |
 | `udp_packets_queued` | Selected outbound UDP packets accepted into a flow's one-skb queue. Queue-full drops are counted separately. |
