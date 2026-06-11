@@ -139,19 +139,90 @@ def test_module_reload_new_params(phantun_module, dmesg):
         pytest.fail("Second load (reload) failed")
 
 
-def test_module_rejects_too_large_reopen_guard(phantun_module, vm):
+def test_module_rejects_reopen_guard_at_cap(phantun_module, vm):
     phantun_module.unload()
     vm.run(
-        "echo 'options phantun managed_local_ports=1234 reopen_guard_bytes=2147483648' "
+        "echo 'options phantun managed_local_ports=1234 reopen_guard_bytes=1073741824' "
         "> /etc/modprobe.d/phantun.conf"
     )
     try:
         res = vm.run(["modprobe", "phantun"], check=False)
-        assert_modprobe_rejected(res, "oversized reopen_guard_bytes")
+        assert_modprobe_rejected(res, "reopen_guard_bytes at cap")
 
         lsmod = vm.run(["lsmod"])
         if "phantun" in lsmod.stdout:
             pytest.fail("phantun module should not remain loaded after invalid reopen_guard_bytes")
+    finally:
+        vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
+
+
+def test_module_accepts_reopen_guard_below_cap(phantun_module, vm):
+    phantun_module.unload()
+    vm.run(
+        "echo 'options phantun managed_local_ports=1234 reopen_guard_bytes=1073741823' "
+        "> /etc/modprobe.d/phantun.conf"
+    )
+    try:
+        res = vm.run(["modprobe", "phantun"], check=False)
+        if res.returncode != 0:
+            pytest.fail(
+                "modprobe rejected reopen_guard_bytes below cap: " f"stdout={res.stdout!r}, stderr={res.stderr!r}"
+            )
+
+        lsmod = vm.run(["lsmod"])
+        if "phantun" not in lsmod.stdout:
+            pytest.fail("phantun module is not loaded with reopen_guard_bytes below cap")
+    finally:
+        vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
+
+
+def test_module_rejects_invalid_hex_handshake_request_payload(phantun_module, vm):
+    phantun_module.unload()
+    vm.run("echo 'options phantun managed_local_ports=1234 handshake_request=hex:zz' > /etc/modprobe.d/phantun.conf")
+    try:
+        res = vm.run(["modprobe", "phantun"], check=False)
+        assert_modprobe_rejected(res, "invalid hex handshake_request")
+
+        lsmod = vm.run(["lsmod"])
+        if "phantun" in lsmod.stdout:
+            pytest.fail("phantun module should not remain loaded after invalid hex handshake_request")
+    finally:
+        vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
+
+
+def test_module_rejects_odd_hex_handshake_response_payload(phantun_module, vm):
+    phantun_module.unload()
+    vm.run(
+        "echo 'options phantun managed_local_ports=1234 handshake_request=req handshake_response=hex:abc' "
+        "> /etc/modprobe.d/phantun.conf"
+    )
+    try:
+        res = vm.run(["modprobe", "phantun"], check=False)
+        assert_modprobe_rejected(res, "odd hex handshake_response")
+
+        lsmod = vm.run(["lsmod"])
+        if "phantun" in lsmod.stdout:
+            pytest.fail("phantun module should not remain loaded after odd hex handshake_response")
+    finally:
+        vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
+
+
+def test_module_rejects_invalid_base64_handshake_request_payload_when_kernel_supports_decode(phantun_module, vm):
+    if not kernel_has_base64_support(vm):
+        pytest.skip("kernel lacks in-kernel base64 decode support")
+
+    phantun_module.unload()
+    vm.run(
+        "echo 'options phantun managed_local_ports=1234 handshake_request=base64:@@@@' "
+        "> /etc/modprobe.d/phantun.conf"
+    )
+    try:
+        res = vm.run(["modprobe", "phantun"], check=False)
+        assert_modprobe_rejected(res, "invalid base64 handshake_request")
+
+        lsmod = vm.run(["lsmod"])
+        if "phantun" in lsmod.stdout:
+            pytest.fail("phantun module should not remain loaded after invalid base64 handshake_request")
     finally:
         vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
 

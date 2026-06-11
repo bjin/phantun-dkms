@@ -280,7 +280,7 @@ in
     reopenGuardBytes = mkOption {
       type = nullableIntType;
       default = null;
-      description = "Sequence-space reopen guard in bytes from 0 through 2147483647, or null to use the kernel default.";
+      description = "Sequence-space reopen guard in bytes from 0 through 1073741823, or null to use the kernel default.";
     };
 
     halfOpenLimit = mkOption {
@@ -358,8 +358,8 @@ in
       ++ [
         {
           assertion =
-            cfg.reopenGuardBytes == null || (cfg.reopenGuardBytes >= 0 && cfg.reopenGuardBytes < 2147483648);
-          message = "services.phantun.reopenGuardBytes must be null or an integer in the range 0..2147483647.";
+            cfg.reopenGuardBytes == null || (cfg.reopenGuardBytes >= 0 && cfg.reopenGuardBytes < 1073741824);
+          message = "services.phantun.reopenGuardBytes must be null or an integer in the range 0..1073741823.";
         }
       ];
     }

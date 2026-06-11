@@ -376,7 +376,7 @@ def test_established_syn_fin_is_not_accepted_as_replacement(phantun_module, vm):
 
 
 def test_established_invalid_syn_destroys_flow(phantun_module, vm):
-    reopen_guard_bytes = 2_100_000_000
+    reopen_guard_bytes = 1_000_000_000
     phantun_module.load(
         managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, reopen_guard_bytes=reopen_guard_bytes
     )

@@ -273,7 +273,7 @@ Validation rules:
 | `keepalive_interval_sec` | `30` | Idle period before sending keepalive ACK. |
 | `keepalive_misses` | `3` | Unanswered keepalives allowed before teardown. |
 | `hard_idle_timeout_sec` | `300` | Hard upper bound for idle flow lifetime. |
-| `reopen_guard_bytes` | `4194304` | Minimum sequence-space distance before reopening same tuple. |
+| `reopen_guard_bytes` | `4194304` | Minimum sequence-space distance before reopening same tuple; accepts `0..1073741823` and rejects values `>= 1073741824`. |
 | `half_open_limit` | `4096` | Maximum concurrent half-open flows per network namespace. New SYN-created or outbound half-open flows beyond this limit are rejected until existing half-open flows establish or time out. |
 | `replacement_quarantine_ms` | `3000` | Previous-generation quarantine window after tuple replacement. Matching old-generation packets are silently dropped during this window. |
 | `replacement_protect_ms` | `0` (auto) | Established-initiator bare-SYN replacement protection window. During the window, aligned bare replacement SYNs to an established initiator are silently dropped to suppress stale simultaneous-initiation loser SYNs. After the window expires, normal replacement handling resumes. |
@@ -288,7 +288,7 @@ Validation rules:
 | Hex | `hex:deadbeef` | Decode remaining text as hex |
 | Base64 | `base64:YWJj` | Decode remaining text as Base64 when the target kernel supports it |
 
-Invalid hex is ignored safely. Invalid Base64, or Base64 on kernels without in-kernel Base64 support, is ignored safely with a kernel log warning.
+Malformed `hex:` payloads reject module load. Malformed `base64:` payloads reject module load when the target kernel provides Base64 decode; on kernels without in-kernel Base64 support, Base64 payloads are ignored with a kernel warning.
 
 ## Common setups
 

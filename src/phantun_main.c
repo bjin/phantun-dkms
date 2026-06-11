@@ -1940,8 +1940,11 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         return NF_ACCEPT;
 
     flows = phantun_net_hook_flows(state->net);
+    /* Fail open if hook state exists before the flow table is attached;
+     * NF_DROP here would blackhole every inbound non-loopback packet.
+     */
     if (!flows)
-        return NF_DROP;
+        return NF_ACCEPT;
 
     ret = phantun_parse_tcp_skb(skb, &view);
     if (ret)
@@ -2968,8 +2971,8 @@ static int phantun_validate_config(void) {
     if (ret)
         return ret;
 
-    if (reopen_guard_bytes >= 0x80000000U) {
-        pht_pr_err("reopen_guard_bytes must be smaller than 2147483648\n");
+    if (reopen_guard_bytes >= PHANTUN_MAX_REOPEN_GUARD_BYTES) {
+        pht_pr_err("reopen_guard_bytes must be smaller than 1073741824\n");
         return -EINVAL;
     }
 
@@ -3037,9 +3040,8 @@ static int phantun_parse_payload_param(const char *raw_str, void **out_buf, unsi
         if (ret == -ENOMEM)
             return -ENOMEM;
         if (ret) {
-            pht_pr_warn("failed to base64 decode parameter, ignoring\n");
-            *out_buf = NULL;
-            *out_len = 0;
+            pht_pr_err("failed to base64 decode parameter\n");
+            return -EINVAL;
         }
         return 0;
 #endif
@@ -3053,8 +3055,8 @@ static int phantun_parse_payload_param(const char *raw_str, void **out_buf, unsi
             return 0;
 
         if (len % 2 != 0) {
-            pht_pr_warn("hex parameter must have an even length, ignoring\n");
-            return 0;
+            pht_pr_err("hex parameter must have an even length\n");
+            return -EINVAL;
         }
 
         *out_buf = kmalloc(len / 2, GFP_KERNEL);
@@ -3062,10 +3064,11 @@ static int phantun_parse_payload_param(const char *raw_str, void **out_buf, unsi
             return -ENOMEM;
 
         if (hex2bin(*out_buf, raw_str, len / 2)) {
-            pht_pr_warn("invalid hex characters in parameter, ignoring\n");
             kfree(*out_buf);
             *out_buf = NULL;
-            return 0;
+            *out_len = 0;
+            pht_pr_err("invalid hex characters in parameter\n");
+            return -EINVAL;
         }
 
         *out_len = len / 2;
