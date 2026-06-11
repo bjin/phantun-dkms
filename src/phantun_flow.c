@@ -194,8 +194,7 @@ static void pht_flow_retransmit_timer(struct timer_list *timer) {
     unsigned long next;
 
     spin_lock_bh(&flow->lock);
-    if (!flow->retransmit_armed || !pht_flow_state_is_half_open(flow->state) ||
-        flow->state == PHT_FLOW_STATE_DEAD) {
+    if (!flow->retransmit_armed || !pht_flow_state_is_half_open(flow->state)) {
         flow->retransmit_armed = false;
         spin_unlock_bh(&flow->lock);
         pht_flow_put(flow);
@@ -225,8 +224,7 @@ static void pht_flow_retransmit_timer(struct timer_list *timer) {
         pht_pr_warn_rl("failed to retransmit half-open flow packet\n");
 
     spin_lock_bh(&flow->lock);
-    if (!flow->retransmit_armed || !pht_flow_state_is_half_open(flow->state) ||
-        flow->state == PHT_FLOW_STATE_DEAD) {
+    if (!flow->retransmit_armed || !pht_flow_state_is_half_open(flow->state)) {
         flow->retransmit_armed = false;
         spin_unlock_bh(&flow->lock);
         pht_flow_put(flow);
@@ -591,9 +589,11 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
     return found;
 }
 
-/* Keepalive candidates are collected with a temporary ref while bucket locks
- * are held, then transmitted here lockless. The revalidation after emit avoids
- * writing route state into a detached/replaced generation.
+/* Keepalive candidates are collected under bucket locks with a temporary ref,
+ * then transmitted here lockless. flow->table is immutable after create, so
+ * ESTABLISHED is the meaningful revalidation before sampling or saving state.
+ * The ACK seq is sampled under flow->lock rather than tx_lock; a concurrent
+ * transmit rollback is benign because keepalives are pure ACKs with no payload.
  */
 static void pht_flow_emit_keepalives(struct pht_flow_table *table, struct list_head *keepalives) {
     while (!list_empty(keepalives)) {
@@ -609,7 +609,7 @@ static void pht_flow_emit_keepalives(struct pht_flow_table *table, struct list_h
         list_del_init(&flow->keepalive_node);
 
         spin_lock_bh(&flow->lock);
-        live = flow->state == PHT_FLOW_STATE_ESTABLISHED && flow->table == table;
+        live = flow->state == PHT_FLOW_STATE_ESTABLISHED;
         if (live) {
             ep = flow->endpoints;
             seq = flow->seq;
@@ -623,7 +623,7 @@ static void pht_flow_emit_keepalives(struct pht_flow_table *table, struct list_h
                                     &ifindex);
             if (!ret) {
                 spin_lock_bh(&flow->lock);
-                if (flow->state == PHT_FLOW_STATE_ESTABLISHED && flow->table == table)
+                if (flow->state == PHT_FLOW_STATE_ESTABLISHED)
                     flow->egress_ifindex = ifindex;
                 spin_unlock_bh(&flow->lock);
             }
@@ -664,18 +664,14 @@ static void pht_flow_gc_worker(struct work_struct *work) {
             continue;
         }
 
-        switch (ntohs(skb->protocol)) {
-        case ETH_P_IP:
+        if (skb->protocol == htons(ETH_P_IP)) {
             ip_local_out(table->net, NULL, skb);
-            break;
 #if IS_ENABLED(CONFIG_IPV6)
-        case ETH_P_IPV6:
+        } else if (skb->protocol == htons(ETH_P_IPV6)) {
             ip6_local_out(table->net, NULL, skb);
-            break;
 #endif
-        default:
+        } else {
             kfree_skb(skb);
-            break;
         }
     }
 
@@ -1427,7 +1423,7 @@ void pht_flow_arm_retransmit(struct pht_flow *flow) {
         return;
 
     spin_lock_bh(&flow->lock);
-    if (!pht_flow_state_is_half_open(flow->state) || flow->state == PHT_FLOW_STATE_DEAD) {
+    if (!pht_flow_state_is_half_open(flow->state)) {
         spin_unlock_bh(&flow->lock);
         return;
     }

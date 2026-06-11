@@ -798,9 +798,9 @@ static bool phantun_family_enabled(u8 family) {
 static int phantun_parse_udp_skb(struct sk_buff *skb, struct pht_l4_view *view) {
     int ret;
 
-    if (ntohs(skb->protocol) == ETH_P_IP)
+    if (skb->protocol == htons(ETH_P_IP))
         return pht_parse_ipv4_udp(skb, view);
-    if (ntohs(skb->protocol) == ETH_P_IPV6)
+    if (skb->protocol == htons(ETH_P_IPV6))
         return pht_parse_ipv6_udp(skb, view);
 
     ret = pht_parse_ipv4_udp(skb, view);
@@ -812,9 +812,9 @@ static int phantun_parse_udp_skb(struct sk_buff *skb, struct pht_l4_view *view) 
 static int phantun_parse_tcp_skb(struct sk_buff *skb, struct pht_l4_view *view) {
     int ret;
 
-    if (ntohs(skb->protocol) == ETH_P_IP)
+    if (skb->protocol == htons(ETH_P_IP))
         return pht_parse_ipv4_tcp(skb, view);
-    if (ntohs(skb->protocol) == ETH_P_IPV6)
+    if (skb->protocol == htons(ETH_P_IPV6))
         return pht_parse_ipv6_tcp(skb, view);
 
     ret = pht_parse_ipv4_tcp(skb, view);
@@ -1818,7 +1818,7 @@ static unsigned int phantun_pre_routing_segment_gso(void *priv, struct sk_buff *
 
     if (!skb_is_gso(skb) || !skb_is_gso_tcp(skb))
         return NF_ACCEPT;
-    if (ntohs(skb->protocol) == ETH_P_IPV6)
+    if (skb->protocol == htons(ETH_P_IPV6))
         features = NETIF_F_SG | NETIF_F_IPV6_CSUM;
 
     segs = __skb_gso_segment(skb, features, false);
@@ -1834,6 +1834,9 @@ static unsigned int phantun_pre_routing_segment_gso(void *priv, struct sk_buff *
         unsigned int verdict;
 
         skb_mark_not_on_list(seg);
+        /* The recursive handler must not consume seg; the segmentation loop
+         * owns every segment and frees it exactly once for NF_ACCEPT or NF_DROP.
+         */
         verdict = phantun_pre_routing(priv, seg, state);
         if (verdict == NF_ACCEPT)
             pht_pr_warn_rl("segmented inbound TCP packet unexpectedly escaped fake-TCP handler\n");
