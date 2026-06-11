@@ -1464,6 +1464,8 @@ def test_queued_established_payload_emit_failure_frees_skb_and_does_not_send_rst
                 }
             ],
         )
+        server_ready_file = f"/tmp/phantun-queued-failure-server-{uuid.uuid4().hex}"
+        server_stop_file = f"/tmp/phantun-queued-failure-stop-{uuid.uuid4().hex}"
         server = spawn_netns_scenario(
             vm,
             NS_B,
@@ -1472,10 +1474,12 @@ def test_queued_established_payload_emit_failure_frees_skb_and_does_not_send_rst
                 "bind_addr": NS_ADDR_B,
                 "bind_port": dst_port,
                 "count": 1,
-                "timeout_sec": 8,
+                "timeout_sec": 30,
+                "ready_file": server_ready_file,
+                "stop_file": server_stop_file,
             },
         )
-        time.sleep(0.2)
+        wait_for_guest_ready_file(vm, server_ready_file)
         client = run_netns_scenario(
             vm,
             NS_A,
@@ -1542,11 +1546,12 @@ def test_queued_established_payload_emit_failure_frees_skb_and_does_not_send_rst
 
         wait_for_flows_below(vm, queued_stats["flows_current"])
 
+        write_guest_text(vm, server_stop_file, "stop\n")
         server_result = server.communicate(timeout=12)
         assert_completed(server_result, "queued established-send failure receiver")
         server_data = parse_guest_json(server_result.stdout, "queued failure receiver stdout")
-        if not server_data.get("timed_out") or received_messages(server_data):
-            pytest.fail(f"queued payload was unexpectedly delivered: {server_data!r}")
+        if not server_data.get("stopped") or received_messages(server_data):
+            pytest.fail(f"queued payload was unexpectedly delivered before server stop: {server_data!r}")
 
         payload_probe = make_netns_tcp_payload_probe(
             vm,
@@ -1573,6 +1578,7 @@ def test_queued_established_payload_emit_failure_frees_skb_and_does_not_send_rst
             time.sleep(0.1)
 
         wait_for_flows_current(vm, initial_stats["flows_current"], timeout=12)
+        fresh_ready_file = f"/tmp/phantun-queued-failure-fresh-{uuid.uuid4().hex}"
         fresh_server = spawn_netns_scenario(
             vm,
             NS_B,
@@ -1582,9 +1588,10 @@ def test_queued_established_payload_emit_failure_frees_skb_and_does_not_send_rst
                 "bind_port": dst_port,
                 "count": 1,
                 "timeout_sec": 10,
+                "ready_file": fresh_ready_file,
             },
         )
-        time.sleep(0.2)
+        wait_for_guest_ready_file(vm, fresh_ready_file)
         fresh_client = run_netns_scenario(
             vm,
             NS_A,

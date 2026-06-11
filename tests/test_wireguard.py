@@ -97,7 +97,7 @@ def assert_ping_clean(result, label):
 
 
 def ping_wireguard_peer(vm, namespace, target, label):
-    result = run_in_netns(vm, namespace, ["ping", "-c", "3", "-W", "1", target])
+    result = run_in_netns(vm, namespace, ["ping", "-c", "3", "-i", "0.2", "-W", "2", target])
     assert_ping_clean(result, label)
 
 
@@ -322,7 +322,6 @@ def test_kernel_wireguard_roaming_updates_endpoint(phantun_module, vm):
 
         run_in_netns(vm, NS_B, ["ip", "addr", "del", f"{NS_ADDR_B}/24", "dev", VETH_B])
         run_in_netns(vm, NS_B, ["ip", "addr", "add", f"{NS_ADDR_B_ROAM}/24", "dev", VETH_B])
-        time.sleep(0.2)
 
         ping_wireguard_peer(vm, NS_B, WG_PEER_A, "roamed ns_b -> ns_a ping")
         wait_for_endpoint(vm, NS_A, f"{NS_ADDR_B_ROAM}:{PORT_B}")

@@ -539,7 +539,7 @@ def test_established_bare_syn_replacement(phantun_module, vm):
 
 
 def test_replacement_protect_suppresses_initiator_bare_syn_then_expires(phantun_module, vm):
-    protect_ms = 5000
+    protect_ms = 3000
     phantun_module.load(
         managed_netns="all",
         managed_local_ports=MANAGED_LOCAL_PORTS,
@@ -578,6 +578,7 @@ def test_replacement_protect_suppresses_initiator_bare_syn_then_expires(phantun_
             },
         ],
     )
+    server_ready_file = f"/tmp/phantun-replacement-protect-{uuid.uuid4().hex}"
     server = spawn_netns_scenario(
         vm,
         NS_B,
@@ -587,11 +588,12 @@ def test_replacement_protect_suppresses_initiator_bare_syn_then_expires(phantun_
             "bind_port": dst_port,
             "count": 2,
             "timeout_sec": 20,
+            "ready_file": server_ready_file,
         },
     )
 
     try:
-        time.sleep(0.2)
+        wait_for_guest_ready_file(vm, server_ready_file)
         client_result_1 = run_netns_scenario(
             vm,
             NS_A,

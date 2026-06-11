@@ -784,7 +784,7 @@ def setup_wireguard_pair_ipv6(vm, endpoint_a=NS6_ADDR_A, endpoint_b=NS6_ADDR_B):
 
 
 def ping6_wireguard_peer(vm, namespace, target, label, size=None):
-    command = ["ping", "-6", "-c", "3", "-W", "1"]
+    command = ["ping", "-6", "-c", "3", "-i", "0.2", "-W", "2"]
     if size is not None:
         command.extend(["-s", str(size)])
     command.append(target)

@@ -151,16 +151,23 @@ def echo_client(config):
 def recv_many(config):
     received = []
     target_count = config["count"]
+    ready_file = config.get("ready_file")
 
     with _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec")) as sock:
-        while len(received) < target_count:
-            data, addr = sock.recvfrom(2048)
-            received.append(
-                {
-                    "message": data.decode(),
-                    "peer": [addr[0], addr[1]],
-                }
-            )
+        if ready_file:
+            Path(ready_file).write_text("ready\n")
+        try:
+            while len(received) < target_count:
+                data, addr = sock.recvfrom(2048)
+                received.append(
+                    {
+                        "message": data.decode(),
+                        "peer": [addr[0], addr[1]],
+                    }
+                )
+        finally:
+            if ready_file:
+                Path(ready_file).unlink(missing_ok=True)
 
     _emit({"received": received})
 
@@ -169,16 +176,28 @@ def recv_until_timeout(config):
     received = []
     target_count = config.get("count", 1)
     ready_file = config.get("ready_file")
+    stop_file = config.get("stop_file")
+    timeout_sec = config.get("timeout_sec")
+    deadline = time.time() + (timeout_sec if timeout_sec is not None else TIMEOUT_SEC)
     timed_out = False
+    stopped = False
 
-    with _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec")) as sock:
+    with _socket(config["bind_addr"], config["bind_port"], 0.1 if stop_file else timeout_sec) as sock:
         if ready_file:
             Path(ready_file).write_text("ready\n")
         try:
             while len(received) < target_count:
+                if stop_file and Path(stop_file).exists():
+                    stopped = True
+                    break
+                if time.time() >= deadline:
+                    timed_out = True
+                    break
                 try:
                     data, addr = sock.recvfrom(2048)
                 except socket.timeout:
+                    if stop_file:
+                        continue
                     timed_out = True
                     break
 
@@ -191,8 +210,10 @@ def recv_until_timeout(config):
         finally:
             if ready_file:
                 Path(ready_file).unlink(missing_ok=True)
+            if stop_file:
+                Path(stop_file).unlink(missing_ok=True)
 
-    _emit({"received": received, "timed_out": timed_out})
+    _emit({"received": received, "timed_out": timed_out, "stopped": stopped})
 
 
 def send_many(config):
