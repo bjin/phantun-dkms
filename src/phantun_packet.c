@@ -765,6 +765,7 @@ static void pht_udp_v4_complete_skb(struct sk_buff *skb) {
     struct udphdr *uh = udp_hdr(skb);
 
     pht_udp_v4_complete(iph, uh, ntohs(uh->len));
+    skb->ip_summed = CHECKSUM_UNNECESSARY;
 }
 
 struct sk_buff *pht_build_udp_v4_uninit(const struct pht_endpoint_pair *ep, size_t payload_len,
@@ -1083,6 +1084,7 @@ static void pht_udp_v6_complete_skb(struct sk_buff *skb) {
     struct udphdr *uh = udp_hdr(skb);
 
     pht_udp_v6_complete(ip6h, uh, ntohs(uh->len));
+    skb->ip_summed = CHECKSUM_UNNECESSARY;
 }
 
 struct sk_buff *pht_build_udp_v6_uninit(const struct pht_endpoint_pair *ep, size_t payload_len,

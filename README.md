@@ -290,6 +290,8 @@ Validation rules:
 
 Malformed `hex:` payloads reject module load. Malformed `base64:` payloads reject module load when the target kernel provides Base64 decode; on kernels without in-kernel Base64 support, Base64 payloads are ignored with a kernel warning.
 
+Payload length is validated against the fake-TCP payload limit for the smallest enabled family. When IPv6 is enabled, the IPv6 limit is used even if the operator expects only IPv4 flows.
+
 ## Common setups
 
 ### Own a WireGuard port
@@ -341,6 +343,7 @@ sudo modprobe phantun
 | **Loopback** | Loopback traffic is still left alone by the data path, so default local Phantun-on-loopback setups can coexist. Only an effective `reserved_local_ports` wildcard bind in pure local-only mode blocks loopback listeners on the same port in a selected namespace; ignored or failed reservations do not. |
 | **MTU** | Same basic fake-TCP packet overhead as Phantun; Phantun's MTU guidance still applies. |
 | **Handshake buffering** | During handshake, the module queues at most **one** outbound UDP packet per flow; later packets may be dropped and must rely on normal app retransmission. |
+| **Zero-length UDP** | A zero-length outbound UDP datagram on a managed tuple is consumed and counted as dropped; it does not create a flow and is not delivered, because fake-TCP data is carried in ACK payload bytes and the wire protocol has no representation for an empty datagram. |
 | **Shaping semantics** | `handshake_request` / `handshake_response` are hints, not a verified sub-protocol. |
 | **Keepalive** | `phantun-dkms` has TCP-like keepalive behavior; that is another reason mixed Phantun / `phantun-dkms` endpoints should not be assumed to interoperate. |
 
@@ -351,6 +354,8 @@ The module exports counters under:
 ```text
 /sys/module/phantun/stats/
 ```
+
+Counters under `/sys/module/phantun/stats/*` are module-global and aggregate all managed network namespaces; they are not per-netns counters when `managed_netns=all`.
 
 Example:
 

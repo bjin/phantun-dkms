@@ -436,6 +436,7 @@ Behavior:
 - established flow → consume UDP skb, emit fake-TCP skb
 - handshaking flow → queue one skb or drop
 - no flow → create initiator flow, queue one skb, send `SYN`
+- zero-payload UDP on an owned tuple is consumed/dropped instead of translated because fake-TCP payload data rides in ACK payloads and has no empty datagram representation
 - if skb already carries conntrack state, confirm original UDP entry before stealing packet so translated inbound replies can match established host-firewall policy
 - copy the outbound UDP packet's transmit metadata to the generated fake-TCP packet
 - original UDP skb is stolen from the stack
@@ -558,6 +559,8 @@ Design constraints:
 - at least one selector list must be non-empty
 - `ip_families` is one of `both`, `ipv4`, `ipv6`; default `both`
 - `managed_netns` is one of `init`, `all`; default `init`
+- `reopen_guard_bytes < 2^30`
+- malformed explicit `hex:`/`base64:` shaping payloads are load errors; unsupported Base64 decode on older kernels remains a warned no-payload fallback
 
 Future control plane direction:
 
