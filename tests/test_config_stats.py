@@ -24,6 +24,7 @@ from helpers import (
     run_netns_scenario,
     spawn_guest_scenario,
     spawn_netns_scenario,
+    wait_for_guest_ready_file,
 )
 
 MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
@@ -79,6 +80,7 @@ def test_sysfs_stats_exist_and_increment(phantun_module, vm):
     ensure_netns_topology(vm)
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
+    ready_file = f"/tmp/phantun-stats-server-{time.monotonic_ns()}"
     server = spawn_netns_scenario(
         vm,
         NS_B,
@@ -88,11 +90,12 @@ def test_sysfs_stats_exist_and_increment(phantun_module, vm):
             "bind_port": dst_port,
             "count": 2,
             "replies": ["reply-0", "reply-1"],
+            "ready_file": ready_file,
         },
     )
 
     try:
-        time.sleep(0.2)
+        wait_for_guest_ready_file(vm, ready_file)
         client = run_netns_scenario(
             vm,
             NS_A,

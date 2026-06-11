@@ -236,6 +236,9 @@ def recv_many_reply(config):
     target_count = config["count"]
 
     with _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec")) as sock:
+        if config.get("ready_file"):
+            Path(config["ready_file"]).write_text("ready\n")
+
         while len(received) < target_count:
             data, addr = sock.recvfrom(2048)
             message = data.decode()
@@ -584,7 +587,7 @@ def _tcp_flags_expr(expr):
     return value
 
 
-def _send_ipv4_tcp_packet(config):
+def _build_ipv4_tcp_packet(config):
     src_addr = config["bind_addr"]
     dst_addr = config["target_addr"]
     src_port = config["bind_port"]
@@ -671,9 +674,15 @@ def _send_ipv4_tcp_packet(config):
         socket.inet_aton(dst_addr),
     )
 
+    return ip_header + tcp_header + payload
+
+
+def _send_ipv4_tcp_packet(config):
+    dst_addr = config["target_addr"]
+
     with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW) as raw_sock:
         raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        raw_sock.sendto(ip_header + tcp_header + payload, (dst_addr, 0))
+        raw_sock.sendto(_build_ipv4_tcp_packet(config), (dst_addr, 0))
 
 
 def _ipv4_add_offset(addr, offset):
@@ -684,6 +693,40 @@ def _ipv4_add_offset(addr, offset):
     return socket.inet_ntoa(struct.pack("!I", base + block * 256 + host + 1))
 
 
+def _run_ip_batch(commands, context):
+    if not commands:
+        return
+
+    res = subprocess.run(
+        ["ip", "-batch", "-"],
+        input="\n".join(commands) + "\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"{context} failed: {res.stderr}")
+
+
+def _existing_ipv4_addresses(device):
+    res = subprocess.run(
+        ["ip", "-j", "-4", "addr", "show", "dev", device],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"ip addr show failed for {device}: {res.stderr}")
+
+    addresses = set()
+    for link in json.loads(res.stdout or "[]"):
+        for info in link.get("addr_info", []):
+            local = info.get("local")
+            if local:
+                addresses.add(local)
+    return addresses
+
+
 def configure_ipv4_aliases(config):
     device = config["device"]
     base_addr = config["base_addr"]
@@ -692,19 +735,13 @@ def configure_ipv4_aliases(config):
     prefix_len = int(config.get("prefix_len", 32))
     ignore_missing = bool(config.get("ignore_missing", action == "del"))
 
-    for offset in range(count):
-        addr = _ipv4_add_offset(base_addr, offset)
-        res = subprocess.run(
-            ["ip", "addr", action, f"{addr}/{prefix_len}", "dev", device],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if res.returncode == 0:
-            continue
-        if ignore_missing and action == "del":
-            continue
-        raise RuntimeError(f"ip addr {action} failed for {addr}/{prefix_len} on {device}: {res.stderr}")
+    addresses = [_ipv4_add_offset(base_addr, offset) for offset in range(count)]
+    if ignore_missing and action == "del":
+        existing = _existing_ipv4_addresses(device)
+        addresses = [addr for addr in addresses if addr in existing]
+
+    commands = [f"addr {action} {addr}/{prefix_len} dev {device}" for addr in addresses]
+    _run_ip_batch(commands, f"ip addr {action} aliases on {device}")
 
     _emit({"action": action, "count": count})
 
@@ -719,23 +756,41 @@ def churn_retired_records(config):
     dst_mac = config.get("dst_mac")
     seq_base = int(config.get("seq_base", 4095 * 1024))
 
-    for offset in range(count):
-        seq = (seq_base + 4095 * offset) & 0xFFFFFFFF
-        target_addr = _ipv4_add_offset(target_base_addr, offset)
-        target_port = target_ports[offset % len(target_ports)]
-        packet = {
-            "bind_addr": src_addr,
-            "bind_port": src_port,
-            "target_addr": target_addr,
-            "target_port": target_port,
-            "seq": seq,
-        }
-        if device and dst_mac:
-            _send_l2_tcp_packet_no_emit({**packet, "flags": "syn", "device": device, "dst_mac": dst_mac})
-            _send_l2_tcp_packet_no_emit(
-                {**packet, "seq": (seq + 1) & 0xFFFFFFFF, "flags": "rst", "device": device, "dst_mac": dst_mac}
-            )
-        else:
+    if device and dst_mac:
+        dst_mac_bytes = bytes.fromhex(dst_mac.replace(":", ""))
+        src_mac = Path(f"/sys/class/net/{device}/address").read_text().strip()
+        src_mac_bytes = bytes.fromhex(src_mac.replace(":", ""))
+        eth_header = dst_mac_bytes + src_mac_bytes + struct.pack("!H", 0x0800)
+
+        with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800)) as raw_sock:
+            raw_sock.bind((device, 0))
+            for offset in range(count):
+                seq = (seq_base + 4095 * offset) & 0xFFFFFFFF
+                target_addr = _ipv4_add_offset(target_base_addr, offset)
+                target_port = target_ports[offset % len(target_ports)]
+                packet = {
+                    "bind_addr": src_addr,
+                    "bind_port": src_port,
+                    "target_addr": target_addr,
+                    "target_port": target_port,
+                    "seq": seq,
+                }
+                raw_sock.send(eth_header + _build_ipv4_tcp_packet({**packet, "flags": "syn"}))
+                raw_sock.send(
+                    eth_header + _build_ipv4_tcp_packet({**packet, "seq": (seq + 1) & 0xFFFFFFFF, "flags": "rst"})
+                )
+    else:
+        for offset in range(count):
+            seq = (seq_base + 4095 * offset) & 0xFFFFFFFF
+            target_addr = _ipv4_add_offset(target_base_addr, offset)
+            target_port = target_ports[offset % len(target_ports)]
+            packet = {
+                "bind_addr": src_addr,
+                "bind_port": src_port,
+                "target_addr": target_addr,
+                "target_port": target_port,
+                "seq": seq,
+            }
             _send_ipv4_tcp_packet({**packet, "flags": "syn"})
             _send_ipv4_tcp_packet({**packet, "seq": (seq + 1) & 0xFFFFFFFF, "flags": "rst"})
 
@@ -834,97 +889,11 @@ def _send_l2_tcp_packet_no_emit(config):
         src_mac = Path(f"/sys/class/net/{iface}/address").read_text().strip()
     src_mac = bytes.fromhex(src_mac.replace(":", ""))
 
-    src_addr = config["bind_addr"]
-    dst_addr = config["target_addr"]
-    src_port = config["bind_port"]
-    dst_port = config["target_port"]
-    seq = config.get("seq", 12345)
-    ack = config.get("ack", 0)
-    payload = config.get("payload", b"")
-    if isinstance(payload, str):
-        payload = payload.encode()
-
-    flags = _tcp_flags_expr(config["flags"])
-    window = socket.htons(config.get("window", 5840))
-    doff = 5
-
-    tcp_header = struct.pack(
-        "!HHLLBBHHH",
-        src_port,
-        dst_port,
-        seq,
-        ack,
-        doff << 4,
-        flags,
-        window,
-        0,
-        0,
-    )
-    pseudo_header = struct.pack(
-        "!4s4sBBH",
-        socket.inet_aton(src_addr),
-        socket.inet_aton(dst_addr),
-        0,
-        socket.IPPROTO_TCP,
-        len(tcp_header) + len(payload),
-    )
-    tcp_check = _checksum(pseudo_header + tcp_header + payload)
-    if config.get("corrupt_tcp_checksum"):
-        tcp_check ^= 0xFFFF
-        if tcp_check == 0:
-            tcp_check = 1
-    tcp_header = struct.pack(
-        "!HHLLBBHHH",
-        src_port,
-        dst_port,
-        seq,
-        ack,
-        doff << 4,
-        flags,
-        window,
-        tcp_check,
-        0,
-    )
-
-    total_len = 20 + len(tcp_header) + len(payload)
-    ip_frag_off = config.get("ip_frag_off", 0)
-    ip_header = struct.pack(
-        "!BBHHHBBH4s4s",
-        (4 << 4) | 5,
-        0,
-        total_len,
-        config.get("ip_id", 0),
-        ip_frag_off,
-        64,
-        socket.IPPROTO_TCP,
-        0,
-        socket.inet_aton(src_addr),
-        socket.inet_aton(dst_addr),
-    )
-    ip_check = _checksum(ip_header)
-    if config.get("corrupt_ip_checksum"):
-        ip_check ^= 0xFFFF
-        if ip_check == 0:
-            ip_check = 1
-    ip_header = struct.pack(
-        "!BBHHHBBH4s4s",
-        (4 << 4) | 5,
-        0,
-        total_len,
-        config.get("ip_id", 0),
-        ip_frag_off,
-        64,
-        socket.IPPROTO_TCP,
-        ip_check,
-        socket.inet_aton(src_addr),
-        socket.inet_aton(dst_addr),
-    )
-
     eth_header = dst_mac + src_mac + struct.pack("!H", 0x0800)
 
     with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800)) as raw_sock:
         raw_sock.bind((iface, 0))
-        raw_sock.send(eth_header + ip_header + tcp_header + payload)
+        raw_sock.send(eth_header + _build_ipv4_tcp_packet(config))
 
 
 def send_l2_tcp_packet(config):
