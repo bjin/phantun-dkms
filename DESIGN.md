@@ -172,6 +172,7 @@ Reason:
 - allowing both raw UDP delivery and translated fake-TCP delivery would create ambiguous mixed delivery
 - forwarded UDP is not translator-owned traffic and must continue through the normal routing path
 - reinjected translated UDP enters after `PRE_ROUTING`, so translated traffic is not black-holed by this drop rule
+
 ## 5. Flow identity and conflict handling
 
 ### 5.1 Local-oriented endpoint identity
@@ -185,6 +186,7 @@ A flow is keyed by the packet-boundary local/remote endpoint pair, including add
 
 - IPv4 secondary addresses and IPv6 global temporary/deprecated addresses remain distinct endpoint identities; translated fake-TCP packet headers and route lookups use the exact stored local address rather than substituting another local address
 - IPv6 link-local addresses are rejected for both local and remote endpoint positions because current scope handling is not a complete scoped-link-local contract
+
 The flow still stores oriented local/remote addresses and role.
 The canonical key exists only for lookup and collision prevention.
 
@@ -471,7 +473,7 @@ Behavior:
 - allow unmatched or merely forwarded inbound UDP normally
 - do not apply this drop to module-reinjected translated UDP
 
-- raw-UDP drop and fake-TCP interception both use priority `-399`; Linux inserts equal-priority hooks before existing entries, so the ops arrays register `phantun_pre_routing` before `phantun_pre_routing_udp_drop` and selector-matched raw UDP executes first
+raw-UDP drop and fake-TCP interception both use priority `-399`. Linux inserts equal-priority hooks before existing entries, so the ops arrays register `phantun_pre_routing` before `phantun_pre_routing_udp_drop` and selector-matched raw UDP executes first.
 
 ### 8.4 Decapsulated UDP reinjection
 
