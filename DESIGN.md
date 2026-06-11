@@ -445,7 +445,7 @@ Behavior:
 | Item | Value |
 |---|---|
 | Hook | `NF_INET_PRE_ROUTING` |
-| Target priority | before conntrack and before real TCP processing |
+| Target priority | before conntrack and before real TCP processing (`PHANTUN_PRE_ROUTING_PRIORITY`, `-399`) |
 | Match | IPv4 or IPv6 TCP, selector-matched existing flow or eligible new responder `SYN`, locally delivered in the current host/netns, non-loopback ingress |
 
 Behavior:
@@ -461,7 +461,7 @@ Behavior:
 | Item | Value |
 |---|---|
 | Hook | `NF_INET_PRE_ROUTING` |
-| Target priority | before conntrack and before local UDP processing (`-400` in current design target) |
+| Target priority | raw-UDP drop runs at `PHANTUN_PRE_ROUTING_PRIORITY` (`-399`), before conntrack and local UDP processing, after IPv4/IPv6 defrag at `-400` |
 | Match | IPv4 or IPv6 UDP, selector-matched tuple, locally delivered in the current host/netns, non-loopback ingress |
 
 Behavior:
@@ -469,6 +469,8 @@ Behavior:
 - drop selector-matched raw inbound UDP by default
 - allow unmatched or merely forwarded inbound UDP normally
 - do not apply this drop to module-reinjected translated UDP
+
+- raw-UDP drop and fake-TCP interception both use priority `-399`; Linux inserts equal-priority hooks before existing entries, so the ops arrays register `phantun_pre_routing` before `phantun_pre_routing_udp_drop` and selector-matched raw UDP executes first
 
 ### 8.4 Decapsulated UDP reinjection
 

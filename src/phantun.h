@@ -21,6 +21,10 @@
 #define PHANTUN_DEFAULT_HALF_OPEN_LIMIT 4096U
 #define PHANTUN_DEFAULT_REPLACEMENT_QUARANTINE_MS 3000U
 #define PHANTUN_DEFAULT_REPLACEMENT_PROTECT_MS 0U
+/* PRE_ROUTING uses -399 so IPv4/IPv6 defrag at -400 runs first. The
+ * raw-UDP drop and fake-TCP hooks intentionally share this priority and
+ * depend on registration order in src/phantun_main.c.
+ */
 #define PHANTUN_PRE_ROUTING_PRIORITY (-399)
 #define PHANTUN_LOCAL_OUT_PRIORITY (-199)
 #define PHT_FAMILY_IPV4 BIT(0)

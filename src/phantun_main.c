@@ -2628,6 +2628,9 @@ static int phantun_net_enable_defrag(struct net *net, struct phantun_net *pnet) 
     return 0;
 }
 
+/* Linux inserts equal-priority hooks before existing entries. Register the
+ * fake-TCP hook first so phantun_pre_routing_udp_drop executes before it.
+ */
 static struct nf_hook_ops phantun_nf_ops_v4[] = {
     {
         .hook = phantun_local_out,
@@ -2639,13 +2642,13 @@ static struct nf_hook_ops phantun_nf_ops_v4[] = {
         .priority = PHANTUN_LOCAL_OUT_PRIORITY,
     },
     {
-        .hook = phantun_pre_routing_udp_drop,
+        .hook = phantun_pre_routing,
         .pf = NFPROTO_IPV4,
         .hooknum = NF_INET_PRE_ROUTING,
         .priority = PHANTUN_PRE_ROUTING_PRIORITY,
     },
     {
-        .hook = phantun_pre_routing,
+        .hook = phantun_pre_routing_udp_drop,
         .pf = NFPROTO_IPV4,
         .hooknum = NF_INET_PRE_ROUTING,
         .priority = PHANTUN_PRE_ROUTING_PRIORITY,
@@ -2661,13 +2664,13 @@ static struct nf_hook_ops phantun_nf_ops_v6[] = {
         .priority = PHANTUN_LOCAL_OUT_PRIORITY,
     },
     {
-        .hook = phantun_pre_routing_udp_drop,
+        .hook = phantun_pre_routing,
         .pf = NFPROTO_IPV6,
         .hooknum = NF_INET_PRE_ROUTING,
         .priority = PHANTUN_PRE_ROUTING_PRIORITY,
     },
     {
-        .hook = phantun_pre_routing,
+        .hook = phantun_pre_routing_udp_drop,
         .pf = NFPROTO_IPV6,
         .hooknum = NF_INET_PRE_ROUTING,
         .priority = PHANTUN_PRE_ROUTING_PRIORITY,
