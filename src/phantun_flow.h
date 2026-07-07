@@ -111,7 +111,6 @@ struct pht_flow {
     enum pht_flow_state state;
     u32 seq;
     u32 ack;
-    u32 last_ack;
     u32 local_isn;
     /* Next remote sequence immediately after the peer's opening SYN. */
     u32 peer_syn_next;
@@ -182,8 +181,6 @@ struct pht_flow {
     bool quarantine_prev_active;
     bool replacement_protect_active;
     bool half_open_tracked;
-    /* Latched GC reason for hard-idle teardown. */
-    bool hard_expired;
     /* Latched post-detach action: established liveness teardown should send
      * best-effort RST. Half-open liveness teardown keeps the existing no-RST
      * reinitiation path.
@@ -268,7 +265,6 @@ int pht_flow_emit_established_payload(struct pht_flow *flow, struct net *net,
                                       const struct sk_buff *src, unsigned int payload_offset,
                                       size_t payload_len, const struct pht_tx_meta *meta,
                                       int *out_ifindex);
-void pht_flow_touch(struct pht_flow *flow);
 void pht_flow_touch_inbound(struct pht_flow *flow);
 void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex);
 bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
@@ -276,10 +272,6 @@ bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb,
                              const struct pht_tx_meta *meta);
 struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow, struct pht_tx_meta *meta);
-/* False means the flow was absent or already DEAD; callers must treat that as
- * a stale generation and drop without resurrecting or tearing it down again.
- */
-bool pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state);
 enum pht_flow_complete_result
 pht_flow_complete_handshake(struct pht_flow *flow,
                             const struct pht_flow_handshake_complete_args *args,

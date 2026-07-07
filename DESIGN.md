@@ -253,7 +253,6 @@ Each flow stores:
 - oriented local/remote addresses
 - send sequence number
 - receive acknowledgement number
-- last acknowledged value
 - one queued UDP skb pointer
 - reserved first-payload ignore slot
 - responder control-response pending-ACK / pending-release flag

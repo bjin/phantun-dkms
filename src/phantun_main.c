@@ -1288,7 +1288,6 @@ static int phantun_send_handshake_request(struct pht_flow *flow, struct net *net
                             req_len, &meta, &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
-        flow->last_ack = ack;
         flow->last_activity_jiffies = jiffies;
         flow->egress_ifindex = ifindex;
         spin_unlock_bh(&flow->lock);
@@ -1319,7 +1318,6 @@ static int phantun_send_handshake_response(struct pht_flow *flow, struct net *ne
                             resp_len, &meta, &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
-        flow->last_ack = ack;
         flow->last_activity_jiffies = jiffies;
         flow->egress_ifindex = ifindex;
         spin_unlock_bh(&flow->lock);
@@ -1347,7 +1345,6 @@ static int phantun_send_idle_ack(struct pht_flow *flow, struct net *net,
     ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_ACK, NULL, 0, &meta, &ifindex);
     if (!ret) {
         spin_lock_bh(&flow->lock);
-        flow->last_ack = ack;
         flow->last_activity_jiffies = jiffies;
         flow->egress_ifindex = ifindex;
         spin_unlock_bh(&flow->lock);
@@ -1454,7 +1451,6 @@ static void phantun_refresh_inbound_progress(struct pht_flow *flow, const struct
     if (phantun_seq_after_eq(seq_end, flow->ack))
         flow->ack = seq_end;
     phantun_flow_refresh_remote_seq_window_locked(flow);
-    flow->last_ack = flow->ack;
     flow->last_activity_jiffies = jiffies;
     flow->last_inbound_jiffies = jiffies;
     flow->keepalives_sent = 0;
@@ -1798,7 +1794,6 @@ create_initiator:
     spin_lock_bh(&new_flow->lock);
     new_flow->seq = init_seq;
     new_flow->ack = 0;
-    new_flow->last_ack = 0;
     new_flow->local_isn = init_seq;
     new_flow->peer_syn_next = 0;
     new_flow->local_seq_window_start = new_flow->local_isn;
@@ -2105,7 +2100,6 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         spin_lock_bh(&new_flow->lock);
         new_flow->seq = responder_seq;
         new_flow->ack = ntohl(view.tcp->seq) + 1;
-        new_flow->last_ack = new_flow->ack;
         new_flow->local_isn = responder_seq;
         new_flow->peer_syn_next = new_flow->ack;
         new_flow->local_seq_window_start = new_flow->local_isn;
@@ -2216,7 +2210,6 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             spin_lock_bh(&new_flow->lock);
             new_flow->seq = responder_seq;
             new_flow->ack = ntohl(view.tcp->seq) + 1;
-            new_flow->last_ack = new_flow->ack;
             new_flow->local_isn = responder_seq;
             new_flow->peer_syn_next = new_flow->ack;
             new_flow->local_seq_window_start = new_flow->local_isn;

@@ -536,7 +536,6 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
                                                                table->keepalive_misses));
                 if (hard_expired) {
                     expired_flow = true;
-                    flow->hard_expired = true;
                 } else if (liveness_failed) {
                     expired_flow = true;
                     flow->liveness_failed = flow->state == PHT_FLOW_STATE_ESTABLISHED;
@@ -1214,15 +1213,6 @@ void pht_flow_touch_inbound(struct pht_flow *flow) {
     spin_unlock_bh(&flow->lock);
 }
 
-void pht_flow_touch(struct pht_flow *flow) {
-    if (!flow)
-        return;
-
-    spin_lock_bh(&flow->lock);
-    flow->last_activity_jiffies = jiffies;
-    spin_unlock_bh(&flow->lock);
-}
-
 void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex) {
     if (!flow)
         return;
@@ -1308,48 +1298,6 @@ struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow, struct pht_tx_me
     return skb;
 }
 
-bool pht_flow_update_state(struct pht_flow *flow, enum pht_flow_state state) {
-    bool half_open;
-    enum pht_flow_state old_state;
-    unsigned long now;
-
-    if (!flow)
-        return false;
-
-    spin_lock_bh(&flow->lock);
-    old_state = flow->state;
-    if (old_state == PHT_FLOW_STATE_DEAD) {
-        spin_unlock_bh(&flow->lock);
-        return false;
-    }
-
-    now = jiffies;
-    if (state == PHT_FLOW_STATE_ESTABLISHED && old_state == PHT_FLOW_STATE_SYN_SENT &&
-        flow->role == PHT_FLOW_ROLE_INITIATOR && flow->table &&
-        flow->table->replacement_protect_jiffies) {
-        flow->replacement_protect_until_jiffies = now + flow->table->replacement_protect_jiffies;
-        flow->replacement_protect_active = true;
-    } else if (state != PHT_FLOW_STATE_ESTABLISHED || flow->role != PHT_FLOW_ROLE_INITIATOR) {
-        flow->replacement_protect_active = false;
-    }
-    flow->state = state;
-    flow->last_activity_jiffies = now;
-    flow->retries_done = 0;
-    half_open = pht_flow_state_is_half_open(state);
-    spin_unlock_bh(&flow->lock);
-
-    if (state == PHT_FLOW_STATE_ESTABLISHED && old_state != PHT_FLOW_STATE_ESTABLISHED)
-        pht_stats_inc(PHT_STAT_FLOWS_ESTABLISHED);
-    if (pht_flow_state_is_half_open(old_state) && !half_open)
-        pht_flow_untrack_half_open(flow);
-    if (half_open)
-        pht_flow_arm_retransmit(flow);
-    else
-        pht_flow_cancel_retransmit(flow);
-
-    return true;
-}
-
 enum pht_flow_complete_result
 pht_flow_complete_handshake(struct pht_flow *flow,
                             const struct pht_flow_handshake_complete_args *args,
@@ -1374,7 +1322,6 @@ pht_flow_complete_handshake(struct pht_flow *flow,
 
     flow->seq = args->local_seq_start + args->local_control_len;
     flow->ack = args->ack;
-    flow->last_ack = args->ack;
     flow->peer_syn_next = args->peer_syn_next;
     flow->local_seq_window_start = flow->local_isn;
     flow->remote_seq_window_start = args->peer_syn_next;
