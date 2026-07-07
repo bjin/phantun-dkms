@@ -1,10 +1,64 @@
 #!/usr/bin/env python3
+import os
 import sys
 import shutil
 import subprocess
 import urllib.request
 import re
 from pathlib import Path
+
+
+def _iter_elf_host_tools(kernels_dir):
+    for headers_dir in (kernels_dir / "usr" / "src").glob("linux-headers-*"):
+        for sub in ("scripts", "tools", "arch"):
+            root = headers_dir / sub
+            if not root.is_dir():
+                continue
+            for path in root.rglob("*"):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                if not path.stat().st_mode & 0o111:
+                    continue
+                with open(path, "rb") as fh:
+                    if fh.read(4) != b"\x7fELF":
+                        continue
+                yield path
+
+
+def fixup_host_tools(kernels_dir):
+    """Make the prebuilt kbuild host tools runnable on non-FHS hosts.
+
+    Ubuntu's linux-headers packages ship dynamically linked binaries
+    (fixdep, modpost, objtool, ...) that expect the FHS ELF interpreter
+    /lib64/ld-linux-*.so. On hosts without a real loader there (e.g.
+    NixOS, where that path is a stub), rewrite the interpreter and rpath.
+    Gated on environment variables exported by the Nix devshell; a no-op
+    everywhere else, so FHS hosts and CI are unaffected.
+    """
+    interp = os.environ.get("PHANTUN_PATCHELF_INTERP")
+    rpath = os.environ.get("PHANTUN_PATCHELF_RPATH")
+    if not interp or not rpath:
+        return
+    if shutil.which("patchelf") is None:
+        print("Warning: patchelf not found; prebuilt kernel host tools were not fixed up")
+        return
+
+    patched = 0
+    for path in _iter_elf_host_tools(kernels_dir):
+        cur = subprocess.run(["patchelf", "--print-interpreter", str(path)], capture_output=True, text=True)
+        if cur.returncode != 0:
+            # Statically linked or no PT_INTERP; nothing to fix.
+            continue
+        if cur.stdout.strip() == interp:
+            continue
+        subprocess.run(
+            ["patchelf", "--set-interpreter", interp, "--set-rpath", rpath, str(path)],
+            check=True,
+            capture_output=True,
+        )
+        patched += 1
+    if patched:
+        print(f"Patched {patched} prebuilt host tool(s) for this non-FHS host in {kernels_dir}")
 
 
 def check_kernel_files(kernels_dir):
@@ -28,7 +82,10 @@ def verify_kernel_dir(kernels_dir):
     extracted_flag = kernels_dir / ".extracted"
     if not extracted_flag.exists():
         return False
-    return check_kernel_files(kernels_dir)
+    if not check_kernel_files(kernels_dir):
+        return False
+    fixup_host_tools(kernels_dir)
+    return True
 
 
 def cleanup_kernel_dir(kernels_dir):
@@ -104,6 +161,7 @@ def prepare_ubuntu_kernel(version):
         sys.exit(1)
 
     if check_kernel_files(kernels_dir):
+        fixup_host_tools(kernels_dir)
         kernels_dir.joinpath(".extracted").touch()
         print(f"Successfully prepared and verified kernel {version}")
     else:

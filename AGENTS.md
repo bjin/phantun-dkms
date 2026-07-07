@@ -7,9 +7,10 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 - `src/phantun_packet.[ch]`: IPv4/IPv6/TCP/UDP parsing, packet build, checksum, tx/reinject helpers
 - `src/phantun_flow.[ch]`: flow table, timers, retries, queued skb handling
 - `Kbuild`, `Makefile`, `dkms.conf`: external module build / DKMS
-- `flake.nix`, `flake.lock`: Nix flake outputs for building the module and exporting the NixOS module; keep in sync with Nix packaging/module changes
+- `flake.nix`, `flake.lock`: Nix flake outputs for building the module, exporting the NixOS module, and the dev shell that runs the test suite on NixOS; keep in sync with Nix packaging/module changes
 - `nix/package.nix`: Nix derivation for building `phantun.ko` against a passed `kernel`
 - `nix/nixos-module.nix`: NixOS module for typed `services.phantun` options, modprobe parameter rendering, and boot-time loading
+- `nix/virtme-ng.nix`, `nix/dkms.nix`, `nix/virtme-ng-nixos-guest-root.patch`: flake-local packaging of the test-only tools (virtme-ng with NixOS guest fixes, dkms)
 - `prepare-kernels.py`: CLI to download/verify Ubuntu mainline kernels for matrix testing
 - `DESIGN.md`: protocol/design notes
 - `TESTING.md`: detailed integration testing instructions
@@ -24,6 +25,7 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 ## Testing
 - Integration tests use `pytest` + `virtme-ng` (COW snapshots).
 - Read `TESTING.md` before adding or changing tests.
+- On NixOS, run through the dev shell: `nix develop -c pytest ...` (also for `prepare-kernels.py`)
 - Prepare kernels: `python prepare-kernels.py <ver>`
 - Run: `pytest [-v] [--kernel host|<ver>]`
 

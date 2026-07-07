@@ -233,7 +233,16 @@ def require_guest_command(vm, command):
 
 
 def kernel_has_base64_support(vm):
-    return vm.run("test -f /usr/lib/modules/$(uname -r)/build/include/linux/base64.h", check=False).returncode == 0
+    # Headers may live directly in build/ (distro header packages) or in a
+    # split build/source/ tree (NixOS kernel dev outputs).
+    return (
+        vm.run(
+            "test -f /lib/modules/$(uname -r)/build/include/linux/base64.h"
+            " -o -f /lib/modules/$(uname -r)/build/source/include/linux/base64.h",
+            check=False,
+        ).returncode
+        == 0
+    )
 
 
 def read_module_stat(vm, name):
@@ -263,7 +272,8 @@ stats = {
     for name in %r
 }
 print(json.dumps(stats))
-""" % (MODULE_STAT_NAMES,),
+"""
+        % (MODULE_STAT_NAMES,),
     )
     return parse_guest_json(res.stdout, "module stats stdout")
 

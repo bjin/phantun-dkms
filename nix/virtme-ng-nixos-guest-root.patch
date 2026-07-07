@@ -1,0 +1,68 @@
+--- a/virtme/mkinitramfs.py
++++ b/virtme/mkinitramfs.py
+@@ -8,6 +8,8 @@
+ import io
+ import os
+ import shlex
++import lzma
++import shutil
+ import tempfile
+ 
+ from . import cpiowriter, util
+@@ -95,6 +97,12 @@
+                 uncompressed_mod = tmpdirname + "/" + os.path.splitext(mod_file)[0]
+                 os.system(f"zstd -d < {mod} > {uncompressed_mod}")
+                 mod = uncompressed_mod
++            elif mod.endswith(".xz"):
++                mod_file = os.path.basename(mod)
++                uncompressed_mod = tmpdirname + "/" + os.path.splitext(mod_file)[0]
++                with lzma.open(mod) as src, open(uncompressed_mod, "wb") as dst:
++                    shutil.copyfileobj(src, dst)
++                mod = uncompressed_mod
+             with open(mod, "rb") as f:
+                 modpath = "modules/" + os.path.basename(mod)
+                 paths.append(modpath)
+@@ -123,14 +131,32 @@
+   fi
+ fi
+ 
++NEWROOT=/newroot
++
++# A NixOS host exports a read-only root without /lib, which later breaks
++# kernel module setup (/lib/modules) and similar FHS expectations. Wrap
++# the root in a tmpfs-backed writable overlay so the guest can create
++# whatever directories it needs; all writes stay in guest RAM.
++if ! [ -d /newroot/lib ]; then
++  log 'root lacks /lib -- wrapping it in a writable overlay'
++  mkdir -p /overlay /overlayroot
++  if /bin/mount -n -t tmpfs -o mode=0755 tmpfs /overlay &&
++     mkdir -p /overlay/upper /overlay/work &&
++     /bin/mount -n -t overlay -o lowerdir=/newroot,upperdir=/overlay/upper,workdir=/overlay/work overlay /overlayroot; then
++    NEWROOT=/overlayroot
++  else
++    log 'overlay wrap failed -- continuing with read-only root'
++  fi
++fi
++
+ # Can we actually use /newroot/ as root?
+-if ! mount -t proc -o nosuid,noexec,nodev proc /newroot/proc 2>/dev/null; then
++if ! mount -t proc -o nosuid,noexec,nodev proc "$NEWROOT"/proc 2>/dev/null; then
+   # QEMU 1.5 and below have a bug in virtfs that prevents mounting
+   # anything on top of a virtfs mount.
+   log "your host's virtfs is broken -- using a fallback tmpfs"
+   need_fallback_tmpfs=1
+ else
+-  umount /newroot/proc  # Don't leave garbage behind
++  umount "$NEWROOT"/proc  # Don't leave garbage behind
+ fi
+ 
+ # Find init
+@@ -149,7 +175,7 @@
+ fi
+ 
+ log 'done; switching to real root'
+-exec /bin/switch_root /newroot "$init" "$@"
++exec /bin/switch_root "$NEWROOT" "$init" "$@"
+ """
+ 
+ 

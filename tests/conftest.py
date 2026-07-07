@@ -1,13 +1,26 @@
 import hashlib
 import pytest
 import subprocess
+import tempfile
 import time
 import os
 import signal
 import shlex
 import shutil
+import json
 from pathlib import Path
 from datetime import datetime
+
+# Guest commands run through a fresh SSH session whose PATH knows nothing
+# about the environment pytest was started from. Re-export the host PATH
+# (store paths stay valid inside the guest because the VM sees the host
+# filesystem) so tools like dkms, nft or wg resolve to the same binaries on
+# every distro, and keep the standard FHS directories behind it so guest-side
+# distro binaries (e.g. the gcc-N compat symlinks in /usr/bin) stay
+# reachable. MODULE_DIR pins kmod to the guest's /lib/modules tree even when
+# the host's kmod was configured for another location (NixOS).
+GUEST_PATH = os.environ.get("PATH", "") + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+GUEST_ENV_PREFIX = f"export PATH={shlex.quote(GUEST_PATH)} MODULE_DIR=/lib/modules; "
 
 
 def pytest_addoption(parser):
@@ -62,7 +75,7 @@ class VM:
         else:
             cmd_str = cmd
 
-        ssh_cmd = self.base_ssh_cmd + [f"bash -c {shlex.quote(cmd_str)}"]
+        ssh_cmd = self.base_ssh_cmd + [f"bash -c {shlex.quote(GUEST_ENV_PREFIX + cmd_str)}"]
         res = subprocess.run(ssh_cmd, capture_output=True, text=True, **kwargs)
         if check and res.returncode != 0:
             print(f"SSH command failed: {ssh_cmd}")
@@ -70,6 +83,129 @@ class VM:
             print(f"stderr: {res.stderr}")
             res.check_returncode()
         return res
+
+    def _locate_nixos_kernel_build(self, kver):
+        """Find (or fetch) the running kernel's build tree on a NixOS host.
+
+        Never compiles a kernel: the dev output is either already on disk or
+        substituted from a binary cache.
+        """
+        override = os.environ.get("PHANTUN_HOST_KDIR")
+        if override:
+            return Path(override)
+
+        cand = Path(f"/run/current-system/kernel-modules/lib/modules/{kver}/build")
+        if cand.exists():
+            return cand.resolve()
+
+        # Ask nix for the kernel derivation's dev output and substitute it.
+        kernel_pkg = Path("/run/current-system/kernel").resolve().parent
+        try:
+            info = json.loads(
+                subprocess.run(
+                    ["nix", "path-info", "--json", str(kernel_pkg)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+            )
+            deriver = next(iter(info.values()))["deriver"]
+            drv = json.loads(
+                subprocess.run(
+                    ["nix", "derivation", "show", deriver],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+            )
+            drv_attrs = next(iter(drv.get("derivations", drv).values()))
+            dev_path = drv_attrs["env"]["dev"]
+            gcroot = Path(__file__).parent.parent / ".build" / "host-kernel-dev"
+            gcroot.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["nix-store", "--realise", dev_path, "--add-root", str(gcroot)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except (subprocess.CalledProcessError, KeyError, StopIteration, json.JSONDecodeError) as exc:
+            detail = getattr(exc, "stderr", "") or str(exc)
+            pytest.exit(
+                "Unable to obtain the host kernel's build tree for DKMS "
+                f"(kernel {kver}): {detail.strip()}\n"
+                "Set PHANTUN_HOST_KDIR=/path/to/kernel/build to override."
+            )
+
+        build = Path(dev_path) / "lib" / "modules" / kver / "build"
+        if not build.exists():
+            pytest.exit(f"Kernel dev output {dev_path} lacks lib/modules/{kver}/build")
+        return build
+
+    def _prepare_nixos_host_kernel(self):
+        """Assemble a shadow root so virtme-ng can boot the NixOS host kernel.
+
+        virtme-ng derives the module directory from the kernel image path
+        (<root>/boot/vmlinuz-V -> <root>/lib/modules/V), so lay the running
+        kernel out that way with symlinks. The guest sees this tree through
+        virtme_link_mods; writes (dkms install, depmod) land in the guest's
+        /tmp overlay because the shadow root lives under TMPDIR.
+        """
+        kver = self.kernel_ver
+        kernel_img = Path("/run/current-system/kernel")
+        mod_src = Path("/run/current-system/kernel-modules/lib/modules") / kver
+        if not kernel_img.exists() or not mod_src.is_dir():
+            pytest.exit(
+                f"Host kernel {kver} not found under /lib/modules or "
+                "/run/current-system; cannot run --kernel host here."
+            )
+
+        build = self._locate_nixos_kernel_build(kver)
+
+        self.temp_dir = tempfile.mkdtemp(prefix="phantun-host-kernel-")
+        shadow = Path(self.temp_dir)
+        boot_dir = shadow / "boot"
+        boot_dir.mkdir(parents=True)
+        vmlinuz = boot_dir / f"vmlinuz-{kver}"
+        vmlinuz.symlink_to(kernel_img.resolve())
+
+        moddir = shadow / "lib" / "modules" / kver
+        moddir.mkdir(parents=True)
+        for entry in mod_src.iterdir():
+            if entry.name == "build":
+                continue
+            (moddir / entry.name).symlink_to(entry)
+        (moddir / "build").symlink_to(build)
+
+        return str(vmlinuz)
+
+    def _prepare_guest_environment(self):
+        """One-time guest setup shared by all kernel flavors."""
+        # DKMS refuses to run without its tree; distro packages normally
+        # pre-create it.
+        self.run("mkdir -p /var/lib/dkms /usr/src", check=False)
+
+        # Kernel-initiated module autoloading (nft, tc netem, ...) execs
+        # kernel.modprobe, whose default /sbin/modprobe may not exist in the
+        # guest (NixOS). Install a shim that resolves modules from
+        # /lib/modules regardless of how the host's kmod was configured.
+        modprobe = shutil.which("modprobe")
+        if modprobe:
+            self.run(
+                'test -x "$(cat /proc/sys/kernel/modprobe)" || { '
+                "printf '#!/bin/sh\\nexport MODULE_DIR=/lib/modules\\nexec %s \"$@\"\\n' "
+                f"{shlex.quote(modprobe)} > /run/phantun-modprobe && "
+                "chmod +x /run/phantun-modprobe && "
+                "echo /run/phantun-modprobe > /proc/sys/kernel/modprobe; }",
+                check=False,
+            )
+
+        # The COW /etc exposes the host's modprobe.d; drop any phantun
+        # options so module parameters only come from the tests.
+        self.run(
+            "grep -lsE '^[[:space:]]*(options|install|blacklist)[[:space:]]+phantun([[:space:]]|$)' "
+            "/etc/modprobe.d/* 2>/dev/null | xargs -r rm -f",
+            check=False,
+        )
 
     def start(self):
         cmd = [
@@ -85,8 +221,14 @@ class VM:
 
         if self.kernel_set_str == "host":
             self.kernel_ver = subprocess.run(["uname", "-r"], capture_output=True, text=True, check=True).stdout.strip()
-            # Default to host kernel by using -r without argument
-            cmd.extend(["-r"])
+            if os.path.exists(f"/lib/modules/{self.kernel_ver}"):
+                # FHS host: default to the host kernel by using -r without argument
+                cmd.extend(["-r"])
+            else:
+                # NixOS-style host: no /lib/modules. Build a shadow root that
+                # lays the kernel image and module tree out the way virtme-ng
+                # expects, including a build/ tree for DKMS.
+                cmd.extend(["-r", self._prepare_nixos_host_kernel()])
         else:
             # Assume it is a pre-extracted ubuntu kernel
             self.kernel_ver = self.kernel_set_str
@@ -107,10 +249,10 @@ class VM:
             # Override kernel_ver with the actual full version string from vmlinuz
             self.kernel_ver = vmlinuz.name.replace("vmlinuz-", "")
             cmd.extend(["-r", str(vmlinuz)])
-
-            # Map host kernel modules directory to guest with a COW overlay so DKMS can install into updates/ without modifying host cache
-            host_mod_dir = str(self.ubuntu_kernel_dir / "lib" / "modules" / self.kernel_ver)
-            cmd.append(f"--overlay-rwdir=/lib/modules/{self.kernel_ver}={host_mod_dir}")
+            # Module visibility needs no extra plumbing: virtme-ng finds
+            # lib/modules/ next to the kernel image and symlinks it into the
+            # guest, and DKMS writes land in the guest-side overlay of the
+            # project directory.
 
         vng_log_path = self.session_log_dir / "vng.log"
         self.vng_log = open(vng_log_path, "w")
@@ -192,6 +334,13 @@ class VM:
                 if self.run(f"test -x /usr/bin/gcc-{v}", check=False).returncode == 0:
                     gcc_target = f"/usr/bin/gcc-{v}"
                     break
+            else:
+                # No distro compiler in the guest (NixOS host): use the
+                # environment's gcc for the compatibility symlinks below.
+                if self.run("test -x /usr/bin/gcc", check=False).returncode != 0:
+                    res = self.run("command -v gcc", check=False)
+                    if res.returncode == 0 and res.stdout.strip():
+                        gcc_target = res.stdout.strip()
 
             # Symlink compilers that Ubuntu kernel Makefile might explicitly ask for
             for ver in [12, 13, 14, 15, 16]:
@@ -200,6 +349,8 @@ class VM:
                     f"test -e /usr/bin/x86_64-linux-gnu-gcc-{ver} || ln -sf {gcc_target} /usr/bin/x86_64-linux-gnu-gcc-{ver}",
                     check=False,
                 )
+
+        self._prepare_guest_environment()
 
         # Start dmesg collector
         self.dmesg_file_path = self.session_log_dir / "dmesg.log"

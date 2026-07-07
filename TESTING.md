@@ -11,6 +11,46 @@ The integration tests use `pytest` and `virtme-ng` (vng). `virtme-ng` boots a QE
 > **Important:** `virtme-ng` uses a **COW (Copy-on-Write)** filesystem. This means the guest VM sees a "snapshot" of the host filesystem at the moment it is created. Any subsequent modifications to host files (e.g. editing source code) will **not** be visible to the guest until the VM is restarted. 
 >
 > The test framework handles this by preparing a source tarball (`.dkms_copy.tar`) **before** spawning the VM, ensuring the latest git-tracked changes are captured.
+
+## Running on NixOS
+
+The repository flake ships a dev shell with everything the suite needs on a
+NixOS host: a patched `virtme-ng`, `dkms`, QEMU/KVM, pytest, `dpkg-deb`,
+`patchelf`, and the guest-side tools (`nft`, `tc`, `wg`, `wireguard-go`, ...).
+Run everything through it:
+
+```bash
+nix develop -c pytest                        # host kernel
+nix develop -c python3 prepare-kernels.py v6.19.1
+nix develop -c pytest --kernel v6.19.1       # prepared Ubuntu kernel
+```
+
+How the NixOS-specific pieces fit together:
+
+- **Guest tool discovery.** `tests/conftest.py` re-exports the host `PATH`
+  (plus the standard FHS directories) and `MODULE_DIR=/lib/modules` into
+  every guest command, so the guest uses the same Nix store binaries as the
+  host shell.
+- **Host kernel.** NixOS has no `/lib/modules/$(uname -r)`; conftest builds a
+  shadow root (`boot/vmlinuz-*` plus a `lib/modules/<ver>` of symlinks) from
+  `/run/current-system` and boots that. The kernel's `build/` tree for DKMS
+  is substituted from the binary cache via the kernel derivation's `dev`
+  output (download only, never compiled; a GC root is kept under
+  `.build/host-kernel-dev`). For a custom host kernel without a cached dev
+  output, point `PHANTUN_HOST_KDIR` at its build tree.
+- **Prepared Ubuntu kernels.** The prebuilt kbuild host tools inside
+  `linux-headers-*.deb` (`fixdep`, `modpost`, `objtool`, ...) expect an FHS
+  ELF loader. When the dev shell exports `PHANTUN_PATCHELF_INTERP`/`_RPATH`,
+  `prepare-kernels.py` rewrites them with `patchelf` during prepare/verify;
+  on FHS hosts (e.g. CI) this pass is skipped entirely.
+- **virtme-ng packaging.** `nix/virtme-ng.nix` pins virtme-ng past v1.41 and
+  patches the guest side: a writable overlay is layered over `/`-less-`/lib`
+  roots from the initramfs, xz-compressed modules load in the initramfs,
+  udevd is found under `/run/current-system`, the vsock transport and
+  overlayfs modules are loaded explicitly, and sshd works on hosts that
+  never enabled OpenSSH (privilege separation user, PAM-less config,
+  non-locked generated shadow entries).
+
 ## Preparing Kernels
 
 Before testing against a specific Ubuntu kernel version, you must prepare it on the host:
@@ -57,7 +97,7 @@ To see real-time output (including module load logs and VM setup):
 ```bash
 pytest -s
 ```
-Logs are automatically saved to `~/.cache/logs/phantun_tests/YYYYMMDD_HHMMSS/`.
+Logs are automatically saved to `$TMPDIR/phantun-test-logs/YYYYMMDD_HHMMSS/` (`/tmp` by default): `vng.log` with the boot console and `dmesg.log` with the guest kernel log.
 
 ## Framework Structure
 
