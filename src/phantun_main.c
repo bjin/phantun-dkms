@@ -1942,12 +1942,15 @@ static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb
     if (!phantun_family_enabled(view.family))
         return NF_ACCEPT;
 
-    phantun_view_local_addr(&view, true, &local_addr);
-    if (!phantun_pre_routing_targets_local_host(state->net, &local_addr))
+    phantun_view_remote_addr(&view, true, &remote_addr);
+    /* Selector matching is cheap cached config; test it before local-delivery
+     * checks that may require a FIB lookup.
+     */
+    if (!phantun_selectors_allow(view.udp->dest, &remote_addr, view.udp->source))
         return NF_ACCEPT;
 
-    phantun_view_remote_addr(&view, true, &remote_addr);
-    if (!phantun_selectors_allow(view.udp->dest, &remote_addr, view.udp->source))
+    phantun_view_local_addr(&view, true, &local_addr);
+    if (!phantun_pre_routing_targets_local_host(state->net, &local_addr))
         return NF_ACCEPT;
 
     if (phantun_addr_pair_uses_unsupported_addr(&local_addr, &remote_addr)) {
@@ -2017,12 +2020,15 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     if (!phantun_family_enabled(view.family))
         return NF_ACCEPT;
 
-    phantun_view_local_addr(&view, true, &local_addr);
-    if (!phantun_pre_routing_targets_local_host(state->net, &local_addr))
+    phantun_view_remote_addr(&view, true, &remote_addr);
+    /* Selector matching is cheap cached config; test it before local-delivery
+     * checks that may require a FIB lookup.
+     */
+    if (!phantun_selectors_allow(view.tcp->dest, &remote_addr, view.tcp->source))
         return NF_ACCEPT;
 
-    phantun_view_remote_addr(&view, true, &remote_addr);
-    if (!phantun_selectors_allow(view.tcp->dest, &remote_addr, view.tcp->source))
+    phantun_view_local_addr(&view, true, &local_addr);
+    if (!phantun_pre_routing_targets_local_host(state->net, &local_addr))
         return NF_ACCEPT;
 
     phantun_fill_tcp_endpoint_pair(&view, &ep);

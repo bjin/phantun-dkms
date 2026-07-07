@@ -173,6 +173,9 @@ void pht_udp_v6_complete(struct ipv6hdr *ip6h, struct udphdr *uh, u16 udp_len);
 
 struct sk_buff *pht_build_fake_tcp_v4(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                                       u8 flags, const void *payload, size_t payload_len);
+/* The payload region is uninitialized; caller must write exactly payload_len
+ * bytes before checksum completion and transmit/reinject.
+ */
 struct sk_buff *pht_build_fake_tcp_v4_uninit(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                                              u8 flags, size_t payload_len, void **payload_ptr);
 struct sk_buff *pht_build_fake_tcp_syn_v4(const struct pht_endpoint_pair *ep, u32 seq);
@@ -184,6 +187,9 @@ struct sk_buff *pht_build_fake_tcp_rst_v4(const struct pht_endpoint_pair *ep, u3
 struct sk_buff *pht_build_fake_tcp_rstack_v4(const struct pht_endpoint_pair *ep, u32 seq, u32 ack);
 struct sk_buff *pht_build_udp_v4(const struct pht_endpoint_pair *ep, const void *payload,
                                  size_t payload_len);
+/* The payload region is uninitialized; caller must write exactly payload_len
+ * bytes before checksum completion and transmit/reinject.
+ */
 struct sk_buff *pht_build_udp_v4_uninit(const struct pht_endpoint_pair *ep, size_t payload_len,
                                         void **payload_ptr);
 
@@ -200,10 +206,16 @@ int pht_reinject_udp_payload_from_skb_v4(struct net_device *dev, const struct ph
                                          size_t payload_len, u32 reinject_mark);
 struct sk_buff *pht_build_fake_tcp_v6(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                                       u8 flags, const void *payload, size_t payload_len);
+/* The payload region is uninitialized; caller must write exactly payload_len
+ * bytes before checksum completion and transmit/reinject.
+ */
 struct sk_buff *pht_build_fake_tcp_v6_uninit(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                                              u8 flags, size_t payload_len, void **payload_ptr);
 struct sk_buff *pht_build_udp_v6(const struct pht_endpoint_pair *ep, const void *payload,
                                  size_t payload_len);
+/* The payload region is uninitialized; caller must write exactly payload_len
+ * bytes before checksum completion and transmit/reinject.
+ */
 struct sk_buff *pht_build_udp_v6_uninit(const struct pht_endpoint_pair *ep, size_t payload_len,
                                         void **payload_ptr);
 int pht_tx_fake_tcp_v6(struct net *net, struct sk_buff *skb, const struct pht_endpoint_pair *ep,

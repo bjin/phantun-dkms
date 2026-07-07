@@ -623,6 +623,10 @@ void pht_udp_v4_complete(struct iphdr *iph, struct udphdr *uh, u16 udp_len) {
         uh->check = CSUM_MANGLED_0;
 }
 
+/* Only L3/L4 headers are zero-filled. Builders returning an uninitialized
+ * payload pointer require the caller to write exactly payload_len bytes before
+ * checksum completion.
+ */
 static struct sk_buff *pht_alloc_l3_skb(unsigned int l4_len, size_t payload_len) {
     unsigned int max_payload;
     unsigned int total_len;
@@ -643,7 +647,7 @@ static struct sk_buff *pht_alloc_l3_skb(unsigned int l4_len, size_t payload_len)
     skb_reset_mac_header(skb);
     skb_reset_network_header(skb);
     skb_put(skb, total_len);
-    memset(skb->data, 0, total_len);
+    memset(skb->data, 0, sizeof(struct iphdr) + l4_len);
     skb_set_transport_header(skb, sizeof(struct iphdr));
     skb->protocol = htons(ETH_P_IP);
     skb->ip_summed = CHECKSUM_NONE;
@@ -970,6 +974,10 @@ void pht_udp_v6_complete(struct ipv6hdr *ip6h, struct udphdr *uh, u16 udp_len) {
         uh->check = CSUM_MANGLED_0;
 }
 
+/* Only L3/L4 headers are zero-filled. Builders returning an uninitialized
+ * payload pointer require the caller to write exactly payload_len bytes before
+ * checksum completion.
+ */
 static struct sk_buff *pht_alloc_l3_skb_v6(unsigned int l4_len, size_t payload_len) {
     unsigned int max_payload;
     unsigned int total_len;
@@ -990,7 +998,7 @@ static struct sk_buff *pht_alloc_l3_skb_v6(unsigned int l4_len, size_t payload_l
     skb_reset_mac_header(skb);
     skb_reset_network_header(skb);
     skb_put(skb, total_len);
-    memset(skb->data, 0, total_len);
+    memset(skb->data, 0, sizeof(struct ipv6hdr) + l4_len);
     skb_set_transport_header(skb, sizeof(struct ipv6hdr));
     skb->protocol = htons(ETH_P_IPV6);
     skb->ip_summed = CHECKSUM_NONE;
