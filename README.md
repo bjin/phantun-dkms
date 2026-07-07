@@ -433,7 +433,7 @@ can increment both an aggregate and a more specific reason counter:
 
 - IPv4 and IPv6 are supported, with `ip_families=both|ipv4|ipv6` selecting active translation families.
 - By default, hooks are installed only in the initial network namespace. Use `managed_netns=all` for namespace/container workloads that need translation outside `init_net`.
-- Linux kernel compatibility: from `5.10` to `7.1`.
+- Linux kernel compatibility: from `5.10` to `7.2`.
 - Mixed **Phantun** / **`phantun-dkms`** deployments are **untested** and should be treated as **likely non-seamless**.
 - **No FIN close state machine**.
 - This is a **kernel-to-kernel protocol variant** in practice, even though the basic packet shape stays close to Phantun.
