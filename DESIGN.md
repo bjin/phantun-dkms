@@ -439,6 +439,7 @@ Behavior:
 - handshaking flow → queue one skb or drop
 - no flow → create initiator flow, queue one skb, send `SYN`
 - zero-payload UDP on an owned tuple is consumed/dropped instead of translated because fake-TCP payload data rides in ACK payloads and has no empty datagram representation
+- outbound UDP GSO superframes are software-segmented before translation; each segment is translated independently and the half-open one-skb queue rule applies per segment
 - if skb already carries conntrack state, confirm original UDP entry before stealing packet so translated inbound replies can match established host-firewall policy
 - copy the outbound UDP packet's transmit metadata to the generated fake-TCP packet
 - original UDP skb is stolen from the stack

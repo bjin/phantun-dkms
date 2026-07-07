@@ -1574,6 +1574,59 @@ static int phantun_confirm_outbound_udp_conntrack(struct sk_buff *skb) {
     return 0;
 }
 
+static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
+                                      const struct nf_hook_state *state);
+
+/* UDP GSO superframes reach LOCAL_OUT before software/device segmentation.
+ * Split owned UDP_L4 skbs here so each datagram follows the normal fake-TCP
+ * translation path and half-open one-skb queue contract independently.
+ */
+static unsigned int phantun_local_out_segment_gso(void *priv, struct sk_buff *skb,
+                                                  const struct nf_hook_state *state) {
+    netdev_features_t features = NETIF_F_SG | NETIF_F_IP_CSUM;
+    struct sk_buff *segs;
+    struct sk_buff *seg;
+    struct sk_buff *next;
+    long err;
+
+    if (!skb_is_gso(skb))
+        return NF_ACCEPT;
+    if (!(skb_shinfo(skb)->gso_type & SKB_GSO_UDP_L4)) {
+        pht_pr_warn_rl("dropping outbound UDP skb with unexpected gso_type %#x\n",
+                       skb_shinfo(skb)->gso_type);
+        phantun_account_udp_translation_failure();
+        return NF_DROP;
+    }
+    if (skb->protocol == htons(ETH_P_IPV6))
+        features = NETIF_F_SG | NETIF_F_IPV6_CSUM;
+
+    segs = __skb_gso_segment(skb, features, true);
+    if (IS_ERR_OR_NULL(segs)) {
+        err = IS_ERR(segs) ? PTR_ERR(segs) : -EINVAL;
+        pht_pr_warn_rl("failed to segment outbound UDP GSO skb: %ld\n", err);
+        phantun_account_udp_translation_failure();
+        return NF_DROP;
+    }
+
+    consume_skb(skb);
+
+    skb_list_walk_safe(segs, seg, next) {
+        unsigned int verdict;
+
+        skb_mark_not_on_list(seg);
+        /* LOCAL_OUT consumes owned skbs on every normal path. If a segment
+         * escapes that contract, keep ownership here and drop it explicitly.
+         */
+        verdict = phantun_local_out(priv, seg, state);
+        if (verdict != NF_STOLEN) {
+            pht_pr_warn_rl("segmented outbound UDP packet unexpectedly escaped fake-TCP handler\n");
+            kfree_skb(seg);
+        }
+    }
+
+    return NF_STOLEN;
+}
+
 /* LOCAL_OUT owns selector-matched outbound UDP. ESTABLISHED flows send
  * immediately, half-open flows keep only one queued skb, and DEAD flows are
  * reopened from scratch with a guarded ISN.
@@ -1623,6 +1676,10 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
         pht_pr_warn_rl("rejecting outbound UDP with unsupported endpoint address\n");
         return NF_DROP;
     }
+
+    ret = phantun_local_out_segment_gso(priv, skb, state);
+    if (ret != NF_ACCEPT)
+        return ret;
 
     if (!view.payload_len) {
         /* Zero-payload fake-TCP ACKs are control/liveness frames, so the

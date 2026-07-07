@@ -452,6 +452,79 @@ def test_netns_ping_pong_uses_tcp_output_only(phantun_module, vm):
         cleanup_netns_topology(vm)
 
 
+def test_established_flow_delivers_udp_gso_superframe(phantun_module, vm):
+    load_netns_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    chunks = [c * 1000 for c in "ABCD"]
+    ready_file = f"/tmp/phantun_gso_recv_{uuid.uuid4().hex}"
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 5,
+            "timeout_sec": 20,
+            "ready_file": ready_file,
+        },
+    )
+
+    try:
+        wait_for_guest_ready_file(vm, ready_file, timeout=5)
+        warmup = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["warmup"],
+            },
+            timeout=10,
+        )
+        assert_completed(warmup, "GSO warm-up sender")
+
+        deadline = time.time() + 5
+        while read_module_stat(vm, "flows_established") == 0:
+            if time.time() >= deadline:
+                pytest.fail("warm-up datagram did not establish the flow")
+            time.sleep(0.1)
+
+        gso = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["".join(chunks)],
+                "gso_size": 1000,
+            },
+            timeout=10,
+        )
+        assert_completed(gso, "UDP GSO sender")
+
+        server_result = server.communicate(timeout=20)
+        assert_completed(server_result, "UDP GSO receiver")
+        server_data = parse_guest_json(server_result.stdout, "UDP GSO receiver stdout")
+        received = [entry["message"] for entry in server_data.get("received", [])]
+        if received != ["warmup", *chunks]:
+            pytest.fail(f"unexpected UDP GSO payloads: {received!r}")
+        if read_module_stat(vm, "oversized_payloads_dropped") != 0:
+            pytest.fail("UDP GSO superframe was treated as an oversized payload")
+    finally:
+        server.terminate()
+        cleanup_netns_topology(vm)
+
+
 def test_netns_outbound_mark_propagates_to_fake_tcp(phantun_module, vm):
     load_netns_module(phantun_module)
     ensure_netns_topology(vm)

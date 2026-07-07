@@ -40,10 +40,14 @@ def _socket(
     ipv4_tos=None,
     ipv6_tclass=None,
     bind_device=None,
+    gso_size=None,
 ):
     family = socket.AF_INET6 if ":" in bind_addr else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_DGRAM)
     sock.settimeout(timeout if timeout is not None else TIMEOUT_SEC)
+    if gso_size is not None:
+        # Python's socket module does not expose SOL_UDP/UDP_SEGMENT.
+        sock.setsockopt(17, 103, int(gso_size))
     if mark is not None:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, int(mark))
     if bind_device:
@@ -233,6 +237,7 @@ def send_many(config):
         config.get("ipv4_tos"),
         config.get("ipv6_tclass"),
         config.get("bind_device"),
+        config.get("gso_size"),
     ) as sock:
         target = _addr_tuple(config["target_addr"], config["target_port"], config.get("target_scope_dev"))
         for payload in payloads:
