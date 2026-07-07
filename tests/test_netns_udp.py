@@ -31,6 +31,7 @@ from helpers import (
     run_in_netns,
     run_netns_scenario,
     spawn_netns_scenario,
+    spawn_ready_capture,
     wait_for_guest_ready_file,
 )
 
@@ -627,6 +628,95 @@ def test_netns_generated_fake_tcp_bypasses_output_invalid_drop(phantun_module, v
         server.terminate()
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_netns_generated_fake_tcp_checksum_state_is_valid_or_partial(phantun_module, vm):
+    load_netns_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    payload = "checksum-v4"
+    ready_file = f"/tmp/phantun_csum_v4_{uuid.uuid4().hex}"
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+            "timeout_sec": 20,
+            "ready_file": ready_file,
+        },
+    )
+    capture = None
+
+    try:
+        wait_for_guest_ready_file(vm, ready_file, timeout=5)
+        warmup = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["warmup"],
+            },
+            timeout=10,
+        )
+        assert_completed(warmup, "checksum warm-up sender")
+
+        deadline = time.time() + 5
+        while read_module_stat(vm, "flows_established") == 0:
+            if time.time() >= deadline:
+                pytest.fail("checksum warm-up datagram did not establish the flow")
+            time.sleep(0.1)
+
+        capture = spawn_ready_capture(
+            vm,
+            NS_B,
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payload": payload,
+                "timeout_sec": 20,
+            },
+        )
+        sender = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": [payload],
+            },
+            timeout=10,
+        )
+        assert_completed(sender, "checksum payload sender")
+
+        capture_result = capture.communicate(timeout=20)
+        assert_completed(capture_result, "checksum capture")
+        captured = parse_guest_json(capture_result.stdout, "checksum capture stdout")
+        # Regression guard for the pseudo-header seed. Depending on the capture
+        # point, the checksum may already be resolved or still CHECKSUM_PARTIAL.
+        if captured.get("csum_state") not in ("valid", "partial_seed"):
+            pytest.fail(f"generated fake-TCP checksum state is invalid: {captured!r}")
+
+        server_result = server.communicate(timeout=20)
+        assert_completed(server_result, "checksum receiver")
+    finally:
+        if capture is not None:
+            capture.terminate()
+        server.terminate()
         cleanup_netns_topology(vm)
 
 

@@ -659,7 +659,10 @@ static void pht_fake_tcp_v4_complete_skb(struct sk_buff *skb) {
     struct tcphdr *th = tcp_hdr(skb);
     u16 tcp_len = ntohs(iph->tot_len) - iph->ihl * 4;
 
-    pht_tcp_v4_complete(iph, th, tcp_len);
+    th->check = ~tcp_v4_check(tcp_len, iph->saddr, iph->daddr, 0);
+    skb->ip_summed = CHECKSUM_PARTIAL;
+    skb->csum_start = skb_transport_header(skb) - skb->head;
+    skb->csum_offset = offsetof(struct tcphdr, check);
 }
 
 struct sk_buff *pht_build_fake_tcp_v4_uninit(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
@@ -1008,8 +1011,12 @@ static struct sk_buff *pht_alloc_l3_skb_v6(unsigned int l4_len, size_t payload_l
 static void pht_fake_tcp_v6_complete_skb(struct sk_buff *skb) {
     struct ipv6hdr *ip6h = ipv6_hdr(skb);
     struct tcphdr *th = tcp_hdr(skb);
+    u16 tcp_len = ntohs(ip6h->payload_len);
 
-    pht_tcp_v6_complete(ip6h, th, ntohs(ip6h->payload_len));
+    th->check = ~tcp_v6_check(tcp_len, &ip6h->saddr, &ip6h->daddr, 0);
+    skb->ip_summed = CHECKSUM_PARTIAL;
+    skb->csum_start = skb_transport_header(skb) - skb->head;
+    skb->csum_offset = offsetof(struct tcphdr, check);
 }
 
 struct sk_buff *pht_build_fake_tcp_v6_uninit(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,

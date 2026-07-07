@@ -35,6 +35,7 @@ from helpers import (
     run_netns_scenario,
     read_module_stat,
     spawn_netns_scenario,
+    spawn_ready_capture,
     wait_for_guest_ready_file,
 )
 from test_wireguard import (
@@ -246,6 +247,95 @@ def test_ipv6_established_flow_delivers_udp_gso_superframe(phantun_module, vm):
         if read_module_stat(vm, "oversized_payloads_dropped") != 0:
             pytest.fail("IPv6 UDP GSO superframe was treated as an oversized payload")
     finally:
+        server.terminate()
+        cleanup_netns_topology(vm)
+
+
+def test_ipv6_generated_fake_tcp_checksum_state_is_valid_or_partial(phantun_module, vm):
+    load_ipv6_module(phantun_module)
+    ensure_netns_topology(vm, with_ipv6=True)
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    payload = "checksum-v6"
+    ready_file = f"/tmp/phantun_csum_v6_{uuid.uuid4().hex}"
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS6_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+            "timeout_sec": 20,
+            "ready_file": ready_file,
+        },
+    )
+    capture = None
+
+    try:
+        wait_for_guest_ready_file(vm, ready_file, timeout=5)
+        warmup = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS6_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS6_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["warmup"],
+            },
+            timeout=10,
+        )
+        assert_completed(warmup, "IPv6 checksum warm-up sender")
+
+        deadline = time.time() + 5
+        while read_module_stat(vm, "flows_established") == 0:
+            if time.time() >= deadline:
+                pytest.fail("IPv6 checksum warm-up datagram did not establish the flow")
+            time.sleep(0.1)
+
+        capture = spawn_ready_capture(
+            vm,
+            NS_B,
+            {
+                "bind_addr": NS6_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS6_ADDR_B,
+                "target_port": dst_port,
+                "payload": payload,
+                "timeout_sec": 20,
+            },
+        )
+        sender = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS6_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS6_ADDR_B,
+                "target_port": dst_port,
+                "payloads": [payload],
+            },
+            timeout=10,
+        )
+        assert_completed(sender, "IPv6 checksum payload sender")
+
+        capture_result = capture.communicate(timeout=20)
+        assert_completed(capture_result, "IPv6 checksum capture")
+        captured = parse_guest_json(capture_result.stdout, "IPv6 checksum capture stdout")
+        # Regression guard for the pseudo-header seed. Depending on the capture
+        # point, the checksum may already be resolved or still CHECKSUM_PARTIAL.
+        if captured.get("csum_state") not in ("valid", "partial_seed"):
+            pytest.fail(f"IPv6 generated fake-TCP checksum state is invalid: {captured!r}")
+
+        server_result = server.communicate(timeout=20)
+        assert_completed(server_result, "IPv6 checksum receiver")
+    finally:
+        if capture is not None:
+            capture.terminate()
         server.terminate()
         cleanup_netns_topology(vm)
 

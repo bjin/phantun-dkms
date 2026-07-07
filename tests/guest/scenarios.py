@@ -934,10 +934,11 @@ def capture_tcp_packet(config):
     dst_port = config["target_port"]
     expected_payload = config.get("payload")
     ready_file = config.get("ready_file")
+    eth_type = 0x86DD if ":" in src_addr else 0x0800
     if isinstance(expected_payload, str):
         expected_payload = expected_payload.encode()
 
-    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0800)) as raw_sock:
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(eth_type)) as raw_sock:
         raw_sock.settimeout(config.get("timeout_sec", TIMEOUT_SEC))
         if ready_file:
             Path(ready_file).write_text("ready\n")
@@ -945,28 +946,68 @@ def capture_tcp_packet(config):
         try:
             while True:
                 frame, _ = raw_sock.recvfrom(65535)
-                if len(frame) < 14 + 20 + 20:
+                if len(frame) < 14 + 20:
                     continue
-                if struct.unpack("!H", frame[12:14])[0] != 0x0800:
+                if struct.unpack("!H", frame[12:14])[0] != eth_type:
                     continue
 
                 ip_offset = 14
-                version_ihl = frame[ip_offset]
-                if version_ihl >> 4 != 4:
-                    continue
-                ihl = (version_ihl & 0x0F) * 4
-                if frame[ip_offset + 9] != socket.IPPROTO_TCP:
-                    continue
+                if eth_type == 0x0800:
+                    version_ihl = frame[ip_offset]
+                    if version_ihl >> 4 != 4:
+                        continue
+                    ihl = (version_ihl & 0x0F) * 4
+                    if frame[ip_offset + 9] != socket.IPPROTO_TCP:
+                        continue
+                    total_len = struct.unpack("!H", frame[ip_offset + 2 : ip_offset + 4])[0]
+                    if len(frame) < ip_offset + total_len:
+                        continue
 
-                packet_src_addr = socket.inet_ntoa(frame[ip_offset + 12 : ip_offset + 16])
-                packet_dst_addr = socket.inet_ntoa(frame[ip_offset + 16 : ip_offset + 20])
+                    src_bytes = frame[ip_offset + 12 : ip_offset + 16]
+                    dst_bytes = frame[ip_offset + 16 : ip_offset + 20]
+                    packet_src_addr = socket.inet_ntoa(src_bytes)
+                    packet_dst_addr = socket.inet_ntoa(dst_bytes)
+                    tcp_offset = ip_offset + ihl
+                    tcp_len = total_len - ihl
+                    pseudo = struct.pack(
+                        "!4s4sBBH",
+                        src_bytes,
+                        dst_bytes,
+                        0,
+                        socket.IPPROTO_TCP,
+                        tcp_len,
+                    )
+                else:
+                    if len(frame) < 14 + 40 + 20:
+                        continue
+                    if frame[ip_offset] >> 4 != 6:
+                        continue
+                    if frame[ip_offset + 6] != socket.IPPROTO_TCP:
+                        continue
+                    payload_len = struct.unpack("!H", frame[ip_offset + 4 : ip_offset + 6])[0]
+                    total_len = 40 + payload_len
+                    if len(frame) < ip_offset + total_len:
+                        continue
+
+                    src_bytes = frame[ip_offset + 8 : ip_offset + 24]
+                    dst_bytes = frame[ip_offset + 24 : ip_offset + 40]
+                    packet_src_addr = socket.inet_ntop(socket.AF_INET6, src_bytes)
+                    packet_dst_addr = socket.inet_ntop(socket.AF_INET6, dst_bytes)
+                    tcp_offset = ip_offset + 40
+                    tcp_len = payload_len
+                    pseudo = struct.pack(
+                        "!16s16sI3xB",
+                        src_bytes,
+                        dst_bytes,
+                        tcp_len,
+                        socket.IPPROTO_TCP,
+                    )
+
                 if packet_src_addr != src_addr or packet_dst_addr != dst_addr:
                     continue
 
-                total_len = struct.unpack("!H", frame[ip_offset + 2 : ip_offset + 4])[0]
-                tcp_offset = ip_offset + ihl
                 tcp_header = frame[tcp_offset : tcp_offset + 20]
-                if len(tcp_header) < 20:
+                if len(tcp_header) < 20 or tcp_len < 20:
                     continue
 
                 (
@@ -977,18 +1018,28 @@ def capture_tcp_packet(config):
                     data_offset,
                     flags,
                     _,
-                    _,
+                    tcp_check,
                     _,
                 ) = struct.unpack("!HHLLBBHHH", tcp_header)
                 if packet_src_port != src_port or packet_dst_port != dst_port:
                     continue
 
                 tcp_header_len = (data_offset >> 4) * 4
+                if tcp_header_len < 20 or tcp_len < tcp_header_len:
+                    continue
                 payload_start = tcp_offset + tcp_header_len
                 payload_end = ip_offset + total_len
                 payload = frame[payload_start:payload_end]
                 if expected_payload is not None and payload != expected_payload:
                     continue
+
+                tcp_segment = frame[tcp_offset:payload_end]
+                if _checksum(pseudo + tcp_segment) == 0:
+                    csum_state = "valid"
+                elif tcp_check == ((~_checksum(pseudo)) & 0xFFFF):
+                    csum_state = "partial_seed"
+                else:
+                    csum_state = "invalid"
 
                 _emit(
                     {
@@ -996,6 +1047,7 @@ def capture_tcp_packet(config):
                         "ack": ack,
                         "flags": flags,
                         "payload": payload.decode(errors="ignore"),
+                        "csum_state": csum_state,
                     }
                 )
                 return

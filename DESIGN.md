@@ -499,7 +499,7 @@ Result:
 For module-generated fake-TCP packets:
 
 - build a new TCP skb
-- set IPv4/TCP or IPv6/TCP headers and checksums explicitly for the active family
+- set IPv4/TCP or IPv6/TCP headers explicitly; emit the TCP checksum as `CHECKSUM_PARTIAL` with a pseudo-header seed for the device or `skb_checksum_help` to resolve
 - emit generated fake TCP as conntrack-untracked (`IP_CT_UNTRACKED`) before local output so conntrack never tracks the half-visible fake-TCP exchange
 - transmit via the normal family-specific local output path (`ip_local_out` / `ip6_local_out` style)
 - apply the selected per-packet transmit metadata before routing and local output
