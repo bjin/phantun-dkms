@@ -374,7 +374,8 @@ can increment both an aggregate and a more specific reason counter:
   counted in `udp_packets_dropped`.
 - `tcp_misaligned_syn_rejected` and `tcp_unknown_tuple_rejected` are also
   counted in `tcp_protocol_rejected`.
-- `oversized_payloads_dropped` covers both directions: outbound oversized UDP is
+- `oversized_payloads_dropped` covers both directions: outbound oversized UDP or
+  established sends whose generated fake TCP exceeds the current route MTU are
   also counted in `udp_packets_dropped`; inbound oversized fake-TCP is also
   counted in `tcp_protocol_rejected` when the module rejects it with RST.
 - These reason counters are useful labels, not a full partition. They will not
@@ -416,7 +417,7 @@ can increment both an aggregate and a more specific reason counter:
 | `tcp_misaligned_syn_rejected` | Owned bare SYNs rejected because `seq % 4095 != 0`. Also increments `tcp_protocol_rejected`. |
 | `tcp_unknown_tuple_rejected` | Owned fake-TCP packets with no live flow rejected because they were not valid new openers. Also increments `tcp_protocol_rejected`; misaligned bare SYNs use `tcp_misaligned_syn_rejected` instead. |
 | `bad_checksum_dropped` | Fake-TCP packets dropped due to invalid TCP checksum. These are not counted as protocol rejections. |
-| `oversized_payloads_dropped` | Payloads too large for module limits. Outbound oversized UDP also increments `udp_packets_dropped`; inbound oversized fake-TCP also increments `tcp_protocol_rejected` when rejected with RST. |
+| `oversized_payloads_dropped` | Payloads too large for module limits, plus established sends whose generated fake TCP exceeds the current route MTU. Outbound oversized UDP also increments `udp_packets_dropped`; inbound oversized fake-TCP also increments `tcp_protocol_rejected` when rejected with RST. |
 
 ## Build, reload, unload
 

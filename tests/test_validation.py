@@ -1560,6 +1560,97 @@ def test_oversized_established_payload_is_rejected_and_counted(phantun_module, v
         cleanup_netns_topology(vm)
 
 
+def test_path_mtu_payload_drop_keeps_established_flow_alive(phantun_module, vm):
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    receiver = spawn_ready_recv_until_timeout(
+        vm,
+        NS_B,
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 3,
+            "timeout_sec": 2,
+        },
+    )
+    baseline_stats = read_module_stats(vm)
+
+    try:
+        opener = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["open"],
+            },
+        )
+        assert_completed(opener, "path-MTU opener")
+        established_stats = wait_for_stat_greater(
+            vm,
+            "flows_established",
+            baseline_stats["flows_established"],
+        )
+
+        run_in_netns(vm, NS_A, ["ip", "link", "set", VETH_A, "mtu", "1300"])
+        run_in_netns(
+            vm,
+            NS_A,
+            ["ip", "route", "replace", f"{NS_ADDR_B}/32", "dev", VETH_A, "mtu", "lock", "1300"],
+        )
+
+        too_large = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["X" * 1350],
+            },
+        )
+        assert_completed(too_large, "path-MTU oversized sender")
+        time.sleep(0.2)
+
+        after_drop = read_module_stats(vm)
+        if after_drop["oversized_payloads_dropped"] != established_stats["oversized_payloads_dropped"] + 1:
+            pytest.fail(f"path-MTU drop stats mismatch: before={established_stats!r} after={after_drop!r}")
+        if after_drop["rst_sent"] != established_stats["rst_sent"]:
+            pytest.fail(f"path-MTU drop must not send RST: before={established_stats!r} after={after_drop!r}")
+        if after_drop["flows_established"] != established_stats["flows_established"]:
+            pytest.fail(f"path-MTU drop must not re-establish flow: before={established_stats!r} after={after_drop!r}")
+
+        small = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["Y" * 1200],
+            },
+        )
+        assert_completed(small, "path-MTU survivor sender")
+
+        receiver_result = receiver.communicate(timeout=6)
+        assert_receiver_messages(receiver_result, ["open", "Y" * 1200], "path-MTU receiver", True)
+    finally:
+        run_in_netns(vm, NS_A, ["ip", "route", "del", f"{NS_ADDR_B}/32", "dev", VETH_A], check=False)
+        run_in_netns(vm, NS_A, ["ip", "link", "set", VETH_A, "mtu", "1500"], check=False)
+        receiver.terminate()
+        cleanup_netns_topology(vm)
+
+
 def test_oversized_final_ack_payload_is_rejected_and_counted(phantun_module, vm):
     phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)

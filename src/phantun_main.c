@@ -572,7 +572,7 @@ static void phantun_account_udp_translation_failure(void) {
 }
 
 static bool phantun_io_error_is_transient(int ret) {
-    return ret == NET_XMIT_DROP || ret == -ENOBUFS || ret == -ENOMEM;
+    return ret == NET_XMIT_DROP || ret == -ENOBUFS || ret == -ENOMEM || ret == -EMSGSIZE;
 }
 
 static void phantun_account_tcp_protocol_rejected(void) {
@@ -1117,9 +1117,9 @@ static int phantun_send_flow_rst(struct pht_flow *flow, struct net *net) {
 }
 
 /* Returns 0 for a successful emit, a stale-generation drop, or a transient
- * local I/O drop where the UDP skb is intentionally consumed. -EMSGSIZE is
- * non-terminal. Any other error owns terminal established-send teardown before
- * returning.
+ * local I/O drop where the UDP skb is intentionally consumed. In-flight
+ * -EMSGSIZE is consumed as a per-packet oversized drop. Any other error owns
+ * terminal established-send teardown before returning.
  */
 static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_endpoint_pair *ep,
                                         const struct pht_l4_view *view, const struct sk_buff *skb,
@@ -1201,10 +1201,15 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
         spin_unlock_bh(&flow->lock);
         /* -EAGAIN is the emit helper's generation guard: the flow stopped
          * matching this packet while the skb/dst was being prepared. Transient
-         * queue/memory pressure consumes only this UDP payload; the established
-         * generation remains live and later packets continue in sequence.
+         * queue/memory pressure and path-MTU refusal consume only this UDP
+         * payload; the established generation remains live and later packets
+         * continue in sequence.
          */
         if (stale_generation) {
+            ret = 0;
+        } else if (ret == -EMSGSIZE) {
+            pht_stats_inc(PHT_STAT_OVERSIZED_PAYLOADS_DROPPED);
+            pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
             ret = 0;
         } else if (transient_failure) {
             phantun_account_udp_translation_failure();

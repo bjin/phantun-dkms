@@ -161,6 +161,45 @@ def make_netns_input_probe(vm, namespace, dst_port, allow_udp_dport):
     return NetnsNftProbe(namespace, "inet", table_name, "input")
 
 
+def make_netns_output_invalid_drop_probe(vm, namespace):
+    table_name = f"phantun_out_invalid_{uuid.uuid4().hex[:8]}"
+    run_in_netns(vm, namespace, ["nft", "delete", "table", "inet", table_name], check=False)
+    run_in_netns(vm, namespace, ["nft", "add", "table", "inet", table_name])
+    run_in_netns(
+        vm,
+        namespace,
+        [
+            "nft",
+            "add",
+            "chain",
+            "inet",
+            table_name,
+            "output",
+            "{ type filter hook output priority 0; policy accept; }",
+        ],
+    )
+    run_in_netns(
+        vm,
+        namespace,
+        [
+            "nft",
+            "add",
+            "rule",
+            "inet",
+            table_name,
+            "output",
+            "ct",
+            "state",
+            "invalid",
+            "counter",
+            "drop",
+            "comment",
+            "invalid_drop_out",
+        ],
+    )
+    return NetnsNftProbe(namespace, "inet", table_name, "output")
+
+
 def make_netns_output_udp_mark_set_probe(vm, namespace, src_addr, src_port, dst_addr, dst_port, mark):
     table_name = f"phantun_mark_set_{uuid.uuid4().hex[:8]}"
     lines = [
@@ -522,6 +561,72 @@ def test_established_flow_delivers_udp_gso_superframe(phantun_module, vm):
             pytest.fail("UDP GSO superframe was treated as an oversized payload")
     finally:
         server.terminate()
+        cleanup_netns_topology(vm)
+
+
+def test_netns_generated_fake_tcp_bypasses_output_invalid_drop(phantun_module, vm):
+    load_netns_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    ready_file = f"/tmp/phantun_output_ct_{uuid.uuid4().hex}"
+    probe_a = make_netns_output_invalid_drop_probe(vm, NS_A)
+    probe_b = make_netns_output_invalid_drop_probe(vm, NS_B)
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many_reply",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "replies": ["strict-reply"],
+            "timeout_sec": 15,
+            "ready_file": ready_file,
+        },
+    )
+
+    try:
+        wait_for_guest_ready_file(vm, ready_file, timeout=5)
+        client = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many_recv",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["strict-request"],
+                "recv_count": 1,
+            },
+            timeout=15,
+        )
+        server_result = server.communicate(timeout=15)
+
+        assert_completed(client, "output invalid-drop client")
+        assert_completed(server_result, "output invalid-drop server")
+        client_data = parse_guest_json(client.stdout, "output invalid-drop client stdout")
+        server_data = parse_guest_json(server_result.stdout, "output invalid-drop server stdout")
+        server_received = [entry["message"] for entry in server_data.get("received", [])]
+        client_replies = [entry["message"] for entry in client_data.get("replies", [])]
+        if server_received != ["strict-request"]:
+            pytest.fail(f"server did not receive strict-firewall request: {server_data!r}")
+        if client_replies != ["strict-reply"]:
+            pytest.fail(f"client did not receive strict-firewall reply: {client_data!r}")
+        if probe_a.packets(vm, "invalid_drop_out") != 0:
+            pytest.fail("NS_A output ct invalid-drop rule matched generated fake TCP")
+        if probe_b.packets(vm, "invalid_drop_out") != 0:
+            pytest.fail("NS_B output ct invalid-drop rule matched generated fake TCP")
+    finally:
+        server.terminate()
+        probe_a.cleanup(vm)
+        probe_b.cleanup(vm)
         cleanup_netns_topology(vm)
 
 

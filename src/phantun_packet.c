@@ -21,6 +21,7 @@
 #include <net/ip6_route.h>
 #include <net/ipv6.h>
 #endif
+#include <net/netfilter/nf_conntrack.h>
 
 #include "phantun_compat.h" // IWYU pragma: keep
 #include "phantun_packet.h"
@@ -279,6 +280,8 @@ int pht_tx_fake_tcp_with_dst(struct net *net, struct sk_buff *skb, u8 family,
         kfree_skb(skb);
         return -EINVAL;
     }
+
+    nf_ct_set(skb, NULL, IP_CT_UNTRACKED);
 
     skb_dst_set(skb, dst);
     skb->dev = dst->dev;

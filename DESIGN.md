@@ -417,11 +417,13 @@ The translator must tolerate loss of handshake-path packets within retry budget:
 ### 7.4 Local I/O pressure
 
 Transient local queue or memory pressure (`NET_XMIT_DROP`, `-ENOBUFS`, or
-`-ENOMEM`) drops only the affected payload or control packet and keeps the flow
-generation live. Half-open handshake packets remain armed for timer retry, and
-established payload sequence space is not reused. Terminal routing or structural
-errors such as unreachable routes, unsupported families, access denial, or
-invalid packet construction still tear down the affected generation.
+`-ENOMEM`) and path-MTU refusal (`-EMSGSIZE`) drop only the affected payload or
+control packet and keep the flow generation live. Half-open handshake packets
+remain armed for timer retry, and established payload sequence space is not
+reused. Established `-EMSGSIZE` sends are counted as oversized drops rather than
+translation failures. Terminal routing or structural errors such as unreachable
+routes, unsupported families, access denial, or invalid packet construction
+still tear down the affected generation.
 
 ## 8. Packet path in kernel
 
@@ -498,7 +500,7 @@ For module-generated fake-TCP packets:
 
 - build a new TCP skb
 - set IPv4/TCP or IPv6/TCP headers and checksums explicitly for the active family
-- clear conntrack association before injection
+- emit generated fake TCP as conntrack-untracked (`IP_CT_UNTRACKED`) before local output so conntrack never tracks the half-visible fake-TCP exchange
 - transmit via the normal family-specific local output path (`ip_local_out` / `ip6_local_out` style)
 - apply the selected per-packet transmit metadata before routing and local output
 
