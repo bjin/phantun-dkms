@@ -1,21 +1,35 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // Copyright (C) 2026 Bin Jin. All Rights Reserved.
-#include <linux/atomic.h>
+#include <linux/cpumask.h>
 #include <linux/kernel.h>
 #include <linux/kobject.h>
 #include <linux/module.h>
+#include <linux/percpu.h>
 #include <linux/sysfs.h>
 
 #include "phantun.h"
 #include "phantun_stats.h"
 
-static atomic64_t pht_stats[PHT_STAT_COUNT];
+static DEFINE_PER_CPU(s64[PHT_STAT_COUNT], pht_stats);
 static struct kobject *pht_stats_kobj;
+
+/* Sums are not snapshots: concurrent updates on other CPUs can be missed
+ * mid-read. Only flows_current mixes inc/dec across CPUs, so a mid-flight
+ * read can transiently sum negative; clamp instead of exposing a huge u64.
+ */
+static u64 pht_stats_sum(enum pht_stat_id id) {
+    s64 total = 0;
+    int cpu;
+
+    for_each_possible_cpu(cpu) total += per_cpu(pht_stats, cpu)[id];
+
+    return total < 0 ? 0 : (u64)total;
+}
 
 #define PHT_STAT_ATTR(_name, _id)                                                                  \
     static ssize_t _name##_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {    \
-        return sysfs_emit(buf, "%llu\n", (unsigned long long)atomic64_read(&pht_stats[_id]));      \
+        return sysfs_emit(buf, "%llu\n", (unsigned long long)pht_stats_sum(_id));                  \
     }                                                                                              \
     static struct kobj_attribute _name##_attr = __ATTR_RO(_name)
 
@@ -89,25 +103,31 @@ static const struct attribute_group pht_stats_group = {
     .attrs = pht_stats_attrs,
 };
 
+/* Only called from module init before the pernet hooks are registered, so no
+ * updater can race the plain per-CPU stores.
+ */
 void pht_stats_reset(void) {
     unsigned int i;
+    int cpu;
 
-    for (i = 0; i < PHT_STAT_COUNT; i++)
-        atomic64_set(&pht_stats[i], 0);
+    for_each_possible_cpu(cpu) {
+        for (i = 0; i < PHT_STAT_COUNT; i++)
+            per_cpu(pht_stats, cpu)[i] = 0;
+    }
 }
 
 void pht_stats_inc(enum pht_stat_id id) {
     if (id >= PHT_STAT_COUNT)
         return;
 
-    atomic64_inc(&pht_stats[id]);
+    this_cpu_inc(pht_stats[id]);
 }
 
 void pht_stats_dec(enum pht_stat_id id) {
     if (id >= PHT_STAT_COUNT)
         return;
 
-    atomic64_dec(&pht_stats[id]);
+    this_cpu_dec(pht_stats[id]);
 }
 
 int pht_stats_init_sysfs(void) {
