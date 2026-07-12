@@ -29,6 +29,7 @@ from helpers import (
     run_in_netns,
     run_netns_scenario,
     spawn_netns_scenario,
+    spawn_ready_capture,
     wait_for_guest_condition,
     wait_for_guest_ready_file,
 )
@@ -1504,6 +1505,106 @@ def test_replacement_quarantine_drops_half_space_old_generation_packet(phantun_m
         rst_probe.cleanup(vm)
         if synack_drop_probe is not None:
             synack_drop_probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_unknown_tuple_rst_sequence_follows_ack_flag(phantun_module, vm):
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    # 45001 is neither a managed local port nor in PORTS_A/PORTS_B, so the
+    # module in NS_A never selector-matches the RST replies captured here.
+    src_port = 45001
+    dst_port = PORTS_B[0]
+
+    try:
+        baseline = read_module_stats(vm)
+
+        # Case A: ACK-less FIN to an unknown tuple. RFC 793 reset generation:
+        # no ACK on the incoming segment means the RST must carry seq=0.
+        capture_a = spawn_ready_capture(
+            vm,
+            NS_A,
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "timeout_sec": 10,
+            },
+        )
+        inject_a = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "fin",
+                "seq": 0x10203040,
+                "ack": 0xDEADBEEF,
+            },
+        )
+        assert_completed(inject_a, "inject ACK-less FIN")
+        result_a = capture_a.communicate(timeout=15)
+        assert_completed(result_a, "capture RST reply to ACK-less FIN")
+        data_a = parse_guest_json(result_a.stdout, "fin reply")
+
+        # Case B: SYN|ACK to an unknown tuple. The incoming segment has ACK
+        # set, so the RST must echo its ack_seq as the sequence number.
+        capture_b = spawn_ready_capture(
+            vm,
+            NS_A,
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "timeout_sec": 10,
+            },
+        )
+        inject_b = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "syn|ack",
+                "seq": 0x55667788,
+                "ack": 0x22334455,
+            },
+        )
+        assert_completed(inject_b, "inject SYN|ACK")
+        result_b = capture_b.communicate(timeout=15)
+        assert_completed(result_b, "capture RST reply to SYN|ACK")
+        data_b = parse_guest_json(result_b.stdout, "synack reply")
+
+        # Collect all mismatches so a single run reports both bad seq values.
+        expectations = [
+            ("case A (ACK-less FIN) flags", data_a["flags"], 0x14),
+            ("case A (ACK-less FIN) seq", data_a["seq"], 0),
+            ("case A (ACK-less FIN) ack", data_a["ack"], 0x10203041),
+            ("case B (SYN|ACK) flags", data_b["flags"], 0x14),
+            ("case B (SYN|ACK) seq", data_b["seq"], 0x22334455),
+            ("case B (SYN|ACK) ack", data_b["ack"], 0x55667789),
+        ]
+        failures = [
+            f"{label}: expected 0x{expected:x}, observed 0x{observed:x}"
+            for label, observed, expected in expectations
+            if observed != expected
+        ]
+        if failures:
+            pytest.fail("\n".join(failures))
+
+        stats = read_module_stats(vm)
+        assert stats["tcp_unknown_tuple_rejected"] == baseline["tcp_unknown_tuple_rejected"] + 2
+        assert stats["rst_sent"] == baseline["rst_sent"] + 2
+    finally:
         cleanup_netns_topology(vm)
 
 

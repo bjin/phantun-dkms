@@ -1255,9 +1255,11 @@ static int phantun_send_synack(struct pht_flow *flow, struct net *net,
 }
 
 static int phantun_send_rstack(struct net *net, const struct pht_endpoint_pair *ep,
-                               const struct pht_l4_view *view, const struct pht_tx_meta *meta,
-                               bool force_zero_seq) {
-    u32 seq = force_zero_seq ? 0 : ntohl(view->tcp->ack_seq);
+                               const struct pht_l4_view *view, const struct pht_tx_meta *meta) {
+    /* RFC 793 reset generation: a RST answering a segment with ACK set takes
+     * its sequence from that ack_seq; an ACK-less segment gets seq 0.
+     */
+    u32 seq = view->tcp->ack ? ntohl(view->tcp->ack_seq) : 0;
     u32 ack = ntohl(view->tcp->seq) + phantun_tcp_seq_advance(view->tcp, view->payload_len);
     int ret;
 
@@ -2067,7 +2069,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
         if (!phantun_tcp_is_bare_syn(&view)) {
             phantun_account_tcp_unknown_tuple_rejected();
-            ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta, view.tcp->syn);
+            ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
             if (ret)
                 pht_pr_warn_rl("failed to emit RST|ACK for unknown packet: %d\n", ret);
             if (dead_flow)
@@ -2077,7 +2079,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
         if (!phantun_tcp_syn_is_aligned(&view)) {
             phantun_account_tcp_misaligned_syn_rejected();
-            ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta, true);
+            ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
             if (ret)
                 pht_pr_warn_rl("failed to emit RST|ACK for misaligned SYN: %d\n", ret);
             if (dead_flow)
@@ -2165,7 +2167,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
             if (!phantun_tcp_syn_is_aligned(&view)) {
                 phantun_account_tcp_misaligned_syn_rejected();
-                ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta, true);
+                ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
                 if (ret)
                     pht_pr_warn_rl("failed to emit RST|ACK for misaligned colliding SYN: %d\n",
                                    ret);
@@ -2301,7 +2303,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         }
 
         phantun_account_tcp_protocol_rejected();
-        ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta, false);
+        ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
         if (ret)
             pht_pr_warn_rl("failed to emit RST|ACK for unexpected SYN_SENT packet: %d\n", ret);
         pht_flow_remove(flow);
@@ -2329,7 +2331,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             }
             if (phantun_tcp_is_bare_syn(&view) && !phantun_tcp_syn_is_aligned(&view)) {
                 phantun_account_tcp_misaligned_syn_rejected();
-                ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta, true);
+                ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
                 if (ret)
                     pht_pr_warn_rl("failed to emit RST|ACK for misaligned SYN_RCVD SYN: %d\n", ret);
                 pht_flow_remove(flow);
@@ -2338,7 +2340,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             }
 
             phantun_account_tcp_protocol_rejected();
-            ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta, false);
+            ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
             if (ret)
                 pht_pr_warn_rl("failed to emit RST|ACK for bad final ACK: %d\n", ret);
             pht_flow_remove(flow);
@@ -2432,7 +2434,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                     pht_pr_warn("failed to process raced responder payload: %d\n", ret);
                     if (ret == -EMSGSIZE) {
                         phantun_account_tcp_protocol_rejected();
-                        phantun_send_rstack(state->net, &ep, &view, &tx_meta, false);
+                        phantun_send_rstack(state->net, &ep, &view, &tx_meta);
                     }
                     pht_flow_remove(flow);
                 }
@@ -2474,7 +2476,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                     pht_pr_warn("failed to process responder open payload: %d\n", ret);
                     if (ret == -EMSGSIZE) {
                         phantun_account_tcp_protocol_rejected();
-                        phantun_send_rstack(state->net, &ep, &view, &tx_meta, false);
+                        phantun_send_rstack(state->net, &ep, &view, &tx_meta);
                     }
                     pht_flow_remove(flow);
                 }
@@ -2508,7 +2510,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 pht_pr_warn("failed to process responder open payload: %d\n", ret);
                 if (ret == -EMSGSIZE) {
                     phantun_account_tcp_protocol_rejected();
-                    phantun_send_rstack(state->net, &ep, &view, &tx_meta, false);
+                    phantun_send_rstack(state->net, &ep, &view, &tx_meta);
                 }
                 pht_flow_remove(flow);
             }
@@ -2579,7 +2581,9 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                 phantun_account_tcp_misaligned_syn_rejected();
             else
                 phantun_account_tcp_protocol_rejected();
-            phantun_send_rstack(state->net, &ep, &view, &tx_meta, true);
+            ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
+            if (ret)
+                pht_pr_warn_rl("failed to emit RST|ACK for invalid established SYN: %d\n", ret);
             pht_flow_remove(flow);
             pht_flow_put(flow);
             return NF_DROP;
@@ -2587,7 +2591,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
 
         if (!phantun_tcp_is_established_ack(&view)) {
             phantun_account_tcp_protocol_rejected();
-            ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta, !view.tcp->ack);
+            ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
             if (ret)
                 pht_pr_warn_rl("failed to emit RST|ACK for unsupported established flags: %d\n",
                                ret);
@@ -2640,7 +2644,7 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
             pht_pr_warn("failed to process established inbound payload: %d\n", ret);
             if (ret == -EMSGSIZE) {
                 phantun_account_tcp_protocol_rejected();
-                phantun_send_rstack(state->net, &ep, &view, &tx_meta, false);
+                phantun_send_rstack(state->net, &ep, &view, &tx_meta);
             }
             pht_flow_remove(flow);
         }
