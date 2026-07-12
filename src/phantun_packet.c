@@ -113,20 +113,6 @@ static void pht_tx_meta_apply_ipv6_header(struct sk_buff *skb, const struct pht_
 }
 #endif
 
-static bool pht_tx_addr_equal(const struct pht_addr *a, const struct pht_addr *b) {
-    if (!a || !b || a->family != b->family)
-        return false;
-
-    switch (a->family) {
-    case AF_INET:
-        return a->v4 == b->v4;
-    case AF_INET6:
-        return !memcmp(&a->v6, &b->v6, sizeof(a->v6));
-    default:
-        return false;
-    }
-}
-
 int pht_tx_route_key_init(struct pht_tx_route_key *key, const struct pht_endpoint_pair *ep,
                           const struct pht_tx_meta *meta) {
     if (!key || !ep)
@@ -168,8 +154,8 @@ bool pht_tx_route_key_equal(const struct pht_tx_route_key *a, const struct pht_t
     if (a->family != b->family || a->local_port != b->local_port ||
         a->remote_port != b->remote_port || a->scope_ifindex != b->scope_ifindex ||
         a->mark != b->mark || a->oif != b->oif || !uid_eq(a->uid, b->uid) ||
-        !pht_tx_addr_equal(&a->local_addr, &b->local_addr) ||
-        !pht_tx_addr_equal(&a->remote_addr, &b->remote_addr))
+        !pht_addr_equal(&a->local_addr, &b->local_addr) ||
+        !pht_addr_equal(&a->remote_addr, &b->remote_addr))
         return false;
 
     switch (a->family) {
@@ -393,10 +379,8 @@ int pht_parse_ipv4_tcp(struct sk_buff *skb, struct pht_l4_view *view) {
     if (ret)
         return ret;
 
-    iph = view->iph;
     th = tcp_hdr(skb);
     tcp_len = th->doff * 4;
-    total_len = ntohs(iph->tot_len);
     if (tcp_len < sizeof(*th))
         return -EINVAL;
     if (!pskb_may_pull(skb, view->ip_hdr_len + tcp_len))

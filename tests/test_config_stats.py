@@ -1,6 +1,7 @@
 import errno
 import subprocess
 import time
+import uuid
 
 import pytest
 
@@ -204,6 +205,112 @@ def test_oversized_outbound_udp_is_dropped_without_tearing_down_flow(phantun_mod
                 f"oversized outbound UDP must not tear down flow with RST: before={baseline_stats!r} after={stats!r}"
             )
     finally:
+        cleanup_netns_topology(vm)
+
+
+def _find_tracefs_root(vm):
+    # A mounted-but-empty tracefs directory is common; probe the actual files.
+    for root in ("/sys/kernel/tracing", "/sys/kernel/debug/tracing"):
+        has_event = vm.run(["test", "-f", f"{root}/events/skb/kfree_skb/enable"], check=False)
+        has_trace = vm.run(["test", "-f", f"{root}/trace"], check=False)
+        if has_event.returncode == 0 and has_trace.returncode == 0:
+            return root
+    return None
+
+
+def test_translated_udp_does_not_hit_kfree_skb_tracepoint(phantun_module, vm):
+    tracefs = _find_tracefs_root(vm)
+    if tracefs is None:
+        pytest.skip("skb:kfree_skb tracepoint unavailable")
+
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
+    ensure_netns_topology(vm)
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    enable_path = f"{tracefs}/events/skb/kfree_skb/enable"
+    tracing_on_path = f"{tracefs}/tracing_on"
+
+    # Snapshot global tracing state so the suite never leaves it altered.
+    saved_tracing_on = vm.run(["cat", tracing_on_path]).stdout.strip()
+    saved_enable = vm.run(["cat", enable_path]).stdout.strip()
+
+    try:
+        vm.run(f"echo 1 > {enable_path}")
+        vm.run(f"echo 1 > {tracing_on_path}")
+        vm.run(f"echo > {tracefs}/trace")
+
+        # Clean phase: a normally translated round trip. Both converted sites
+        # (phantun_local_out established tail, phantun_flush_queued_udp tail)
+        # must free the consumed skb via consume_skb, so neither location may
+        # appear as a kfree_skb (drop) event.
+        ready_file = f"/tmp/phantun-trace-echo-{uuid.uuid4().hex}"
+        server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "echo_server",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 1,
+                "timeout_sec": 15,
+                "ready_file": ready_file,
+            },
+        )
+        wait_for_guest_ready_file(vm, ready_file, timeout=10)
+        client = run_netns_scenario(
+            vm,
+            NS_A,
+            "echo_client",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["clean"],
+                "timeout_sec": 15,
+            },
+        )
+        assert_completed(client, "clean-phase echo client")
+        server_result = server.communicate(timeout=20)
+        assert_completed(server_result, "clean-phase echo server")
+
+        trace = vm.run(["cat", f"{tracefs}/trace"]).stdout
+        offending = [
+            line for line in trace.splitlines() if "phantun_local_out" in line or "phantun_flush_queued_udp" in line
+        ]
+        if offending:
+            pytest.fail("translated UDP hit the kfree_skb drop tracepoint:\n" + "\n".join(offending))
+
+        # Drop phase: an oversized payload on the same tuple is a genuine drop
+        # and must still be visible to drop monitors via kfree_skb.
+        vm.run(f"echo > {tracefs}/trace")
+        oversized = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["X" * 1470],
+            },
+        )
+        assert_completed(oversized, "oversized drop-phase send")
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            trace = vm.run(["cat", f"{tracefs}/trace"]).stdout
+            if any("phantun_local_out" in line for line in trace.splitlines()):
+                break
+            time.sleep(0.5)
+        else:
+            pytest.fail("oversized-drop kfree_skb event at phantun_local_out never appeared")
+    finally:
+        vm.run(f"echo {saved_tracing_on} > {tracing_on_path}", check=False)
+        vm.run(f"echo {saved_enable} > {enable_path}", check=False)
+        vm.run(f"echo > {tracefs}/trace", check=False)
         cleanup_netns_topology(vm)
 
 

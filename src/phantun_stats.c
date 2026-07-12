@@ -110,20 +110,6 @@ void pht_stats_dec(enum pht_stat_id id) {
     atomic64_dec(&pht_stats[id]);
 }
 
-void pht_stats_add(enum pht_stat_id id, u64 delta) {
-    if (id >= PHT_STAT_COUNT || !delta)
-        return;
-
-    atomic64_add(delta, &pht_stats[id]);
-}
-
-u64 pht_stats_read(enum pht_stat_id id) {
-    if (id >= PHT_STAT_COUNT)
-        return 0;
-
-    return atomic64_read(&pht_stats[id]);
-}
-
 int pht_stats_init_sysfs(void) {
     int ret;
 

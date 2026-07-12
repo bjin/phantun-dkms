@@ -11,6 +11,7 @@
 #include <linux/ipv6.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
+#include <linux/string.h>
 #include <linux/tcp.h>
 #include <linux/types.h>
 #include <linux/udp.h>
@@ -48,6 +49,20 @@ struct pht_addr {
         struct in6_addr v6;
     };
 };
+
+static inline bool pht_addr_equal(const struct pht_addr *a, const struct pht_addr *b) {
+    if (!a || !b || a->family != b->family)
+        return false;
+
+    switch (a->family) {
+    case AF_INET:
+        return a->v4 == b->v4;
+    case AF_INET6:
+        return !memcmp(&a->v6, &b->v6, sizeof(a->v6));
+    default:
+        return false;
+    }
+}
 
 struct pht_endpoint_pair {
     struct pht_addr local_addr;

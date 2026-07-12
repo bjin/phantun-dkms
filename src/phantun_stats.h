@@ -43,8 +43,6 @@ enum pht_stat_id {
 void pht_stats_reset(void);
 void pht_stats_inc(enum pht_stat_id id);
 void pht_stats_dec(enum pht_stat_id id);
-void pht_stats_add(enum pht_stat_id id, u64 delta);
-u64 pht_stats_read(enum pht_stat_id id);
 int pht_stats_init_sysfs(void);
 void pht_stats_exit_sysfs(void);
 

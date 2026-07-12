@@ -646,22 +646,6 @@ static bool phantun_local_port_allowed(__be16 port) {
     return false;
 }
 
-static bool phantun_addr_equal(const struct pht_addr *a, const struct pht_addr *b) {
-    if (!a || !b || a->family != b->family)
-        return false;
-
-    switch (a->family) {
-    case AF_INET:
-        return a->v4 == b->v4;
-#if IS_ENABLED(CONFIG_IPV6)
-    case AF_INET6:
-        return ipv6_addr_equal(&a->v6, &b->v6);
-#endif
-    default:
-        return false;
-    }
-}
-
 static bool phantun_remote_peer_allowed(const struct pht_addr *addr, __be16 port) {
     unsigned int i;
 
@@ -669,7 +653,7 @@ static bool phantun_remote_peer_allowed(const struct pht_addr *addr, __be16 port
         return true;
 
     for (i = 0; i < phantun_cfg.managed_remote_peers_count; i++) {
-        if (phantun_addr_equal(&phantun_cfg.managed_remote_peers[i].addr, addr) &&
+        if (pht_addr_equal(&phantun_cfg.managed_remote_peers[i].addr, addr) &&
             phantun_cfg.managed_remote_peers[i].port == port)
             return true;
     }
@@ -1395,7 +1379,13 @@ static int phantun_flush_queued_udp(struct pht_flow *flow, struct net *net, bool
     if (payload_emitted && emitted_payload)
         *emitted_payload = true;
 
-    kfree_skb(queued_skb);
+    /* The payload left the box as fake TCP; freeing the original UDP skb is
+     * consumption, not a drop, so keep it out of drop monitors.
+     */
+    if (payload_emitted)
+        consume_skb(queued_skb);
+    else
+        kfree_skb(queued_skb);
     return 0;
 }
 
@@ -1662,6 +1652,7 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
     bool has_prev_seq = false;
     int ret;
     bool queued;
+    bool payload_emitted = false;
 
     if (!state || !skb)
         return NF_ACCEPT;
@@ -1743,13 +1734,19 @@ retry_lookup:
             }
 
             ret = phantun_send_established_udp(flow, &ep, &view, skb, &tx_meta, state->net, true,
-                                               true, NULL);
+                                               true, &payload_emitted);
             if (ret && ret != -EMSGSIZE) {
                 phantun_account_udp_translation_failure();
                 pht_pr_warn("failed to emit fake-TCP payload for established flow: %d\n", ret);
             }
             pht_flow_put(flow);
-            kfree_skb(skb);
+            /* Freeing the original UDP skb after its payload was emitted as
+             * fake TCP is consumption, not a drop.
+             */
+            if (payload_emitted)
+                consume_skb(skb);
+            else
+                kfree_skb(skb);
             return NF_STOLEN;
         }
 
