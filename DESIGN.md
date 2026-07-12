@@ -425,6 +425,24 @@ translation failures. Terminal routing or structural errors such as unreachable
 routes, unsupported families, access denial, or invalid packet construction
 still tear down the affected generation.
 
+### 7.5 Spoofing posture
+
+Inbound `RST` on a known tuple and inbound aligned bare replacement `SYN` on an
+established tuple are accepted without current-generation sequence-window
+validation; data-path window validation is deliberately absent because payloads
+are UDP.
+
+Consequence: an off-path sender who knows the 4-tuple can tear down or replace
+a generation with one checksum-valid packet. Replacement-protect shields
+established initiator-role flows only; the exact current-opener duplicate `SYN`
+is exempt on responders; an active replacement quarantine incidentally filters
+`RST`s classified into the previous-generation window.
+
+Posture: accepted v1 tradeoff (peers recover by re-handshake). A future
+hardening, if ever needed, is gating the `RST` path on the existing
+current-generation window check (`remote_seq_window_start..ack` /
+`local_seq_window_start..seq`) without touching data-path semantics.
+
 ## 8. Packet path in kernel
 
 ### 8.1 Outbound UDP interception
