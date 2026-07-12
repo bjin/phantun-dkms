@@ -1742,6 +1742,183 @@ def test_delayed_handshake_request_does_not_regress_ack(phantun_module, vm):
         cleanup_netns_topology(vm)
 
 
+def test_ignore_slot_disarms_after_half_space_ack_advance(phantun_module, vm):
+    load_recovery_module(phantun_module, handshake_request=REQ)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+
+    syn_ready_file = f"/tmp/phantun-syn-capture-{uuid.uuid4().hex}"
+    syn_capture = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "capture_tcp_packet",
+        {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+            "payload": "",
+            "ready_file": syn_ready_file,
+            "timeout_sec": 30,
+        },
+    )
+    # Dropping the reserved handshake_request on ingress leaves the responder's
+    # first-payload ignore slot armed at I+1 after the flow is established by
+    # the higher-sequence msg1 packet.
+    drop_request = make_netns_ingress_payload_drop_probe(
+        vm,
+        NS_B,
+        VETH_B,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "src_port": src_port,
+                "dst_addr": NS_ADDR_B,
+                "dst_port": dst_port,
+                "payload": REQ,
+                "comment": "drop_slot_req",
+            }
+        ],
+    )
+    ready_file_1 = f"/tmp/phantun-slot1-{uuid.uuid4().hex}"
+    ready_file_2 = f"/tmp/phantun-slot2-{uuid.uuid4().hex}"
+    server_1 = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_until_timeout",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "timeout_sec": 15,
+            "ready_file": ready_file_1,
+        },
+    )
+
+    try:
+        wait_for_guest_ready_file(vm, syn_ready_file, timeout=30)
+        wait_for_guest_ready_file(vm, ready_file_1, timeout=10)
+
+        # Phase 1: establish the flow while REQ is dropped on ingress. msg1
+        # received by the application proves the responder is ESTABLISHED and
+        # msg1 was reinjected -- only then is forging safe (a forged packet
+        # reaching a still-SYN_RCVD responder would destroy the flow).
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["msg1"],
+            },
+        )
+        assert_completed(client_result, "send msg1")
+
+        syn_result = syn_capture.communicate(timeout=30)
+        assert_completed(syn_result, "capture initiator SYN")
+        syn_data = parse_guest_json(syn_result.stdout, "captured initiator SYN")
+        if (syn_data.get("flags", 0) & 0x02) == 0 or (syn_data.get("flags", 0) & 0x10) != 0:
+            pytest.fail(f"expected bare SYN, got {syn_data!r}")
+        drop_seq = (syn_data["seq"] + 1) & 0xFFFFFFFF
+
+        server_1_result = server_1.communicate(timeout=25)
+        assert_completed(server_1_result, "slot server phase 1")
+        payload_1 = parse_guest_json(server_1_result.stdout, "slot server phase 1")
+        if [entry["message"] for entry in payload_1["received"]] != ["msg1"]:
+            pytest.fail(f"phase 1 delivery mismatch: {payload_1!r}")
+        if payload_1["timed_out"] is not False:
+            pytest.fail(f"phase 1 server timed out: {payload_1!r}")
+
+        # Phase 2: fresh listener before any forging so jumps cannot land in a
+        # listener gap between the two sockets.
+        server_2 = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_until_timeout",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 3,
+                "timeout_sec": 25,
+                "ready_file": ready_file_2,
+            },
+        )
+        wait_for_guest_ready_file(vm, ready_file_2, timeout=10)
+
+        if drop_request.packets(vm, "drop_slot_req") == 0:
+            pytest.fail("reserved handshake_request was never seen/dropped; slot is not armed")
+
+        # Advance the responder's ack in two sub-half-space hops so the final
+        # distance from the armed slot is exactly 2**31 (the disarm boundary).
+        for label, offset in (("jump1", 0x40000000), ("jump2", 0x80000000)):
+            jump_result = run_netns_scenario(
+                vm,
+                NS_A,
+                "send_tcp_packet",
+                {
+                    "bind_addr": NS_ADDR_A,
+                    "bind_port": src_port,
+                    "target_addr": NS_ADDR_B,
+                    "target_port": dst_port,
+                    "flags": "ack",
+                    "seq": (drop_seq + offset - len(label)) & 0xFFFFFFFF,
+                    "ack": 1,
+                    "payload": label,
+                },
+            )
+            assert_completed(jump_result, f"inject {label}")
+
+        mid = read_module_stats(vm)
+        # A payload at the armed sequence itself: with the slot disarmed it
+        # must reach the application instead of being eaten as shaping traffic.
+        # Its payload differs from REQ so the still-installed drop rule does
+        # not match (slot matching is by sequence only).
+        wrapped_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack",
+                "seq": drop_seq,
+                "ack": 1,
+                "payload": "wrapped",
+            },
+        )
+        assert_completed(wrapped_result, "inject wrapped payload")
+
+        server_2_result = server_2.communicate(timeout=35)
+        assert_completed(server_2_result, "slot server phase 2")
+        payload_2 = parse_guest_json(server_2_result.stdout, "slot server phase 2")
+        messages = [entry["message"] for entry in payload_2["received"]]
+        if messages != ["jump1", "jump2", "wrapped"]:
+            pytest.fail(f"expected ['jump1', 'jump2', 'wrapped'], got {messages!r}")
+        if payload_2["timed_out"] is not False:
+            pytest.fail(f"phase 2 server timed out: {payload_2!r}")
+        final_stats = read_module_stats(vm)
+        if final_stats["shaping_payloads_dropped"] != mid["shaping_payloads_dropped"]:
+            pytest.fail(
+                f"wrapped payload was eaten as shaping traffic: "
+                f"{mid['shaping_payloads_dropped']} -> {final_stats['shaping_payloads_dropped']}"
+            )
+    finally:
+        drop_request.cleanup(vm)
+        vm.run(["rm", "-f", syn_ready_file, ready_file_1, ready_file_2], check=False)
+        cleanup_netns_topology(vm)
+
+
 def test_route_change_revalidates_cached_dst_without_rst(phantun_module, vm):
     load_recovery_module(phantun_module)
     ensure_netns_topology(vm)

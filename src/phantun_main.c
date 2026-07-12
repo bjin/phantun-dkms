@@ -1452,6 +1452,18 @@ static void phantun_refresh_inbound_progress(struct pht_flow *flow, const struct
      */
     if (phantun_seq_after_eq(seq_end, flow->ack))
         flow->ack = seq_end;
+    /* Once our ack has advanced at least half the sequence space (2^31) past
+     * the reserved shaping slot, a payload starting at that sequence may be
+     * post-wrap application data rather than the delayed control payload --
+     * the slot identity is ambiguous, so disarm rather than risk eating real
+     * data. An arbitrarily delayed original shaping packet remains possible;
+     * suppressing it beyond the signed half-space is explicitly not promised.
+     */
+    if (flow->drop_next_rx_payload &&
+        flow->ack - flow->drop_next_rx_seq > PHANTUN_SEQ_MAX_SIGNED_WINDOW) {
+        flow->drop_next_rx_payload = false;
+        flow->drop_next_rx_seq = 0;
+    }
     phantun_flow_refresh_remote_seq_window_locked(flow);
     flow->last_activity_jiffies = jiffies;
     flow->last_inbound_jiffies = jiffies;

@@ -57,6 +57,7 @@ Rules:
 - `handshake_request` optionally occupies the initiator's first payload slot.
 - `handshake_response` optionally occupies the responder's first payload slot, but only when `handshake_request` is also configured.
 - The payload to ignore is identified by the **reserved lowest payload sequence number** for that flow generation, **not** by arrival order.
+- The reserved-slot identity is bounded to the signed half-space of the receiver's acknowledged progress: once the receiver's `ack` has advanced **at least 2^31 bytes** past the reserved sequence, the slot is disarmed and a payload starting at that (wrapped) sequence is delivered as normal data. This bounds delayed-shaping suppression; suppression of control payloads delayed beyond half the sequence space is explicitly not promised.
 - Missing, delayed, duplicated, or reordered shaping payloads do **not** fail establishment by themselves.
 - Only payloads intentionally suppressed by shaping logic are hidden from the local UDP socket.
 
