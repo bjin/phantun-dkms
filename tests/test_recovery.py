@@ -1743,7 +1743,18 @@ def test_delayed_handshake_request_does_not_regress_ack(phantun_module, vm):
 
 
 def test_ignore_slot_disarms_after_half_space_ack_advance(phantun_module, vm):
-    load_recovery_module(phantun_module, handshake_request=REQ)
+    # Same shape as load_recovery_module but with a 10s liveness budget: this
+    # test spans several guest round-trips between establishment and the
+    # forged probes, and the 2s recovery deadline can legitimately tear the
+    # flow down during a scheduling stall on slow nested-QEMU runners.
+    phantun_module.load(
+        managed_netns="all",
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        keepalive_interval_sec=1,
+        keepalive_misses=10,
+        handshake_retries=20,
+        handshake_request=REQ,
+    )
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
