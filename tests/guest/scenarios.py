@@ -586,6 +586,109 @@ def tcp_bind_listen(config):
         _emit({"ok": False, "errno": exc.errno, "error": str(exc)})
 
 
+def tcp_timewait_server(config):
+    ready_file = config.get("ready_file")
+    accepted = 0
+    fin_seen_dir = config.get("fin_seen_dir")
+    bound_dir = config.get("bound_dir")
+
+    if fin_seen_dir:
+        Path(fin_seen_dir).mkdir(parents=True, exist_ok=True)
+    if bound_dir:
+        Path(bound_dir).mkdir(parents=True, exist_ok=True)
+
+    with _tcp_listener(config["bind_addr"], config["bind_port"], config["count"]) as listener:
+        listener.settimeout(config.get("timeout_sec", TIMEOUT_SEC))
+        if ready_file:
+            Path(ready_file).write_text("ready\n")
+        try:
+            while accepted < config["count"]:
+                conn, _ = listener.accept()
+                with conn:
+                    peer_port = conn.getpeername()[1]
+                    conn.settimeout(config.get("timeout_sec", TIMEOUT_SEC))
+                    while conn.recv(4096):
+                        pass
+                    if fin_seen_dir:
+                        (Path(fin_seen_dir) / str(peer_port)).write_text("ready\n")
+                    if bound_dir:
+                        _wait_for_file(
+                            str(Path(bound_dir) / str(peer_port)),
+                            config.get("timeout_sec", TIMEOUT_SEC),
+                        )
+                accepted += 1
+        finally:
+            if ready_file:
+                Path(ready_file).unlink(missing_ok=True)
+
+    _emit({"accepted": accepted})
+
+
+def _ipv4_timewait_ports(local_addr, local_ports, remote_addr, remote_port):
+    local_endpoint_prefix = f"{socket.inet_aton(local_addr)[::-1].hex().upper()}:"
+    remote_endpoint = f"{socket.inet_aton(remote_addr)[::-1].hex().upper()}:{remote_port:04X}"
+    expected_ports = set(local_ports)
+    found_ports = set()
+
+    for line in Path("/proc/net/tcp").read_text().splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 4 or fields[3] != "06":
+            continue
+        local_endpoint, peer_endpoint = fields[1:3]
+        if not local_endpoint.startswith(local_endpoint_prefix) or peer_endpoint != remote_endpoint:
+            continue
+        port = int(local_endpoint.rsplit(":", 1)[1], 16)
+        if port in expected_ports:
+            found_ports.add(port)
+
+    return found_ports
+
+
+def tcp_timewait_client(config):
+    local_ports = [int(port) for port in config["bind_ports"]]
+    timeout_sec = config.get("timeout_sec", TIMEOUT_SEC)
+    bind_after_shutdown_device = config.get("bind_after_shutdown_device")
+    fin_seen_dir = config.get("fin_seen_dir")
+    bound_dir = config.get("bound_dir")
+
+    for local_port in local_ports:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout_sec)
+            sock.bind((config["bind_addr"], local_port))
+            sock.connect((config["target_addr"], config["target_port"]))
+            sock.sendall(b"x")
+            sock.shutdown(socket.SHUT_WR)
+            if fin_seen_dir:
+                _wait_for_file(str(Path(fin_seen_dir) / str(local_port)), timeout_sec)
+            if bind_after_shutdown_device:
+                sock.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_BINDTODEVICE,
+                    bind_after_shutdown_device.encode() + b"\0",
+                )
+            if bound_dir:
+                (Path(bound_dir) / str(local_port)).write_text("bound\n")
+            while sock.recv(4096):
+                pass
+
+    deadline = time.time() + timeout_sec
+    found_ports = set()
+    while time.time() < deadline:
+        found_ports = _ipv4_timewait_ports(
+            config["bind_addr"],
+            local_ports,
+            config["target_addr"],
+            config["target_port"],
+        )
+        if found_ports == set(local_ports):
+            _emit({"timewait_ports": sorted(found_ports)})
+            return
+        time.sleep(0.05)
+
+    missing_ports = sorted(set(local_ports) - found_ports)
+    raise TimeoutError(f"ports did not enter TIME_WAIT: {missing_ports}")
+
+
 def _checksum(data):
     if len(data) % 2:
         data += b"\x00"
@@ -828,6 +931,20 @@ def send_tcp_packet(config):
     _emit({"done": True})
 
 
+def send_tcp_packets(config):
+    packets = config["packets"]
+    delay_sec = config.get("delay_ms", 0) / 1000.0
+
+    with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW) as raw_sock:
+        raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        for index, packet in enumerate(packets):
+            raw_sock.sendto(_build_ipv4_tcp_packet(packet), (packet["target_addr"], 0))
+            if delay_sec and index + 1 < len(packets):
+                time.sleep(delay_sec)
+
+    _emit({"sent": len(packets)})
+
+
 def send_ipv4_udp_fragments(config):
     src_addr = config["bind_addr"]
     dst_addr = config["target_addr"]
@@ -1067,7 +1184,10 @@ SCENARIOS = {
     "simultaneous_exchange": simultaneous_exchange,
     "hold_tcp_listener": hold_tcp_listener,
     "tcp_bind_listen": tcp_bind_listen,
+    "tcp_timewait_server": tcp_timewait_server,
+    "tcp_timewait_client": tcp_timewait_client,
     "send_tcp_packet": send_tcp_packet,
+    "send_tcp_packets": send_tcp_packets,
     "configure_ipv4_aliases": configure_ipv4_aliases,
     "churn_retired_records": churn_retired_records,
     "send_ipv4_udp_fragments": send_ipv4_udp_fragments,

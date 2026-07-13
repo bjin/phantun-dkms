@@ -22,6 +22,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
+#include <net/inet_sock.h>
 #include <net/netfilter/ipv4/nf_defrag_ipv4.h>
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_core.h>
@@ -727,8 +728,13 @@ static void phantun_tx_meta_from_view(const struct sk_buff *skb, const struct ph
     meta->mark = skb->mark;
     meta->priority = skb->priority;
 
-    sk = skb->sk;
-    if (sk) {
+    /*
+     * TCP control skbs may carry a TIME_WAIT or request socket. Normalize
+     * that owner before reading full-socket fields: a TIME_WAIT socket has
+     * only the sock_common prefix, so sk_uid would otherwise be out of bounds.
+     */
+    sk = skb_to_full_sk(skb);
+    if (sk && sk_fullsock(sk)) {
         meta->uid = sk->sk_uid;
         if (use_oif && sk->sk_bound_dev_if > 0)
             meta->oif = sk->sk_bound_dev_if;

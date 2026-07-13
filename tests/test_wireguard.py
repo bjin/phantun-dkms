@@ -1,6 +1,7 @@
 import re
 import shlex
 import time
+import uuid
 
 import pytest
 
@@ -10,13 +11,20 @@ from helpers import (
     NS_ADDR_B,
     NS_B,
     VETH_B,
+    NetnsNftProbe,
+    assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
     make_netns_output_probe,
     make_netns_tcp_payload_probe,
+    parse_guest_json,
     probe_comment,
     require_guest_command,
+    read_module_stat,
     run_in_netns,
+    run_netns_scenario,
+    spawn_netns_scenario,
+    wait_for_guest_ready_file,
 )
 
 WG_ADDR_A = "10.10.0.1/24"
@@ -29,6 +37,8 @@ MANAGED_LOCAL_PORTS = "2222,3333"
 REQ = "WGREQ42"
 RESP = "WGRESP42"
 NS_ADDR_B_ROAM = "10.200.0.22"
+TIMEWAIT_SERVER_PORT = 40404
+TIMEWAIT_CLIENT_PORTS = tuple(range(45000, 45008))
 
 
 def load_wireguard_module(phantun_module, **kwargs):
@@ -42,6 +52,32 @@ def require_wireguard_stack(vm):
         pytest.skip("ping is not available in the guest")
     if vm.run(["modprobe", "wireguard"], check=False).returncode != 0:
         pytest.skip("wireguard kernel module is not available in the guest")
+
+
+def require_timewait_skb_owner(vm):
+    match = re.match(r"^(\d+)\.(\d+)", vm.kernel_ver)
+    if not match or tuple(map(int, match.groups())) < (6, 13):
+        pytest.skip("Linux before 6.13 does not attach TIME_WAIT sockets to TCP control skbs")
+
+
+def make_timewait_ack_probe(vm):
+    table_name = f"phantun_tw_ack_{uuid.uuid4().hex[:8]}"
+    comment = "timewait_ack"
+    first_port = TIMEWAIT_CLIENT_PORTS[0]
+    last_port = TIMEWAIT_CLIENT_PORTS[-1]
+    lines = [
+        f"nft delete table inet {table_name} >/dev/null 2>&1 || true",
+        f"nft add table inet {table_name}",
+        f"nft 'add chain inet {table_name} input {{ type filter hook input priority 0; policy accept; }}'",
+        (
+            f"nft 'add rule inet {table_name} input "
+            f'iifname "wg0" ip saddr {WG_PEER_A} ip daddr {WG_PEER_B} '
+            f"tcp sport {first_port}-{last_port} tcp dport {TIMEWAIT_SERVER_PORT} "
+            f'tcp flags & (fin|syn|rst|ack) == ack counter accept comment "{comment}"\''
+        ),
+    ]
+    run_in_netns(vm, NS_B, "\n".join(lines))
+    return NetnsNftProbe(NS_B, "inet", table_name, "input"), comment
 
 
 def guest_keypair(vm):
@@ -105,7 +141,7 @@ def sum_probe_packets(vm, probe, prefix, channels):
     return sum(probe.packets(vm, probe_comment(prefix, *channel)) for channel in channels)
 
 
-def setup_wireguard_pair(vm, endpoint_a=NS_ADDR_A, endpoint_b=NS_ADDR_B):
+def setup_wireguard_pair(vm, endpoint_a=NS_ADDR_A, endpoint_b=NS_ADDR_B, persistent_keepalive=1):
     priv_a, pub_a = guest_keypair(vm)
     priv_b, pub_b = guest_keypair(vm)
     key_a_path = "/tmp/wg-a.key"
@@ -137,7 +173,7 @@ def setup_wireguard_pair(vm, endpoint_a=NS_ADDR_A, endpoint_b=NS_ADDR_B):
             "endpoint",
             f"{endpoint_b}:{PORT_B}",
             "persistent-keepalive",
-            "1",
+            str(persistent_keepalive),
         ],
     )
     run_in_netns(
@@ -158,7 +194,7 @@ def setup_wireguard_pair(vm, endpoint_a=NS_ADDR_A, endpoint_b=NS_ADDR_B):
             "endpoint",
             f"{endpoint_a}:{PORT_A}",
             "persistent-keepalive",
-            "1",
+            str(persistent_keepalive),
         ],
     )
     run_in_netns(vm, NS_A, ["ip", "link", "set", "wg0", "up"])
@@ -286,6 +322,133 @@ def test_kernel_wireguard_over_phantun_translates_underlay(
             payload_probe_b.cleanup(vm)
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_kernel_wireguard_timewait_ack_uses_safe_socket_metadata(phantun_module, vm):
+    require_wireguard_stack(vm)
+    require_timewait_skb_owner(vm)
+    if not require_guest_command(vm, "nft"):
+        pytest.skip("nft is not available in the guest")
+
+    load_wireguard_module(phantun_module, handshake_timeout_ms=200, handshake_retries=1)
+    ensure_netns_topology(vm)
+
+    server_ready = f"/tmp/phantun-wg-timewait-server-{uuid.uuid4().hex}"
+    fin_seen_dir = f"/tmp/phantun-wg-timewait-fin-{uuid.uuid4().hex}"
+    bound_dir = f"/tmp/phantun-wg-timewait-bound-{uuid.uuid4().hex}"
+    key_a_path = "/tmp/wg-a.key"
+    key_b_path = "/tmp/wg-b.key"
+    server = None
+    ack_probe = None
+
+    try:
+        key_a_path, key_b_path = setup_wireguard_pair(vm, persistent_keepalive=0)
+        ping_wireguard_peer(vm, NS_A, WG_PEER_B, "TIME_WAIT setup ping")
+        assert_wireguard_peer_state(vm, NS_ADDR_A, NS_ADDR_B)
+
+        server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "tcp_timewait_server",
+            {
+                "bind_addr": WG_PEER_B,
+                "bind_port": TIMEWAIT_SERVER_PORT,
+                "count": len(TIMEWAIT_CLIENT_PORTS),
+                "ready_file": server_ready,
+                "fin_seen_dir": fin_seen_dir,
+                "bound_dir": bound_dir,
+                "timeout_sec": 30,
+            },
+        )
+        wait_for_guest_ready_file(vm, server_ready, timeout=10)
+
+        # Wait until the unbound FIN reaches the peer, then bind the live
+        # socket before the peer closes it. The barrier makes the resulting
+        # TIME_WAIT owner carry wg0 without changing the setup traffic.
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "tcp_timewait_client",
+            {
+                "bind_addr": WG_PEER_A,
+                "bind_ports": TIMEWAIT_CLIENT_PORTS,
+                "bind_after_shutdown_device": "wg0",
+                "fin_seen_dir": fin_seen_dir,
+                "bound_dir": bound_dir,
+                "target_addr": WG_PEER_B,
+                "target_port": TIMEWAIT_SERVER_PORT,
+                "timeout_sec": 30,
+            },
+            timeout=60,
+        )
+        assert_completed(client_result, "WireGuard TIME_WAIT client")
+        client_data = parse_guest_json(client_result.stdout, "WireGuard TIME_WAIT client stdout")
+        if tuple(client_data.get("timewait_ports", ())) != TIMEWAIT_CLIENT_PORTS:
+            pytest.fail(f"not all client sockets entered TIME_WAIT: {client_data!r}")
+
+        server_result = server.communicate(timeout=60)
+        assert_completed(server_result, "WireGuard TIME_WAIT server")
+        server = None
+
+        # An unfixed module may already have broken the close ACK's underlay
+        # route. Recover it before measuring the independent TIME_WAIT-only
+        # input phase.
+        ping_wireguard_peer(vm, NS_A, WG_PEER_B, "TIME_WAIT underlay recovery")
+        ack_probe, ack_comment = make_timewait_ack_probe(vm)
+        acks_before = ack_probe.packets(vm, ack_comment)
+        failures_before = read_module_stat(vm, "udp_translation_failed_dropped")
+
+        # Data avoids the per-TIME_WAIT pure-ACK rate limiter, while spacing
+        # keeps each inner control packet as a distinct WireGuard datagram.
+        inject_result = run_netns_scenario(
+            vm,
+            NS_B,
+            "send_tcp_packets",
+            {
+                "packets": [
+                    {
+                        "bind_addr": WG_PEER_B,
+                        "bind_port": TIMEWAIT_SERVER_PORT,
+                        "target_addr": WG_PEER_A,
+                        "target_port": client_port,
+                        "flags": "ack",
+                        "seq": 0,
+                        "ack": 0,
+                        "payload": "x",
+                    }
+                    for client_port in TIMEWAIT_CLIENT_PORTS
+                ],
+                "delay_ms": 100,
+            },
+            timeout=30,
+        )
+        assert_completed(inject_result, "stale TIME_WAIT packet injector")
+
+        expected_acks = len(TIMEWAIT_CLIENT_PORTS)
+        deadline = time.time() + 10
+        while True:
+            acks_after = ack_probe.packets(vm, ack_comment)
+            delivered = acks_after - acks_before
+            failures_after = read_module_stat(vm, "udp_translation_failed_dropped")
+            if delivered >= expected_acks or failures_after != failures_before or time.time() >= deadline:
+                break
+            time.sleep(0.1)
+
+        if delivered < expected_acks or failures_after != failures_before:
+            pytest.fail(
+                "TIME_WAIT ACKs did not preserve safe default routing metadata: "
+                f"delivered={delivered} expected_at_least={expected_acks} "
+                f"translation_failures={failures_before}->{failures_after}"
+            )
+    finally:
+        if server is not None:
+            server.terminate()
+        run_in_netns(vm, NS_A, ["ip", "link", "del", "wg0"], check=False)
+        run_in_netns(vm, NS_B, ["ip", "link", "del", "wg0"], check=False)
+        vm.run(["rm", "-rf", key_a_path, key_b_path, server_ready, fin_seen_dir, bound_dir], check=False)
+        if ack_probe is not None:
+            ack_probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 
