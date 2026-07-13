@@ -218,10 +218,28 @@ def _find_tracefs_root(vm):
     return None
 
 
-def test_translated_udp_does_not_hit_kfree_skb_tracepoint(phantun_module, vm):
+@pytest.fixture(scope="session")
+def symbolic_kfree_skb_tracefs(vm):
     tracefs = _find_tracefs_root(vm)
     if tracefs is None:
         pytest.skip("skb:kfree_skb tracepoint unavailable")
+
+    event_format = vm.run(["cat", f"{tracefs}/events/skb/kfree_skb/format"]).stdout
+    # A stack can include the hook as an ancestor of a later unrelated free.
+    # Only a symbolized event location identifies the freeing call site.
+    if "location=%pS" not in event_format:
+        pytest.skip("skb:kfree_skb does not render call-site symbols")
+    return tracefs
+
+
+@pytest.fixture(scope="session")
+def symbolic_kfree_skb_module(symbolic_kfree_skb_tracefs, request):
+    # Bind this wrapper to the VM-parametrized capability check.
+    return symbolic_kfree_skb_tracefs, request.getfixturevalue("phantun_module")
+
+
+def test_translated_udp_does_not_hit_kfree_skb_tracepoint(symbolic_kfree_skb_module, vm):
+    tracefs, phantun_module = symbolic_kfree_skb_module
 
     phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
     ensure_netns_topology(vm)
