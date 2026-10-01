@@ -1638,62 +1638,243 @@ static unsigned int phantun_local_out_segment_gso(void *priv, struct sk_buff *sk
     return NF_STOLEN;
 }
 
+/* Per-packet LOCAL_OUT translation input. @view borrows the owned UDP skb's
+ * headers; @tx_meta is that skb's transmit policy, used for the fake-TCP
+ * packets it produces and persisted as the flow's local_tx_meta.
+ */
+struct phantun_local_out_ctx {
+    struct net *net;
+    struct pht_flow_table *flows;
+    struct pht_l4_view view;
+    struct pht_endpoint_pair ep;
+    struct pht_tx_meta tx_meta;
+};
+
+/* Hand @skb to the live generation @flow according to the caller's locked
+ * snapshot of its state. Always consumes @skb.
+ */
+static void phantun_local_out_live_flow(const struct phantun_local_out_ctx *ctx,
+                                        struct pht_flow *flow, struct sk_buff *skb,
+                                        enum pht_flow_state state_now, bool hold_responder_data) {
+    bool payload_emitted = false;
+    bool queued;
+    int ret;
+
+    if (state_now == PHT_FLOW_STATE_ESTABLISHED && !hold_responder_data) {
+        ret = phantun_send_established_udp(flow, &ctx->ep, &ctx->view, skb, &ctx->tx_meta, ctx->net,
+                                           true, true, &payload_emitted);
+        if (ret && ret != -EMSGSIZE) {
+            phantun_account_udp_translation_failure();
+            pht_pr_warn("failed to emit fake-TCP payload for established flow: %d\n", ret);
+        }
+        /* Freeing the original UDP skb after its payload was emitted as
+         * fake TCP is consumption, not a drop.
+         */
+        if (payload_emitted)
+            consume_skb(skb);
+        else
+            kfree_skb(skb);
+        return;
+    }
+
+    if (state_now != PHT_FLOW_STATE_ESTABLISHED && !pht_flow_state_is_half_open(state_now)) {
+        kfree_skb(skb);
+        return;
+    }
+
+    /* Half-open flows hold one datagram until the handshake completes. So
+     * does an ESTABLISHED responder while its injected handshake_response
+     * still needs peer acknowledgement or later initiator data to prove the
+     * reserved control slot was skipped.
+     */
+    queued = pht_flow_queue_skb_if_empty(flow, skb, &ctx->tx_meta);
+    if (!queued)
+        kfree_skb(skb);
+    phantun_account_udp_queue_result(queued);
+}
+
+/* Open a SYN_SENT initiator generation whose one-skb queue carries @skb until
+ * the handshake completes. @dead_flow, when set, is the hashed DEAD tombstone
+ * to replace atomically; it stays owned by the caller. When @has_prev_seq, the
+ * new ISN keeps reopen_guard_bytes away from @prev_seq.
+ *
+ * Returns @skb, still owned by the caller, when another CPU published the
+ * tuple first; otherwise consumes @skb and returns NULL.
+ */
+static struct sk_buff *phantun_local_out_open_initiator(const struct phantun_local_out_ctx *ctx,
+                                                        struct sk_buff *skb,
+                                                        struct pht_flow *dead_flow, u32 prev_seq,
+                                                        bool has_prev_seq) {
+    struct pht_flow *new_flow;
+    u32 init_seq;
+    int ifindex;
+    int ret;
+
+    new_flow =
+        pht_flow_create(ctx->flows, &ctx->ep, PHT_FLOW_ROLE_INITIATOR, PHT_FLOW_STATE_SYN_SENT);
+    if (IS_ERR(new_flow)) {
+        phantun_account_udp_translation_failure();
+        pht_pr_warn("failed to create initiator flow: %ld\n", PTR_ERR(new_flow));
+        kfree_skb(skb);
+        return NULL;
+    }
+
+    if (!phantun_pick_reopen_isn(prev_seq, has_prev_seq, &init_seq)) {
+        phantun_account_udp_translation_failure();
+        pht_pr_warn("failed to choose reopen ISN for new flow\n");
+        pht_flow_put(new_flow);
+        kfree_skb(skb);
+        return NULL;
+    }
+
+    spin_lock_bh(&new_flow->lock);
+    new_flow->seq = init_seq;
+    new_flow->ack = 0;
+    new_flow->local_isn = init_seq;
+    new_flow->peer_syn_next = 0;
+    new_flow->local_seq_window_start = new_flow->local_isn;
+    new_flow->remote_seq_window_start = new_flow->peer_syn_next;
+    new_flow->local_tx_meta = ctx->tx_meta;
+    spin_unlock_bh(&new_flow->lock);
+    pht_flow_set_queued_skb(new_flow, skb, &ctx->tx_meta);
+
+    if (dead_flow)
+        ret = pht_flow_replace_dead(ctx->flows, dead_flow, new_flow);
+    else
+        ret = pht_flow_insert(ctx->flows, new_flow);
+    /* Another CPU won the canonical-tuple race. Reuse its flow instead of
+     * creating a parallel generation. new_flow was never published, so its
+     * queue still holds @skb.
+     */
+    if (ret == -EEXIST || (dead_flow && ret == -EAGAIN)) {
+        skb = pht_flow_take_queued_skb(new_flow, NULL);
+        pht_flow_put(new_flow);
+        return skb;
+    }
+    if (ret) {
+        /* -ENOSPC is half-open admission pressure, not a translation failure. */
+        if (ret == -ENOSPC)
+            pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+        else
+            phantun_account_udp_translation_failure();
+        pht_pr_warn("failed to insert initiator flow: %d\n", ret);
+        /* Freeing the unpublished flow also frees @skb from its queue. */
+        pht_flow_put(new_flow);
+        return NULL;
+    }
+    pht_stats_inc(PHT_STAT_UDP_PACKETS_QUEUED);
+
+    ret = pht_emit_fake_tcp(ctx->net, &ctx->ep, init_seq, 0, PHT_TCP_FLAG_SYN, NULL, 0,
+                            &ctx->tx_meta, &ifindex);
+    if (!ret) {
+        pht_flow_set_egress_ifindex(new_flow, ifindex);
+    } else {
+        pht_pr_warn("failed to emit fake-TCP SYN: %d\n", ret);
+        /* Transient local drops leave the SYN to the handshake retransmit timer. */
+        if (!phantun_io_error_is_transient(ret)) {
+            phantun_account_udp_translation_failure();
+            pht_flow_detach(new_flow);
+        }
+    }
+    pht_flow_put(new_flow);
+    return NULL;
+}
+
+/* Hand one owned UDP datagram to the generation published on its tuple, or
+ * publish a new initiator generation for it. Always consumes @skb.
+ */
+static void phantun_local_out_dispatch(const struct phantun_local_out_ctx *ctx,
+                                       struct sk_buff *skb) {
+    enum pht_flow_state state_now;
+    struct pht_flow *dead_flow;
+    struct pht_flow *flow;
+    bool hold_responder_data;
+    bool has_prev_seq = false;
+    u32 prev_seq = 0;
+
+    /* Losing the publish race hands @skb back; look the tuple up again so it
+     * joins the winning generation.
+     */
+    do {
+        dead_flow = NULL;
+        flow = pht_flow_lookup(ctx->flows, &ctx->ep);
+        if (flow) {
+            spin_lock_bh(&flow->lock);
+            state_now = flow->state;
+            hold_responder_data =
+                flow->role == PHT_FLOW_ROLE_RESPONDER && flow->response_pending_ack;
+            if (state_now == PHT_FLOW_STATE_DEAD)
+                prev_seq = flow->seq;
+            spin_unlock_bh(&flow->lock);
+
+            if (state_now != PHT_FLOW_STATE_DEAD) {
+                phantun_local_out_live_flow(ctx, flow, skb, state_now, hold_responder_data);
+                pht_flow_put(flow);
+                return;
+            }
+
+            /* A hashed DEAD flow is only the allocation-failure tombstone
+             * from terminal teardown. Keep it visible until the guarded
+             * replacement is published, so competing openers always see a
+             * previous-generation sequence source or the new live flow.
+             */
+            has_prev_seq = true;
+            dead_flow = flow;
+        } else if (!has_prev_seq) {
+            has_prev_seq = pht_flow_lookup_retired_seq(ctx->flows, &ctx->ep, &prev_seq);
+        }
+
+        skb = phantun_local_out_open_initiator(ctx, skb, dead_flow, prev_seq, has_prev_seq);
+        pht_flow_put(dead_flow);
+    } while (skb);
+}
+
 /* LOCAL_OUT owns selector-matched outbound UDP. ESTABLISHED flows send
  * immediately, half-open flows keep only one queued skb, and DEAD flows are
  * reopened from scratch with a guarded ISN.
  */
 static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
                                       const struct nf_hook_state *state) {
-    struct pht_l4_view view;
-    struct pht_endpoint_pair ep;
+    struct phantun_local_out_ctx ctx;
     struct pht_addr remote_addr;
-    struct pht_tx_meta tx_meta;
-    struct pht_flow_table *flows;
-    struct pht_flow *flow;
-    struct pht_flow *new_flow;
-    struct pht_flow *dead_flow = NULL;
-    enum pht_flow_state state_now;
-    u32 init_seq;
-    u32 prev_seq = 0;
-    bool has_prev_seq = false;
+    unsigned int verdict;
     int ret;
-    bool queued;
-    bool payload_emitted = false;
 
     if (!state || !skb)
         return NF_ACCEPT;
 
-    flows = phantun_net_hook_flows(state->net);
-    if (!flows)
+    ctx.flows = phantun_net_hook_flows(state->net);
+    if (!ctx.flows)
         return NF_ACCEPT;
 
-    ret = phantun_parse_udp_skb(skb, &view);
+    ret = phantun_parse_udp_skb(skb, &ctx.view);
     if (ret)
         return NF_ACCEPT;
-    if (!phantun_family_enabled(view.family))
+    if (!phantun_family_enabled(ctx.view.family))
         return NF_ACCEPT;
 
     if (phantun_local_out_uses_loopback_dev(skb, state))
         return NF_ACCEPT;
 
-    phantun_view_remote_addr(&view, false, &remote_addr);
-    if (!phantun_selectors_allow(view.udp->source, &remote_addr, view.udp->dest))
+    phantun_view_remote_addr(&ctx.view, false, &remote_addr);
+    if (!phantun_selectors_allow(ctx.view.udp->source, &remote_addr, ctx.view.udp->dest))
         return NF_ACCEPT;
 
-    phantun_fill_udp_endpoint_pair(&view, &ep);
-    phantun_fill_endpoint_scope_ifindex(&ep, state->out ? state->out : skb->dev);
-    phantun_tx_meta_from_view(skb, &view, true, &tx_meta);
-    if (phantun_endpoint_uses_unsupported_addr(&ep)) {
+    ctx.net = state->net;
+    phantun_fill_udp_endpoint_pair(&ctx.view, &ctx.ep);
+    phantun_fill_endpoint_scope_ifindex(&ctx.ep, state->out ? state->out : skb->dev);
+    phantun_tx_meta_from_view(skb, &ctx.view, true, &ctx.tx_meta);
+    if (phantun_endpoint_uses_unsupported_addr(&ctx.ep)) {
         pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
         pht_pr_warn_rl("rejecting outbound UDP with unsupported endpoint address\n");
         return NF_DROP;
     }
 
-    ret = phantun_local_out_segment_gso(priv, skb, state);
-    if (ret != NF_ACCEPT)
-        return ret;
+    verdict = phantun_local_out_segment_gso(priv, skb, state);
+    if (verdict != NF_ACCEPT)
+        return verdict;
 
-    if (!view.payload_len) {
+    if (!ctx.view.payload_len) {
         /* Zero-payload fake-TCP ACKs are control/liveness frames, so the
          * current wire protocol has no lossless representation for an empty
          * UDP datagram.
@@ -1711,167 +1892,7 @@ static unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
         return NF_STOLEN;
     }
 
-retry_lookup:
-    flow = pht_flow_lookup(flows, &ep);
-    if (flow) {
-        spin_lock_bh(&flow->lock);
-        state_now = flow->state;
-        spin_unlock_bh(&flow->lock);
-
-        if (state_now == PHT_FLOW_STATE_ESTABLISHED) {
-            bool hold_responder_data;
-
-            spin_lock_bh(&flow->lock);
-            hold_responder_data =
-                flow->role == PHT_FLOW_ROLE_RESPONDER && flow->response_pending_ack;
-            spin_unlock_bh(&flow->lock);
-            /* Responder-owned UDP must wait while an injected
-             * handshake_response still needs peer acknowledgement or later
-             * initiator data to prove the reserved control slot was
-             * skipped.
-             */
-            if (hold_responder_data) {
-                queued = pht_flow_queue_skb_if_empty(flow, skb, &tx_meta);
-                if (!queued)
-                    kfree_skb(skb);
-                phantun_account_udp_queue_result(queued);
-                pht_flow_put(flow);
-                return NF_STOLEN;
-            }
-
-            ret = phantun_send_established_udp(flow, &ep, &view, skb, &tx_meta, state->net, true,
-                                               true, &payload_emitted);
-            if (ret && ret != -EMSGSIZE) {
-                phantun_account_udp_translation_failure();
-                pht_pr_warn("failed to emit fake-TCP payload for established flow: %d\n", ret);
-            }
-            pht_flow_put(flow);
-            /* Freeing the original UDP skb after its payload was emitted as
-             * fake TCP is consumption, not a drop.
-             */
-            if (payload_emitted)
-                consume_skb(skb);
-            else
-                kfree_skb(skb);
-            return NF_STOLEN;
-        }
-
-        if (pht_flow_state_is_half_open(state_now)) {
-            queued = pht_flow_queue_skb_if_empty(flow, skb, &tx_meta);
-            if (!queued)
-                kfree_skb(skb);
-            phantun_account_udp_queue_result(queued);
-            pht_flow_put(flow);
-            return NF_STOLEN;
-        }
-
-        /* A hashed DEAD flow is only the allocation-failure tombstone from
-         * terminal teardown. Keep it visible until the guarded replacement is
-         * published, so competing openers always see a previous-generation
-         * sequence source or the new live flow.
-         */
-        if (state_now == PHT_FLOW_STATE_DEAD) {
-            spin_lock_bh(&flow->lock);
-            prev_seq = flow->seq;
-            spin_unlock_bh(&flow->lock);
-            has_prev_seq = true;
-            dead_flow = flow;
-            goto create_initiator;
-        }
-
-        pht_flow_put(flow);
-        kfree_skb(skb);
-        return NF_STOLEN;
-    }
-
-    if (!has_prev_seq)
-        has_prev_seq = pht_flow_lookup_retired_seq(flows, &ep, &prev_seq);
-
-create_initiator:
-    new_flow = pht_flow_create(flows, &ep, PHT_FLOW_ROLE_INITIATOR, PHT_FLOW_STATE_SYN_SENT);
-    if (IS_ERR(new_flow)) {
-        phantun_account_udp_translation_failure();
-        pht_pr_warn("failed to create initiator flow: %ld\n", PTR_ERR(new_flow));
-        kfree_skb(skb);
-        if (dead_flow)
-            pht_flow_put(dead_flow);
-        return NF_STOLEN;
-    }
-
-    if (!phantun_pick_reopen_isn(prev_seq, has_prev_seq, &init_seq)) {
-        phantun_account_udp_translation_failure();
-        pht_pr_warn("failed to choose reopen ISN for new flow\n");
-        pht_flow_put(new_flow);
-        if (dead_flow)
-            pht_flow_put(dead_flow);
-        kfree_skb(skb);
-        return NF_STOLEN;
-    }
-
-    spin_lock_bh(&new_flow->lock);
-    new_flow->seq = init_seq;
-    new_flow->ack = 0;
-    new_flow->local_isn = init_seq;
-    new_flow->peer_syn_next = 0;
-    new_flow->local_seq_window_start = new_flow->local_isn;
-    new_flow->remote_seq_window_start = new_flow->peer_syn_next;
-    new_flow->local_tx_meta = tx_meta;
-    spin_unlock_bh(&new_flow->lock);
-    pht_flow_set_queued_skb(new_flow, skb, &tx_meta);
-
-    if (dead_flow)
-        ret = pht_flow_replace_dead(flows, dead_flow, new_flow);
-    else
-        ret = pht_flow_insert(flows, new_flow);
-    /* Another CPU won the canonical-tuple race. Reuse its flow instead of
-     * creating a parallel generation.
-     */
-    if (ret == -EEXIST || (dead_flow && ret == -EAGAIN)) {
-        skb = pht_flow_take_queued_skb(new_flow, NULL);
-        pht_flow_put(new_flow);
-        if (dead_flow) {
-            pht_flow_put(dead_flow);
-            dead_flow = NULL;
-        }
-        goto retry_lookup;
-    }
-    if (ret) {
-        if (ret == -ENOSPC)
-            pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
-        else
-            phantun_account_udp_translation_failure();
-        pht_pr_warn("failed to insert initiator flow: %d\n", ret);
-        pht_flow_put(new_flow);
-        if (dead_flow)
-            pht_flow_put(dead_flow);
-        return NF_STOLEN;
-    }
-    pht_stats_inc(PHT_STAT_UDP_PACKETS_QUEUED);
-
-    {
-        int ifindex;
-
-        ret = pht_emit_fake_tcp(state->net, &ep, init_seq, 0, PHT_TCP_FLAG_SYN, NULL, 0, &tx_meta,
-                                &ifindex);
-        if (!ret)
-            pht_flow_set_egress_ifindex(new_flow, ifindex);
-    }
-    if (ret) {
-        pht_pr_warn("failed to emit fake-TCP SYN: %d\n", ret);
-        if (!phantun_io_error_is_transient(ret)) {
-            phantun_account_udp_translation_failure();
-            pht_flow_detach(new_flow);
-            pht_flow_put(new_flow);
-            if (dead_flow)
-                pht_flow_put(dead_flow);
-            return NF_STOLEN;
-        }
-    }
-
-    pht_flow_put(new_flow);
-    if (dead_flow)
-        pht_flow_put(dead_flow);
-
+    phantun_local_out_dispatch(&ctx, skb);
     return NF_STOLEN;
 }
 
@@ -1978,39 +1999,655 @@ static unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb
     return NF_STOLEN;
 }
 
+/* Per-packet PRE_ROUTING input shared by the fake-TCP handlers. @skb and
+ * @view borrow the hooked packet; @tx_meta is reply-scoped metadata for
+ * packets answering it directly and must not be persisted in a flow. Every
+ * packet that reaches the handlers ends in NF_DROP, so they only produce side
+ * effects.
+ */
+struct phantun_pre_routing_ctx {
+    struct net *net;
+    struct net_device *in_dev;
+    struct pht_flow_table *flows;
+    const struct sk_buff *skb;
+    struct pht_l4_view view;
+    struct pht_endpoint_pair ep;
+    struct pht_tx_meta tx_meta;
+};
+
+/* Flow fields sampled once under flow->lock to classify a packet. Handlers
+ * that change protocol state revalidate it under the lock, e.g. through
+ * pht_flow_complete_handshake().
+ */
+struct phantun_pre_routing_snapshot {
+    enum pht_flow_state state;
+    enum pht_flow_role role;
+    u32 local_isn;
+    u32 peer_syn_next;
+    bool had_queued;
+};
+
+/* Sequence windows of an ESTABLISHED generation displaced by a replacement
+ * bare SYN; the new generation quarantines them.
+ */
+struct phantun_prev_generation {
+    u32 local_seq_start;
+    u32 local_seq_end;
+    u32 remote_seq_start;
+    u32 remote_seq_end;
+};
+
+static void phantun_pre_routing_send_rstack(const struct phantun_pre_routing_ctx *ctx,
+                                            const char *what) {
+    int ret = phantun_send_rstack(ctx->net, &ctx->ep, &ctx->view, &ctx->tx_meta);
+
+    if (ret)
+        pht_pr_warn_rl("failed to emit RST|ACK for %s: %d\n", what, ret);
+}
+
+/* Flush the flow's queued local UDP datagram. On failure, drop anything queued
+ * since the flush took its skb and end the generation; returns false then.
+ */
+static bool phantun_pre_routing_flush_queue(const struct phantun_pre_routing_ctx *ctx,
+                                            struct pht_flow *flow) {
+    int ret = phantun_flush_queued_udp(flow, ctx->net, NULL);
+
+    if (!ret)
+        return true;
+
+    phantun_discard_queued_udp_translation_failure(flow);
+    pht_pr_warn("failed to flush responder queue: %d\n", ret);
+    pht_flow_remove(flow);
+    return false;
+}
+
+/* Finish an inbound segment on an ESTABLISHED flow: advance ACK state,
+ * reinject its payload as local UDP when @reinject, flush queued UDP, and ACK.
+ * Any failure ends the generation; oversized payload is a protocol violation
+ * and is answered with RST|ACK first. @what names the segment in the log.
+ */
+static void phantun_pre_routing_deliver(const struct phantun_pre_routing_ctx *ctx,
+                                        struct pht_flow *flow, bool reinject, const char *what) {
+    int ret;
+
+    ret = phantun_finalize_established_rx(flow, &ctx->ep, ctx->skb, &ctx->view, ctx->net,
+                                          ctx->in_dev, reinject, true, &ctx->tx_meta);
+    if (!ret)
+        return;
+
+    pht_pr_warn("failed to process %s: %d\n", what, ret);
+    if (ret == -EMSGSIZE) {
+        phantun_account_tcp_protocol_rejected();
+        phantun_send_rstack(ctx->net, &ctx->ep, &ctx->view, &ctx->tx_meta);
+    }
+    pht_flow_remove(flow);
+}
+
+/* Allocate an unpublished SYN_RCVD responder generation answering the bare
+ * SYN in @ctx.
+ */
+static struct pht_flow *
+phantun_pre_routing_new_responder(const struct phantun_pre_routing_ctx *ctx) {
+    struct pht_flow *flow;
+    u32 responder_seq;
+
+    flow = pht_flow_create(ctx->flows, &ctx->ep, PHT_FLOW_ROLE_RESPONDER, PHT_FLOW_STATE_SYN_RCVD);
+    if (IS_ERR(flow))
+        return flow;
+
+    responder_seq = get_random_u32();
+    spin_lock_bh(&flow->lock);
+    flow->seq = responder_seq;
+    flow->ack = ntohl(ctx->view.tcp->seq) + 1;
+    flow->local_isn = responder_seq;
+    flow->peer_syn_next = flow->ack;
+    flow->local_seq_window_start = flow->local_isn;
+    flow->remote_seq_window_start = flow->peer_syn_next;
+    spin_unlock_bh(&flow->lock);
+    return flow;
+}
+
+/* Publish a responder generation for the bare aligned SYN in @ctx and answer
+ * it with SYN|ACK. @dead_flow, when set, is a hashed DEAD tombstone to replace
+ * atomically. @prev, when set, describes the ESTABLISHED generation this SYN
+ * just displaced. Both stay owned by the caller.
+ */
+static void phantun_pre_routing_accept_syn(const struct phantun_pre_routing_ctx *ctx,
+                                           struct pht_flow *dead_flow,
+                                           const struct phantun_prev_generation *prev) {
+    struct pht_flow *new_flow;
+    int ret;
+
+    new_flow = phantun_pre_routing_new_responder(ctx);
+    if (IS_ERR(new_flow)) {
+        pht_pr_warn("failed to create responder flow: %ld\n", PTR_ERR(new_flow));
+        return;
+    }
+    if (prev)
+        phantun_flow_arm_prev_generation_quarantine(new_flow, prev->local_seq_start,
+                                                    prev->local_seq_end, prev->remote_seq_start,
+                                                    prev->remote_seq_end);
+
+    if (dead_flow)
+        ret = pht_flow_replace_dead(ctx->flows, dead_flow, new_flow);
+    else
+        ret = pht_flow_insert(ctx->flows, new_flow);
+    if (ret) {
+        pht_flow_put(new_flow);
+        return;
+    }
+
+    ret = phantun_send_synack(new_flow, ctx->net, &ctx->tx_meta);
+    if (ret) {
+        pht_pr_warn("failed to emit SYN|ACK: %d\n", ret);
+        /* Transient local drops leave SYN|ACK to the handshake retransmit timer. */
+        if (!phantun_io_error_is_transient(ret))
+            pht_flow_detach(new_flow);
+    } else if (prev) {
+        pht_stats_inc(PHT_STAT_REPLACEMENTS_ACCEPTED);
+    }
+    pht_flow_put(new_flow);
+}
+
+/* No live generation owns the tuple: there is no flow, or only a hashed DEAD
+ * tombstone (@dead_flow, borrowed) kept as the previous-sequence source. Only
+ * a bare aligned SYN may create responder state; RST is dropped silently and
+ * anything else is answered with RST|ACK.
+ */
+static void phantun_pre_routing_unknown_tuple(const struct phantun_pre_routing_ctx *ctx,
+                                              struct pht_flow *dead_flow) {
+    if (ctx->view.tcp->rst)
+        return;
+
+    if (!phantun_tcp_is_bare_syn(&ctx->view)) {
+        phantun_account_tcp_unknown_tuple_rejected();
+        phantun_pre_routing_send_rstack(ctx, "unknown packet");
+        return;
+    }
+
+    if (!phantun_tcp_syn_is_aligned(&ctx->view)) {
+        phantun_account_tcp_misaligned_syn_rejected();
+        phantun_pre_routing_send_rstack(ctx, "misaligned SYN");
+        return;
+    }
+
+    phantun_pre_routing_accept_syn(ctx, dead_flow, NULL);
+}
+
+/* Simultaneous open lost on ISN tie-break: retire this SYN_SENT generation
+ * and answer the peer's SYN as responder. The queued first datagram moves to
+ * the new generation together with its exact metadata.
+ */
+static void phantun_pre_routing_yield_initiator(const struct phantun_pre_routing_ctx *ctx,
+                                                struct pht_flow *flow) {
+    struct pht_tx_meta queued_tx_meta;
+    struct pht_tx_meta local_tx_meta;
+    struct sk_buff *queued_skb;
+    struct pht_flow *new_flow;
+    int ret;
+
+    pht_pr_info("collision on tuple; switching to responder role\n");
+    pht_stats_inc(PHT_STAT_COLLISIONS_LOST);
+    pht_flow_detach(flow);
+    queued_skb = pht_flow_take_queued_skb(flow, &queued_tx_meta);
+    spin_lock_bh(&flow->lock);
+    local_tx_meta = flow->local_tx_meta;
+    spin_unlock_bh(&flow->lock);
+
+    new_flow = phantun_pre_routing_new_responder(ctx);
+    if (IS_ERR(new_flow)) {
+        kfree_skb(queued_skb);
+        return;
+    }
+
+    /* queued_tx_meta stays tied to the transferred skb. local_tx_meta may be
+     * newer when later UDP arrived while the one-skb queue was full, so
+     * preserve it separately for retransmits and keepalives.
+     */
+    spin_lock_bh(&new_flow->lock);
+    new_flow->local_tx_meta = local_tx_meta;
+    spin_unlock_bh(&new_flow->lock);
+    if (queued_skb)
+        pht_flow_set_queued_skb(new_flow, queued_skb, &queued_tx_meta);
+
+    ret = pht_flow_insert(ctx->flows, new_flow);
+    if (ret) {
+        pht_flow_put(new_flow);
+        return;
+    }
+
+    ret = phantun_send_synack(new_flow, ctx->net, &ctx->tx_meta);
+    if (ret) {
+        pht_pr_warn("failed to emit SYN|ACK after collision handoff: %d\n", ret);
+        if (!phantun_io_error_is_transient(ret))
+            pht_flow_detach(new_flow);
+    }
+    pht_flow_put(new_flow);
+}
+
+/* Bare SYN while SYN_SENT: both ends opened the tuple at once. The lower ISN
+ * keeps the initiator role.
+ */
+static void phantun_pre_routing_collision(const struct phantun_pre_routing_ctx *ctx,
+                                          struct pht_flow *flow,
+                                          const struct phantun_pre_routing_snapshot *snap) {
+    u32 peer_isn;
+
+    if (!phantun_tcp_syn_is_aligned(&ctx->view)) {
+        phantun_account_tcp_misaligned_syn_rejected();
+        phantun_pre_routing_send_rstack(ctx, "misaligned colliding SYN");
+        return;
+    }
+
+    peer_isn = ntohl(ctx->view.tcp->seq);
+    /* Exact match is extremely rare. Drop to resolve via timeout. */
+    if (snap->local_isn == peer_isn)
+        return;
+
+    if (snap->local_isn < peer_isn) {
+        pht_pr_info("collision on tuple; keeping initiator role\n");
+        pht_flow_touch_inbound(flow);
+        pht_stats_inc(PHT_STAT_COLLISIONS_WON);
+        return;
+    }
+
+    phantun_pre_routing_yield_initiator(ctx, flow);
+}
+
+/* Matching SYN|ACK: complete SYN_SENT, inject the optional handshake_request,
+ * and release the queued first datagram. A bare final ACK is sent only when
+ * neither the request nor flushed queued payload carries it.
+ */
+static void
+phantun_pre_routing_complete_initiator(const struct phantun_pre_routing_ctx *ctx,
+                                       struct pht_flow *flow,
+                                       const struct phantun_pre_routing_snapshot *snap) {
+    const u32 ack = ntohl(ctx->view.tcp->seq) + 1;
+    struct pht_flow_handshake_complete_args complete_args = {
+        .expected_state = PHT_FLOW_STATE_SYN_SENT,
+        .local_seq_start = snap->local_isn + 1,
+        .ack = ack,
+        .peer_syn_next = ack,
+        .remote_payload_seq = ntohl(ctx->view.tcp->seq),
+        .remote_payload_len = ctx->view.payload_len,
+        .local_control_len = phantun_request_enabled() ? phantun_cfg.handshake_request_len : 0,
+        .arm_drop_next_rx_payload = phantun_response_enabled(),
+        .response_pending_ack = false,
+    };
+    enum pht_flow_complete_result complete;
+    bool flushed_payload = false;
+    int ret;
+
+    complete = pht_flow_complete_handshake(flow, &complete_args, NULL);
+    if (complete == PHT_FLOW_COMPLETE_STALE)
+        return;
+    if (complete == PHT_FLOW_COMPLETE_ALREADY_ESTABLISHED) {
+        ret = phantun_send_idle_ack(flow, ctx->net, &ctx->tx_meta);
+        if (ret)
+            pht_pr_warn("failed to ACK duplicate SYN|ACK: %d\n", ret);
+        return;
+    }
+
+    pht_flow_touch_inbound(flow);
+    if (phantun_request_enabled()) {
+        ret = phantun_send_handshake_request(flow, ctx->net);
+        if (ret) {
+            pht_pr_warn("failed to emit handshake request: %d\n", ret);
+            if (!phantun_io_error_is_transient(ret)) {
+                pht_flow_remove(flow);
+                return;
+            }
+        }
+    }
+
+    ret = phantun_flush_queued_udp(flow, ctx->net, &flushed_payload);
+    if (!ret && !phantun_request_enabled() && (!snap->had_queued || !flushed_payload)) {
+        ret = phantun_send_idle_ack(flow, ctx->net, &ctx->tx_meta);
+        if (phantun_io_error_is_transient(ret))
+            ret = 0;
+    }
+    if (ret) {
+        phantun_discard_queued_udp_translation_failure(flow);
+        pht_pr_warn("failed to finalize initiator open: %d\n", ret);
+        pht_flow_remove(flow);
+    }
+}
+
+/* Initiator half-open state: accept only collision SYNs, the matching
+ * SYN|ACK, or RST (handled by the caller). Simultaneous initiation collapses
+ * by comparing ISNs; anything else resets the generation.
+ */
+static void phantun_pre_routing_syn_sent(const struct phantun_pre_routing_ctx *ctx,
+                                         struct pht_flow *flow,
+                                         const struct phantun_pre_routing_snapshot *snap) {
+    if (phantun_tcp_is_bare_syn(&ctx->view)) {
+        phantun_pre_routing_collision(ctx, flow, snap);
+        return;
+    }
+
+    if (phantun_tcp_is_clean_synack(&ctx->view, snap->local_isn + 1)) {
+        phantun_pre_routing_complete_initiator(ctx, flow, snap);
+        return;
+    }
+
+    phantun_account_tcp_protocol_rejected();
+    phantun_pre_routing_send_rstack(ctx, "unexpected SYN_SENT packet");
+    pht_flow_remove(flow);
+}
+
+/* ACK/data on an ESTABLISHED flow. @raced_final_ack marks a responder final
+ * ACK whose handshake completion lost to another CPU: payload that replays
+ * the opening payload the winner claimed, or that flow->ack already covers,
+ * is not delivered twice.
+ */
+static void phantun_pre_routing_established_data(const struct phantun_pre_routing_ctx *ctx,
+                                                 struct pht_flow *flow, bool raced_final_ack) {
+    const struct pht_l4_view *view = &ctx->view;
+    bool response_unblocked = false;
+    bool replayed_payload = false;
+    bool drop_payload = false;
+
+    spin_lock_bh(&flow->lock);
+    if (flow->response_pending_ack) {
+        if (view->tcp->ack &&
+            phantun_seq_after_eq(ntohl(view->tcp->ack_seq),
+                                 flow->local_isn + 1 + phantun_cfg.handshake_response_len)) {
+            flow->response_pending_ack = false;
+            response_unblocked = true;
+        } else if (view->payload_len > 0) {
+            /* A lost handshake_response leaves the reserved control
+             * sequence range unseen. Once later initiator traffic
+             * arrives, release queued responder data anyway and keep
+             * the ignore slot pinned to responder_seq + 1 so a delayed
+             * handshake_response is still suppressed by sequence.
+             */
+            flow->response_pending_ack = false;
+            response_unblocked = true;
+        }
+    }
+    if (raced_final_ack && view->payload_len > 0) {
+        u32 payload_seq = ntohl(view->tcp->seq);
+        u32 payload_end = payload_seq + view->payload_len;
+
+        replayed_payload =
+            (flow->opening_rx_payload_claimed && payload_seq == flow->opening_rx_seq_start &&
+             payload_end == flow->opening_rx_seq_end) ||
+            phantun_seq_after_eq(flow->ack, payload_end);
+    }
+    if (phantun_consume_drop_next_rx_payload_locked(flow, view)) {
+        drop_payload = true;
+        pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
+    }
+    spin_unlock_bh(&flow->lock);
+
+    if (replayed_payload) {
+        if (response_unblocked)
+            phantun_pre_routing_flush_queue(ctx, flow);
+        return;
+    }
+
+    if (view->payload_len == 0) {
+        pht_flow_touch_inbound(flow);
+        if (response_unblocked)
+            phantun_pre_routing_flush_queue(ctx, flow);
+        return;
+    }
+
+    phantun_pre_routing_deliver(ctx, flow, !drop_payload,
+                                raced_final_ack ? "raced responder payload"
+                                                : "established inbound payload");
+}
+
+/* Exact final ACK in SYN_RCVD: complete the handshake, then either inject the
+ * handshake_response (holding responder UDP behind it) or release queued UDP
+ * immediately, and deliver any payload the final ACK carries.
+ */
+static void
+phantun_pre_routing_complete_responder(const struct phantun_pre_routing_ctx *ctx,
+                                       struct pht_flow *flow,
+                                       const struct phantun_pre_routing_snapshot *snap) {
+    struct pht_flow_handshake_complete_args complete_args = {
+        .expected_state = PHT_FLOW_STATE_SYN_RCVD,
+        .local_seq_start = snap->local_isn + 1,
+        .ack = snap->peer_syn_next,
+        .peer_syn_next = snap->peer_syn_next,
+        .remote_payload_seq = ntohl(ctx->view.tcp->seq),
+        .remote_payload_len = ctx->view.payload_len,
+        .local_control_len = phantun_response_enabled() ? phantun_cfg.handshake_response_len : 0,
+        .arm_drop_next_rx_payload = phantun_request_enabled(),
+        .response_pending_ack = phantun_response_enabled(),
+    };
+    enum pht_flow_complete_result complete;
+    bool drop_open_payload;
+    int ret;
+
+    complete = pht_flow_complete_handshake(flow, &complete_args, &drop_open_payload);
+    if (complete == PHT_FLOW_COMPLETE_STALE)
+        return;
+    if (complete == PHT_FLOW_COMPLETE_ALREADY_ESTABLISHED) {
+        /* Another CPU completed the handshake after our SYN_RCVD snapshot. */
+        phantun_pre_routing_established_data(ctx, flow, true);
+        return;
+    }
+
+    if (phantun_response_enabled()) {
+        /* Injected handshake_response occupies responder_seq + 1.
+         * Keep responder-owned UDP blocked until the peer ACKs that
+         * range or later initiator payload proves the control slot was
+         * skipped.
+         */
+        if (drop_open_payload) {
+            phantun_note_inbound_payload(flow, &ctx->view);
+            pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
+        }
+
+        ret = phantun_send_handshake_response(flow, ctx->net, &ctx->tx_meta);
+        if (ret) {
+            pht_pr_warn("failed to emit handshake response: %d\n", ret);
+            if (!phantun_io_error_is_transient(ret)) {
+                pht_flow_remove(flow);
+                return;
+            }
+        }
+
+        if (ctx->view.payload_len == 0)
+            pht_flow_touch_inbound(flow);
+        if (ctx->view.payload_len == 0 || drop_open_payload)
+            return;
+
+        phantun_pre_routing_deliver(ctx, flow, true, "responder open payload");
+        return;
+    }
+
+    pht_flow_touch_inbound(flow);
+
+    /* The responder transitions to ESTABLISHED. We must flush any queued UDP
+     * data.
+     */
+    if (!phantun_pre_routing_flush_queue(ctx, flow))
+        return;
+
+    if (ctx->view.payload_len == 0)
+        return;
+
+    if (drop_open_payload)
+        pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
+    phantun_pre_routing_deliver(ctx, flow, !drop_open_payload, "responder open payload");
+}
+
+/* Responder half-open state: duplicate SYN retransmits SYN|ACK, and only
+ * the exact final ACK can complete the handshake.
+ */
+static void phantun_pre_routing_syn_rcvd(const struct phantun_pre_routing_ctx *ctx,
+                                         struct pht_flow *flow,
+                                         const struct phantun_pre_routing_snapshot *snap) {
+    const struct pht_l4_view *view = &ctx->view;
+    int ret;
+
+    if (phantun_tcp_is_bare_syn(view) && phantun_tcp_syn_is_aligned(view) &&
+        ntohl(view->tcp->seq) + 1 == snap->peer_syn_next) {
+        ret = phantun_send_synack(flow, ctx->net, &ctx->tx_meta);
+        if (ret)
+            pht_pr_warn("failed to re-emit SYN|ACK: %d\n", ret);
+        return;
+    }
+
+    if (phantun_tcp_is_syn_rcvd_final_ack(view, snap->local_isn + 1)) {
+        phantun_pre_routing_complete_responder(ctx, flow, snap);
+        return;
+    }
+
+    if (phantun_flow_should_drop_quarantined_packet(flow, view))
+        return;
+
+    if (phantun_tcp_is_bare_syn(view) && !phantun_tcp_syn_is_aligned(view)) {
+        phantun_account_tcp_misaligned_syn_rejected();
+        phantun_pre_routing_send_rstack(ctx, "misaligned SYN_RCVD SYN");
+    } else {
+        phantun_account_tcp_protocol_rejected();
+        phantun_pre_routing_send_rstack(ctx, "bad final ACK");
+    }
+    pht_flow_remove(flow);
+}
+
+/* SYN on an ESTABLISHED tuple: retransmitted opening segments of this
+ * generation are answered again, a bare aligned SYN outside replacement
+ * protection opens a new responder generation, and any other SYN is fatal.
+ */
+static void phantun_pre_routing_established_syn(const struct phantun_pre_routing_ctx *ctx,
+                                                struct pht_flow *flow,
+                                                const struct phantun_pre_routing_snapshot *snap) {
+    const struct pht_l4_view *view = &ctx->view;
+    struct phantun_prev_generation prev;
+    int ret;
+
+    if (snap->role == PHT_FLOW_ROLE_INITIATOR &&
+        phantun_tcp_is_clean_synack(view, snap->local_isn + 1) &&
+        ntohl(view->tcp->seq) + 1 == snap->peer_syn_next) {
+        ret = phantun_send_idle_ack(flow, ctx->net, &ctx->tx_meta);
+        if (ret)
+            pht_pr_warn("failed to ACK duplicate current-generation SYN|ACK: %d\n", ret);
+        return;
+    }
+
+    if (!phantun_tcp_is_bare_syn(view) || !phantun_tcp_syn_is_aligned(view)) {
+        pht_pr_warn_rl("received invalid SYN on ESTABLISHED tuple, destroying\n");
+        if (phantun_tcp_is_bare_syn(view))
+            phantun_account_tcp_misaligned_syn_rejected();
+        else
+            phantun_account_tcp_protocol_rejected();
+        phantun_pre_routing_send_rstack(ctx, "invalid established SYN");
+        pht_flow_remove(flow);
+        return;
+    }
+
+    if (snap->role == PHT_FLOW_ROLE_RESPONDER && ntohl(view->tcp->seq) + 1 == snap->peer_syn_next) {
+        ret = phantun_send_synack(flow, ctx->net, &ctx->tx_meta);
+        if (ret)
+            pht_pr_warn("failed to re-emit SYN|ACK for duplicate established SYN: %d\n", ret);
+        return;
+    }
+
+    if (phantun_flow_should_drop_protected_replacement_syn(flow, view))
+        return;
+
+    /* Accept bare replacement SYN as a new generation. Preserve only the
+     * just-replaced seq/ack window so delayed old packets are dropped quietly
+     * during the quarantine window.
+     */
+    spin_lock_bh(&flow->lock);
+    prev.local_seq_start = flow->local_seq_window_start;
+    prev.local_seq_end = flow->seq;
+    prev.remote_seq_start = flow->remote_seq_window_start;
+    prev.remote_seq_end = flow->ack;
+    spin_unlock_bh(&flow->lock);
+    pht_pr_info("received bare SYN on ESTABLISHED tuple, replacing generation\n");
+    kfree_skb(pht_flow_take_queued_skb(flow, NULL));
+    pht_flow_detach(flow);
+    phantun_pre_routing_accept_syn(ctx, NULL, &prev);
+}
+
+/* ESTABLISHED handling still prioritizes flags over payload. Duplicate open
+ * packets are absorbed, bare SYN can replace the generation, any other SYN is
+ * fatal, and plain ACK/data continues the stream.
+ */
+static void phantun_pre_routing_established(const struct phantun_pre_routing_ctx *ctx,
+                                            struct pht_flow *flow,
+                                            const struct phantun_pre_routing_snapshot *snap) {
+    if (phantun_flow_should_drop_quarantined_packet(flow, &ctx->view))
+        return;
+
+    if (ctx->view.tcp->syn) {
+        phantun_pre_routing_established_syn(ctx, flow, snap);
+        return;
+    }
+
+    if (!phantun_tcp_is_established_ack(&ctx->view)) {
+        phantun_account_tcp_protocol_rejected();
+        phantun_pre_routing_send_rstack(ctx, "unsupported established flags");
+        pht_flow_remove(flow);
+        return;
+    }
+
+    phantun_pre_routing_established_data(ctx, flow, false);
+}
+
+/* Classify an owned packet against the flow hashed on its tuple. @flow is
+ * borrowed; the hook drops the lookup reference.
+ */
+static void phantun_pre_routing_dispatch(const struct phantun_pre_routing_ctx *ctx,
+                                         struct pht_flow *flow) {
+    struct phantun_pre_routing_snapshot snap;
+
+    spin_lock_bh(&flow->lock);
+    snap.state = flow->state;
+    snap.role = flow->role;
+    snap.local_isn = flow->local_isn;
+    snap.peer_syn_next = flow->peer_syn_next;
+    snap.had_queued = flow->queued_skb != NULL;
+    spin_unlock_bh(&flow->lock);
+
+    /* Allocation-failure tombstone: keep it hashed as the previous sequence
+     * source unless this packet publishes a replacement SYN.
+     */
+    if (snap.state == PHT_FLOW_STATE_DEAD) {
+        phantun_pre_routing_unknown_tuple(ctx, flow);
+        return;
+    }
+
+    /* RST ends a live generation unless it fits the quarantined previous one. */
+    if (ctx->view.tcp->rst) {
+        if (!phantun_flow_should_drop_quarantined_packet(flow, &ctx->view))
+            pht_flow_remove(flow);
+        return;
+    }
+
+    switch (snap.state) {
+    case PHT_FLOW_STATE_SYN_SENT:
+        phantun_pre_routing_syn_sent(ctx, flow, &snap);
+        break;
+    case PHT_FLOW_STATE_SYN_RCVD:
+        phantun_pre_routing_syn_rcvd(ctx, flow, &snap);
+        break;
+    case PHT_FLOW_STATE_ESTABLISHED:
+        phantun_pre_routing_established(ctx, flow, &snap);
+        break;
+    default:
+        break;
+    }
+}
+
 /* PRE_ROUTING owns selector-matched fake-TCP before the real TCP stack sees
  * it. Unknown owned packets are rejected unless they are valid bare SYNs that
  * create a new responder flow.
  */
 static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                                         const struct nf_hook_state *state) {
-    struct pht_l4_view view;
-    struct pht_endpoint_pair ep;
+    struct phantun_pre_routing_ctx ctx;
     struct pht_addr local_addr;
     struct pht_addr remote_addr;
-    struct pht_tx_meta tx_meta;
-    struct pht_flow_table *flows;
     struct pht_flow *flow;
-    struct pht_flow *new_flow;
-    struct pht_flow *dead_flow = NULL;
-    struct sk_buff *queued_skb;
-    struct pht_tx_meta queued_tx_meta;
-    struct pht_tx_meta local_tx_meta;
-    enum pht_flow_state state_now;
-    struct net_device *in_dev;
-    u32 expected_ack;
-    u32 responder_seq;
-    u32 local_isn;
-    u32 peer_syn_next;
-    enum pht_flow_role role_now;
-    u32 quarantine_prev_local_seq_start = 0;
-    u32 quarantine_prev_local_seq_end = 0;
-    u32 quarantine_prev_remote_seq_start = 0;
-    u32 quarantine_prev_remote_seq_end = 0;
-    bool carry_quarantine = false;
-    bool count_replacement_accept = false;
-    bool had_queued;
-    bool drop_open_payload;
+    unsigned int verdict;
     int ret;
 
     if (!state || !skb)
@@ -2019,655 +2656,60 @@ static unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     if (phantun_pre_routing_uses_loopback_dev(skb, state))
         return NF_ACCEPT;
 
-    flows = phantun_net_hook_flows(state->net);
+    ctx.flows = phantun_net_hook_flows(state->net);
     /* Fail open if hook state exists before the flow table is attached;
      * NF_DROP here would blackhole every inbound non-loopback packet.
      */
-    if (!flows)
+    if (!ctx.flows)
         return NF_ACCEPT;
 
-    ret = phantun_parse_tcp_skb(skb, &view);
+    ret = phantun_parse_tcp_skb(skb, &ctx.view);
     if (ret)
         return NF_ACCEPT;
-    if (!phantun_family_enabled(view.family))
+    if (!phantun_family_enabled(ctx.view.family))
         return NF_ACCEPT;
 
-    phantun_view_remote_addr(&view, true, &remote_addr);
+    phantun_view_remote_addr(&ctx.view, true, &remote_addr);
     /* Selector matching is cheap cached config; test it before local-delivery
      * checks that may require a FIB lookup.
      */
-    if (!phantun_selectors_allow(view.tcp->dest, &remote_addr, view.tcp->source))
+    if (!phantun_selectors_allow(ctx.view.tcp->dest, &remote_addr, ctx.view.tcp->source))
         return NF_ACCEPT;
 
-    phantun_view_local_addr(&view, true, &local_addr);
+    phantun_view_local_addr(&ctx.view, true, &local_addr);
     if (!phantun_pre_routing_targets_local_host(state->net, &local_addr))
         return NF_ACCEPT;
 
-    phantun_fill_tcp_endpoint_pair(&view, &ep);
-    in_dev = state->in ? state->in : skb->dev;
-    phantun_fill_endpoint_scope_ifindex(&ep, in_dev);
-    phantun_tx_meta_from_view(skb, &view, false, &tx_meta);
-    if (phantun_endpoint_uses_unsupported_addr(&ep)) {
+    ctx.net = state->net;
+    ctx.in_dev = state->in ? state->in : skb->dev;
+    ctx.skb = skb;
+    phantun_fill_tcp_endpoint_pair(&ctx.view, &ctx.ep);
+    phantun_fill_endpoint_scope_ifindex(&ctx.ep, ctx.in_dev);
+    phantun_tx_meta_from_view(skb, &ctx.view, false, &ctx.tx_meta);
+    if (phantun_endpoint_uses_unsupported_addr(&ctx.ep)) {
         pht_pr_warn_rl("rejecting inbound fake-TCP with unsupported endpoint address\n");
         return NF_DROP;
     }
 
-    ret = phantun_pre_routing_segment_gso(priv, skb, state);
-    if (ret != NF_ACCEPT)
-        return ret;
+    verdict = phantun_pre_routing_segment_gso(priv, skb, state);
+    if (verdict != NF_ACCEPT)
+        return verdict;
 
-    ret = phantun_validate_tcp_checksums(skb, &view);
+    ret = phantun_validate_tcp_checksums(skb, &ctx.view);
     if (ret)
         return NF_DROP;
 
-    flow = pht_flow_lookup(flows, &ep);
+    /* Owned fake TCP never reaches the TCP stack: payload leaves as a freshly
+     * built UDP skb, so every path from here drops the original. Handlers
+     * borrow the lookup reference.
+     */
+    flow = pht_flow_lookup(ctx.flows, &ctx.ep);
     if (flow) {
-        spin_lock_bh(&flow->lock);
-        state_now = flow->state;
-        spin_unlock_bh(&flow->lock);
-
-        if (state_now == PHT_FLOW_STATE_DEAD) {
-            /* Allocation-failure tombstone: keep it hashed as the previous
-             * sequence source unless this packet publishes a replacement SYN.
-             */
-            dead_flow = flow;
-            flow = NULL;
-        }
-    }
-
-    if (!flow) {
-        if (view.tcp->rst) {
-            if (dead_flow)
-                pht_flow_put(dead_flow);
-            return NF_DROP;
-        }
-
-        if (!phantun_tcp_is_bare_syn(&view)) {
-            phantun_account_tcp_unknown_tuple_rejected();
-            ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
-            if (ret)
-                pht_pr_warn_rl("failed to emit RST|ACK for unknown packet: %d\n", ret);
-            if (dead_flow)
-                pht_flow_put(dead_flow);
-            return NF_DROP;
-        }
-
-        if (!phantun_tcp_syn_is_aligned(&view)) {
-            phantun_account_tcp_misaligned_syn_rejected();
-            ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
-            if (ret)
-                pht_pr_warn_rl("failed to emit RST|ACK for misaligned SYN: %d\n", ret);
-            if (dead_flow)
-                pht_flow_put(dead_flow);
-            return NF_DROP;
-        }
-        /* Only a bare aligned SYN is allowed to create responder state for an
-         * otherwise unknown owned tuple.
-         */
-    process_as_new_syn:
-        new_flow = pht_flow_create(flows, &ep, PHT_FLOW_ROLE_RESPONDER, PHT_FLOW_STATE_SYN_RCVD);
-        if (IS_ERR(new_flow)) {
-            pht_pr_warn("failed to create responder flow: %ld\n", PTR_ERR(new_flow));
-            if (dead_flow)
-                pht_flow_put(dead_flow);
-            return NF_DROP;
-        }
-
-        responder_seq = get_random_u32();
-        spin_lock_bh(&new_flow->lock);
-        new_flow->seq = responder_seq;
-        new_flow->ack = ntohl(view.tcp->seq) + 1;
-        new_flow->local_isn = responder_seq;
-        new_flow->peer_syn_next = new_flow->ack;
-        new_flow->local_seq_window_start = new_flow->local_isn;
-        new_flow->remote_seq_window_start = new_flow->peer_syn_next;
-        spin_unlock_bh(&new_flow->lock);
-        if (carry_quarantine) {
-            phantun_flow_arm_prev_generation_quarantine(
-                new_flow, quarantine_prev_local_seq_start, quarantine_prev_local_seq_end,
-                quarantine_prev_remote_seq_start, quarantine_prev_remote_seq_end);
-            carry_quarantine = false;
-        }
-
-        if (dead_flow)
-            ret = pht_flow_replace_dead(flows, dead_flow, new_flow);
-        else
-            ret = pht_flow_insert(flows, new_flow);
-        if (ret) {
-            pht_flow_put(new_flow);
-            if (dead_flow)
-                pht_flow_put(dead_flow);
-            return NF_DROP;
-        }
-
-        ret = phantun_send_synack(new_flow, state->net, &tx_meta);
-        if (ret) {
-            pht_pr_warn("failed to emit SYN|ACK: %d\n", ret);
-            if (!phantun_io_error_is_transient(ret))
-                pht_flow_detach(new_flow);
-        } else if (count_replacement_accept) {
-            pht_stats_inc(PHT_STAT_REPLACEMENTS_ACCEPTED);
-        }
-        pht_flow_put(new_flow);
-        if (dead_flow)
-            pht_flow_put(dead_flow);
-        return NF_DROP;
-    }
-
-    spin_lock_bh(&flow->lock);
-    state_now = flow->state;
-    expected_ack = flow->local_isn + 1;
-    local_isn = flow->local_isn;
-    peer_syn_next = flow->peer_syn_next;
-    role_now = flow->role;
-    had_queued = flow->queued_skb != NULL;
-    spin_unlock_bh(&flow->lock);
-
-    if (view.tcp->rst) {
-        if (phantun_flow_should_drop_quarantined_packet(flow, &view)) {
-            pht_flow_put(flow);
-            return NF_DROP;
-        }
-        pht_flow_remove(flow);
+        phantun_pre_routing_dispatch(&ctx, flow);
         pht_flow_put(flow);
-        return NF_DROP;
+    } else {
+        phantun_pre_routing_unknown_tuple(&ctx, NULL);
     }
-
-    /* Initiator half-open state: accept only collision SYNs, the matching
-     * SYN|ACK, or RST. Simultaneous initiation collapses by comparing ISNs.
-     */
-    if (state_now == PHT_FLOW_STATE_SYN_SENT) {
-        if (phantun_tcp_is_bare_syn(&view)) {
-            u32 peer_isn;
-
-            if (!phantun_tcp_syn_is_aligned(&view)) {
-                phantun_account_tcp_misaligned_syn_rejected();
-                ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
-                if (ret)
-                    pht_pr_warn_rl("failed to emit RST|ACK for misaligned colliding SYN: %d\n",
-                                   ret);
-                pht_flow_put(flow);
-                return NF_DROP;
-            }
-
-            peer_isn = ntohl(view.tcp->seq);
-
-            if (local_isn == peer_isn) {
-                /* Exact match is extremely rare. Drop to
-                 * resolve via timeout */
-                pht_flow_put(flow);
-                return NF_DROP;
-            }
-
-            if (local_isn < peer_isn) {
-                pht_pr_info("collision on tuple; keeping initiator role\n");
-                pht_flow_touch_inbound(flow);
-                pht_stats_inc(PHT_STAT_COLLISIONS_WON);
-                pht_flow_put(flow);
-                return NF_DROP;
-            }
-
-            pht_pr_info("collision on tuple; switching to responder role\n");
-            pht_stats_inc(PHT_STAT_COLLISIONS_LOST);
-            pht_flow_detach(flow);
-            queued_skb = pht_flow_take_queued_skb(flow, &queued_tx_meta);
-            spin_lock_bh(&flow->lock);
-            local_tx_meta = flow->local_tx_meta;
-            spin_unlock_bh(&flow->lock);
-            pht_flow_put(flow);
-
-            new_flow =
-                pht_flow_create(flows, &ep, PHT_FLOW_ROLE_RESPONDER, PHT_FLOW_STATE_SYN_RCVD);
-            if (IS_ERR(new_flow)) {
-                kfree_skb(queued_skb);
-                return NF_DROP;
-            }
-
-            responder_seq = get_random_u32();
-            spin_lock_bh(&new_flow->lock);
-            new_flow->seq = responder_seq;
-            new_flow->ack = ntohl(view.tcp->seq) + 1;
-            new_flow->local_isn = responder_seq;
-            new_flow->peer_syn_next = new_flow->ack;
-            new_flow->local_seq_window_start = new_flow->local_isn;
-            new_flow->remote_seq_window_start = new_flow->peer_syn_next;
-            /* queued_tx_meta stays tied to the transferred skb. local_tx_meta
-             * may be newer when later UDP arrived while the one-skb queue was
-             * full, so preserve it separately for retransmits and keepalives.
-             */
-            new_flow->local_tx_meta = local_tx_meta;
-            spin_unlock_bh(&new_flow->lock);
-            if (queued_skb)
-                pht_flow_set_queued_skb(new_flow, queued_skb, &queued_tx_meta);
-
-            ret = pht_flow_insert(flows, new_flow);
-            if (ret) {
-                pht_flow_put(new_flow);
-                return NF_DROP;
-            }
-
-            ret = phantun_send_synack(new_flow, state->net, &tx_meta);
-            if (ret) {
-                pht_pr_warn("failed to emit SYN|ACK after collision handoff: %d\n", ret);
-                if (!phantun_io_error_is_transient(ret))
-                    pht_flow_detach(new_flow);
-            }
-            pht_flow_put(new_flow);
-            return NF_DROP;
-        }
-
-        if (phantun_tcp_is_clean_synack(&view, expected_ack)) {
-            const u32 ack = ntohl(view.tcp->seq) + 1;
-            struct pht_flow_handshake_complete_args complete_args = {
-                .expected_state = PHT_FLOW_STATE_SYN_SENT,
-                .local_seq_start = local_isn + 1,
-                .ack = ack,
-                .peer_syn_next = ack,
-                .remote_payload_seq = ntohl(view.tcp->seq),
-                .remote_payload_len = view.payload_len,
-                .local_control_len =
-                    phantun_request_enabled() ? phantun_cfg.handshake_request_len : 0,
-                .arm_drop_next_rx_payload = phantun_response_enabled(),
-                .response_pending_ack = false,
-            };
-            enum pht_flow_complete_result complete;
-
-            complete = pht_flow_complete_handshake(flow, &complete_args, NULL);
-            if (complete == PHT_FLOW_COMPLETE_STALE) {
-                pht_flow_put(flow);
-                return NF_DROP;
-            }
-            if (complete == PHT_FLOW_COMPLETE_ALREADY_ESTABLISHED) {
-                ret = phantun_send_idle_ack(flow, state->net, &tx_meta);
-                if (ret)
-                    pht_pr_warn("failed to ACK duplicate SYN|ACK: %d\n", ret);
-                pht_flow_put(flow);
-                return NF_DROP;
-            }
-
-            pht_flow_touch_inbound(flow);
-            if (phantun_request_enabled()) {
-                ret = phantun_send_handshake_request(flow, state->net);
-                if (ret) {
-                    pht_pr_warn("failed to emit handshake request: %d\n", ret);
-                    if (!phantun_io_error_is_transient(ret)) {
-                        pht_flow_remove(flow);
-                        pht_flow_put(flow);
-                        return NF_DROP;
-                    }
-                }
-            }
-
-            {
-                bool flushed_payload = false;
-
-                ret = phantun_flush_queued_udp(flow, state->net, &flushed_payload);
-                if (!ret && !phantun_request_enabled() && (!had_queued || !flushed_payload)) {
-                    ret = phantun_send_idle_ack(flow, state->net, &tx_meta);
-                    if (phantun_io_error_is_transient(ret))
-                        ret = 0;
-                }
-            }
-            if (ret) {
-                phantun_discard_queued_udp_translation_failure(flow);
-                pht_pr_warn("failed to finalize initiator open: %d\n", ret);
-                pht_flow_remove(flow);
-            }
-            pht_flow_put(flow);
-            return NF_DROP;
-        }
-
-        phantun_account_tcp_protocol_rejected();
-        ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
-        if (ret)
-            pht_pr_warn_rl("failed to emit RST|ACK for unexpected SYN_SENT packet: %d\n", ret);
-        pht_flow_remove(flow);
-        pht_flow_put(flow);
-        return NF_DROP;
-    }
-
-    if (state_now == PHT_FLOW_STATE_SYN_RCVD && phantun_tcp_is_bare_syn(&view) &&
-        phantun_tcp_syn_is_aligned(&view) && ntohl(view.tcp->seq) + 1 == peer_syn_next) {
-        ret = phantun_send_synack(flow, state->net, &tx_meta);
-        if (ret)
-            pht_pr_warn("failed to re-emit SYN|ACK: %d\n", ret);
-        pht_flow_put(flow);
-        return NF_DROP;
-    }
-
-    /* Responder half-open state: duplicate SYN retransmits SYN|ACK, and only
-     * the exact final ACK can complete the handshake.
-     */
-    if (state_now == PHT_FLOW_STATE_SYN_RCVD) {
-        if (!phantun_tcp_is_syn_rcvd_final_ack(&view, expected_ack)) {
-            if (phantun_flow_should_drop_quarantined_packet(flow, &view)) {
-                pht_flow_put(flow);
-                return NF_DROP;
-            }
-            if (phantun_tcp_is_bare_syn(&view) && !phantun_tcp_syn_is_aligned(&view)) {
-                phantun_account_tcp_misaligned_syn_rejected();
-                ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
-                if (ret)
-                    pht_pr_warn_rl("failed to emit RST|ACK for misaligned SYN_RCVD SYN: %d\n", ret);
-                pht_flow_remove(flow);
-                pht_flow_put(flow);
-                return NF_DROP;
-            }
-
-            phantun_account_tcp_protocol_rejected();
-            ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
-            if (ret)
-                pht_pr_warn_rl("failed to emit RST|ACK for bad final ACK: %d\n", ret);
-            pht_flow_remove(flow);
-            pht_flow_put(flow);
-            return NF_DROP;
-        }
-
-        {
-            struct pht_flow_handshake_complete_args complete_args = {
-                .expected_state = PHT_FLOW_STATE_SYN_RCVD,
-                .local_seq_start = local_isn + 1,
-                .ack = peer_syn_next,
-                .peer_syn_next = peer_syn_next,
-                .remote_payload_seq = ntohl(view.tcp->seq),
-                .remote_payload_len = view.payload_len,
-                .local_control_len =
-                    phantun_response_enabled() ? phantun_cfg.handshake_response_len : 0,
-                .arm_drop_next_rx_payload = phantun_request_enabled(),
-                .response_pending_ack = phantun_response_enabled(),
-            };
-            enum pht_flow_complete_result complete;
-
-            complete = pht_flow_complete_handshake(flow, &complete_args, &drop_open_payload);
-            if (complete == PHT_FLOW_COMPLETE_STALE) {
-                pht_flow_put(flow);
-                return NF_DROP;
-            }
-            if (complete == PHT_FLOW_COMPLETE_ALREADY_ESTABLISHED) {
-                u32 payload_seq = ntohl(view.tcp->seq);
-                u32 payload_end = payload_seq + view.payload_len;
-                bool response_unblocked = false;
-                bool duplicate_opening_payload = false;
-                bool drop_payload = false;
-                bool payload_already_acked = false;
-
-                spin_lock_bh(&flow->lock);
-                if (flow->response_pending_ack) {
-                    if (view.tcp->ack &&
-                        phantun_seq_after_eq(ntohl(view.tcp->ack_seq),
-                                             flow->local_isn + 1 +
-                                                 phantun_cfg.handshake_response_len)) {
-                        flow->response_pending_ack = false;
-                        response_unblocked = true;
-                    } else if (view.payload_len > 0) {
-                        flow->response_pending_ack = false;
-                        response_unblocked = true;
-                    }
-                }
-                if (view.payload_len > 0 && flow->opening_rx_payload_claimed &&
-                    payload_seq == flow->opening_rx_seq_start &&
-                    payload_end == flow->opening_rx_seq_end)
-                    duplicate_opening_payload = true;
-                if (view.payload_len > 0 && phantun_seq_after_eq(flow->ack, payload_end))
-                    payload_already_acked = true;
-                if (phantun_consume_drop_next_rx_payload_locked(flow, &view)) {
-                    drop_payload = true;
-                    pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
-                }
-                spin_unlock_bh(&flow->lock);
-
-                if (payload_already_acked || duplicate_opening_payload) {
-                    if (response_unblocked) {
-                        ret = phantun_flush_queued_udp(flow, state->net, NULL);
-                        if (ret) {
-                            phantun_discard_queued_udp_translation_failure(flow);
-                            pht_pr_warn("failed to flush responder queue: %d\n", ret);
-                            pht_flow_remove(flow);
-                        }
-                    }
-                    pht_flow_put(flow);
-                    return NF_DROP;
-                }
-
-                if (view.payload_len == 0) {
-                    pht_flow_touch_inbound(flow);
-                    if (response_unblocked) {
-                        ret = phantun_flush_queued_udp(flow, state->net, NULL);
-                        if (ret) {
-                            phantun_discard_queued_udp_translation_failure(flow);
-                            pht_pr_warn("failed to flush responder queue: %d\n", ret);
-                            pht_flow_remove(flow);
-                        }
-                    }
-                    pht_flow_put(flow);
-                    return NF_DROP;
-                }
-
-                ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
-                                                      !drop_payload, true, &tx_meta);
-                if (ret) {
-                    pht_pr_warn("failed to process raced responder payload: %d\n", ret);
-                    if (ret == -EMSGSIZE) {
-                        phantun_account_tcp_protocol_rejected();
-                        phantun_send_rstack(state->net, &ep, &view, &tx_meta);
-                    }
-                    pht_flow_remove(flow);
-                }
-                pht_flow_put(flow);
-                return NF_DROP;
-            }
-
-            /* Injected handshake_response occupies responder_seq + 1.
-             * Keep responder-owned UDP blocked until the peer ACKs that
-             * range or later initiator payload proves the control slot was
-             * skipped.
-             */
-            if (phantun_response_enabled()) {
-                if (drop_open_payload) {
-                    phantun_note_inbound_payload(flow, &view);
-                    pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
-                }
-
-                ret = phantun_send_handshake_response(flow, state->net, &tx_meta);
-                if (ret) {
-                    pht_pr_warn("failed to emit handshake response: %d\n", ret);
-                    if (!phantun_io_error_is_transient(ret)) {
-                        pht_flow_remove(flow);
-                        pht_flow_put(flow);
-                        return NF_DROP;
-                    }
-                }
-
-                if (view.payload_len == 0)
-                    pht_flow_touch_inbound(flow);
-                if (view.payload_len == 0 || drop_open_payload) {
-                    pht_flow_put(flow);
-                    return NF_DROP;
-                }
-
-                ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
-                                                      true, true, &tx_meta);
-                if (ret) {
-                    pht_pr_warn("failed to process responder open payload: %d\n", ret);
-                    if (ret == -EMSGSIZE) {
-                        phantun_account_tcp_protocol_rejected();
-                        phantun_send_rstack(state->net, &ep, &view, &tx_meta);
-                    }
-                    pht_flow_remove(flow);
-                }
-                pht_flow_put(flow);
-                return NF_DROP;
-            }
-
-            pht_flow_touch_inbound(flow);
-
-            /* The responder transitions to ESTABLISHED. We must flush any
-             * queued UDP data. */
-            ret = phantun_flush_queued_udp(flow, state->net, NULL);
-            if (ret) {
-                phantun_discard_queued_udp_translation_failure(flow);
-                pht_pr_warn("failed to flush responder queue: %d\n", ret);
-                pht_flow_remove(flow);
-                pht_flow_put(flow);
-                return NF_DROP;
-            }
-
-            if (view.payload_len == 0) {
-                pht_flow_put(flow);
-                return NF_DROP;
-            }
-
-            if (drop_open_payload)
-                pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
-            ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
-                                                  !drop_open_payload, true, &tx_meta);
-            if (ret) {
-                pht_pr_warn("failed to process responder open payload: %d\n", ret);
-                if (ret == -EMSGSIZE) {
-                    phantun_account_tcp_protocol_rejected();
-                    phantun_send_rstack(state->net, &ep, &view, &tx_meta);
-                }
-                pht_flow_remove(flow);
-            }
-            pht_flow_put(flow);
-            return NF_DROP;
-        }
-    }
-
-    /* ESTABLISHED handling still prioritizes flags over payload. Duplicate
-     * open packets are absorbed, bare SYN can replace the generation, any
-     * other SYN is fatal, and plain ACK/data continues the stream.
-     */
-    if (state_now == PHT_FLOW_STATE_ESTABLISHED) {
-        bool response_unblocked = false;
-        bool drop_payload = false;
-
-        if (phantun_flow_should_drop_quarantined_packet(flow, &view)) {
-            pht_flow_put(flow);
-            return NF_DROP;
-        }
-
-        if (view.tcp->syn) {
-            if (role_now == PHT_FLOW_ROLE_INITIATOR &&
-                phantun_tcp_is_clean_synack(&view, expected_ack) &&
-                ntohl(view.tcp->seq) + 1 == peer_syn_next) {
-                ret = phantun_send_idle_ack(flow, state->net, &tx_meta);
-                if (ret)
-                    pht_pr_warn("failed to ACK duplicate current-generation SYN|ACK: %d\n", ret);
-                pht_flow_put(flow);
-                return NF_DROP;
-            }
-            if (phantun_tcp_is_bare_syn(&view) && phantun_tcp_syn_is_aligned(&view)) {
-                if (role_now == PHT_FLOW_ROLE_RESPONDER &&
-                    ntohl(view.tcp->seq) + 1 == peer_syn_next) {
-                    ret = phantun_send_synack(flow, state->net, &tx_meta);
-                    if (ret)
-                        pht_pr_warn("failed to re-emit SYN|ACK for duplicate established SYN: %d\n",
-                                    ret);
-                    pht_flow_put(flow);
-                    return NF_DROP;
-                }
-                if (phantun_flow_should_drop_protected_replacement_syn(flow, &view)) {
-                    pht_flow_put(flow);
-                    return NF_DROP;
-                }
-                /* Accept bare replacement SYN as a new generation. Preserve
-                 * only the just-replaced seq/ack window so delayed old packets
-                 * are dropped quietly during the quarantine window.
-                 */
-                spin_lock_bh(&flow->lock);
-                quarantine_prev_local_seq_start = flow->local_seq_window_start;
-                quarantine_prev_local_seq_end = flow->seq;
-                quarantine_prev_remote_seq_start = flow->remote_seq_window_start;
-                quarantine_prev_remote_seq_end = flow->ack;
-                spin_unlock_bh(&flow->lock);
-                carry_quarantine = true;
-                count_replacement_accept = true;
-                pht_pr_info("received bare SYN on ESTABLISHED tuple, replacing generation\n");
-                queued_skb = pht_flow_take_queued_skb(flow, NULL);
-                if (queued_skb)
-                    kfree_skb(queued_skb);
-                pht_flow_detach(flow);
-                pht_flow_put(flow);
-                goto process_as_new_syn;
-            }
-            pht_pr_warn_rl("received invalid SYN on ESTABLISHED tuple, destroying\n");
-            if (phantun_tcp_is_bare_syn(&view))
-                phantun_account_tcp_misaligned_syn_rejected();
-            else
-                phantun_account_tcp_protocol_rejected();
-            ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
-            if (ret)
-                pht_pr_warn_rl("failed to emit RST|ACK for invalid established SYN: %d\n", ret);
-            pht_flow_remove(flow);
-            pht_flow_put(flow);
-            return NF_DROP;
-        }
-
-        if (!phantun_tcp_is_established_ack(&view)) {
-            phantun_account_tcp_protocol_rejected();
-            ret = phantun_send_rstack(state->net, &ep, &view, &tx_meta);
-            if (ret)
-                pht_pr_warn_rl("failed to emit RST|ACK for unsupported established flags: %d\n",
-                               ret);
-            pht_flow_remove(flow);
-            pht_flow_put(flow);
-            return NF_DROP;
-        }
-
-        spin_lock_bh(&flow->lock);
-        if (flow->response_pending_ack) {
-            if (view.tcp->ack &&
-                phantun_seq_after_eq(ntohl(view.tcp->ack_seq),
-                                     flow->local_isn + 1 + phantun_cfg.handshake_response_len)) {
-                flow->response_pending_ack = false;
-                response_unblocked = true;
-            } else if (view.payload_len > 0) {
-                /* A lost handshake_response leaves the reserved control
-                 * sequence range unseen. Once later initiator traffic
-                 * arrives, release queued responder data anyway and keep
-                 * the ignore slot pinned to responder_seq + 1 so a delayed
-                 * handshake_response is still suppressed by sequence.
-                 */
-                flow->response_pending_ack = false;
-                response_unblocked = true;
-            }
-        }
-        if (phantun_consume_drop_next_rx_payload_locked(flow, &view)) {
-            drop_payload = true;
-            pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
-        }
-        spin_unlock_bh(&flow->lock);
-
-        if (view.payload_len == 0) {
-            pht_flow_touch_inbound(flow);
-            if (response_unblocked) {
-                ret = phantun_flush_queued_udp(flow, state->net, NULL);
-                if (ret) {
-                    phantun_discard_queued_udp_translation_failure(flow);
-                    pht_pr_warn("failed to flush responder queue: %d\n", ret);
-                    pht_flow_remove(flow);
-                }
-            }
-            pht_flow_put(flow);
-            return NF_DROP;
-        }
-
-        ret = phantun_finalize_established_rx(flow, &ep, skb, &view, state->net, in_dev,
-                                              !drop_payload, true, &tx_meta);
-        if (ret) {
-            pht_pr_warn("failed to process established inbound payload: %d\n", ret);
-            if (ret == -EMSGSIZE) {
-                phantun_account_tcp_protocol_rejected();
-                phantun_send_rstack(state->net, &ep, &view, &tx_meta);
-            }
-            pht_flow_remove(flow);
-        }
-        pht_flow_put(flow);
-        return NF_DROP;
-    }
-
-    pht_flow_put(flow);
     return NF_DROP;
 }
 
