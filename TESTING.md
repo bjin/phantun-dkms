@@ -71,7 +71,7 @@ Logs are automatically saved to `~/.cache/logs/phantun_tests/YYYYMMDD_HHMMSS/`.
 - `tests/test_config_stats.py`: selector configuration, `/sys/module/phantun/stats/*`, and basic selector-path behavior.
 - `tests/test_handshakes.py`: shaping semantics and control-payload visibility rules.
 - `tests/test_netns_udp.py`: basic namespace UDP-to-fake-TCP operation and multi-channel behavior.
-- `tests/test_packet_loss.py`: handshake retries, payload-loss behavior, and state-machine behavior under packet loss.
+- `tests/test_packet_loss.py`: handshake retries, payload-loss behavior, local send failures, and state-machine behavior under packet loss.
 - `tests/test_recovery.py`: collision handling, same-tuple replacement, quarantine, and unknown-packet recovery behavior.
 - `tests/test_wireguard.py`: end-to-end coverage for kernel WireGuard and `wireguard-go`.
 

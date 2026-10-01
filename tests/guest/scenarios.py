@@ -156,6 +156,9 @@ def recv_many(config):
     received = []
     target_count = config["count"]
     ready_file = config.get("ready_file")
+    # Left in place when the receiver exits so a test can still observe it if
+    # later datagrams finish the receive loop immediately; the test removes it.
+    first_received_file = config.get("first_received_file")
 
     with _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec")) as sock:
         if ready_file:
@@ -169,6 +172,8 @@ def recv_many(config):
                         "peer": [addr[0], addr[1]],
                     }
                 )
+                if first_received_file and len(received) == 1:
+                    Path(first_received_file).write_text("ready\n")
         finally:
             if ready_file:
                 Path(ready_file).unlink(missing_ok=True)

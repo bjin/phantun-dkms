@@ -20,8 +20,10 @@ from helpers import (
     make_netns_ingress_payload_drop_probe,
     make_netns_output_flag_probe,
     make_netns_output_ipv4_pure_ack_probe,
+    make_netns_output_probe,
     make_netns_tcp_payload_probe,
     parse_guest_json,
+    probe_comment,
     read_module_stats,
     require_guest_command,
     run_netns_scenario,
@@ -71,7 +73,7 @@ def wait_for_half_open_drain(vm, baseline_stats, expected_rst, timeout=15):
     )
 
 
-def wait_for_flows_current(vm, expected, timeout=10):
+def wait_for_flows_current(vm, expected, timeout=10, reason=None):
     deadline = time.time() + timeout
     while time.time() < deadline:
         stats = read_module_stats(vm)
@@ -79,7 +81,8 @@ def wait_for_flows_current(vm, expected, timeout=10):
             return stats
         time.sleep(0.1)
 
-    pytest.fail(f"flows_current did not reach {expected}: current={stats!r}")
+    prefix = f"{reason}: " if reason else ""
+    pytest.fail(f"{prefix}flows_current did not reach {expected}: current={stats!r}")
 
 
 def wait_for_flows_above(vm, baseline, timeout=5):
@@ -201,6 +204,93 @@ def test_initial_syn_emit_failure_releases_flow_slot_and_queue(phantun_module, v
             pytest.fail(f"failed initial SYN retained or delivered queued skb: {server_data!r}")
     finally:
         probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_responder_synack_emit_failure_does_not_keep_half_open_flow(phantun_module, vm):
+    # A long handshake timeout leaves a quiet window between the initiator's
+    # SYN retransmissions in which the responder's state can be observed.
+    load_loss_module(phantun_module, handshake_timeout_ms=3000, handshake_retries=3)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    payload = "queued-before-synack"
+    ready_file = f"/tmp/phantun-synack-emit-failure-{uuid.uuid4().hex}"
+    synack_drop = make_netns_output_flag_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "action": "drop",
+                "comment": "drop_synack_local_emit",
+            }
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "timeout_sec": 20,
+            "ready_file": ready_file,
+        },
+    )
+
+    try:
+        wait_for_guest_ready_file(vm, ready_file, timeout=5)
+        baseline_stats = read_module_stats(vm)
+        client = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": [payload],
+            },
+        )
+        assert_completed(client, "SYN|ACK emit failure sender")
+        wait_for_probe_packets(vm, synack_drop, "drop_synack_local_emit")
+
+        # Only the initiator's SYN_SENT flow may remain. A responder that could
+        # not answer must not keep half-open state for the tuple until its own
+        # retransmit budget runs out.
+        wait_for_flows_current(
+            vm,
+            baseline_stats["flows_current"] + 1,
+            timeout=2,
+            reason="responder kept half-open state after a fatal SYN|ACK emit failure",
+        )
+
+        synack_drop.cleanup(vm)
+        server_result = server.communicate(timeout=20)
+        assert_completed(server_result, "SYN|ACK emit failure receiver")
+        server_data = parse_guest_json(server_result.stdout, "SYN|ACK emit failure receiver stdout")
+        if received_messages(server_data) != [payload]:
+            pytest.fail(f"initiator SYN retransmission did not recover the queued payload: {server_data!r}")
+
+        final_stats = read_module_stats(vm)
+        if final_stats["flows_established"] - baseline_stats["flows_established"] != 2:
+            pytest.fail(f"expected the recovered handshake to establish both ends: {final_stats!r}")
+    finally:
+        synack_drop.cleanup(vm)
+        if server.proc.poll() is None:
+            server.terminate()
         cleanup_netns_topology(vm)
 
 
@@ -942,6 +1032,216 @@ def test_handshake_response_loss_does_not_drop_later_replies(phantun_module, vm)
         cleanup_netns_topology(vm)
 
 
+def test_handshake_request_emit_failure_never_sends_application_data(phantun_module, vm):
+    load_loss_module(phantun_module, handshake_request=REQ)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    stale_payload = "queued-before-request"
+    fresh_payload = "sent-after-reopen"
+    ready_file = f"/tmp/phantun-request-emit-failure-{uuid.uuid4().hex}"
+    request_drop = make_netns_tcp_payload_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "src_port": src_port,
+                "dst_addr": NS_ADDR_B,
+                "dst_port": dst_port,
+                "payload": REQ,
+                "action": "drop",
+                "comment": "drop_request_local_emit",
+            }
+        ],
+    )
+    stale_probe = make_netns_tcp_payload_probe(
+        vm,
+        NS_A,
+        [
+            {
+                "src_addr": NS_ADDR_A,
+                "src_port": src_port,
+                "dst_addr": NS_ADDR_B,
+                "dst_port": dst_port,
+                "payload": stale_payload,
+                "comment": "stale_payload_emitted",
+            }
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "timeout_sec": 20,
+            "ready_file": ready_file,
+        },
+    )
+
+    try:
+        wait_for_guest_ready_file(vm, ready_file, timeout=5)
+        baseline_stats = read_module_stats(vm)
+        first = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": [stale_payload],
+            },
+        )
+        assert_completed(first, "request emit failure sender")
+        wait_for_probe_packets(vm, request_drop, "drop_request_local_emit")
+
+        # The queued payload would be flushed right behind the request in the
+        # same receive path, so a leak is already visible on the wire here.
+        if stale_probe.packets(vm, "stale_payload_emitted") != 0:
+            pytest.fail("initiator sent application data on a generation whose handshake_request failed")
+
+        # The initiator abandons the generation; the responder's SYN|ACK
+        # retransmission then meets an unknown tuple and is reset, so both ends
+        # drain.
+        wait_for_flows_current(
+            vm,
+            baseline_stats["flows_current"],
+            reason="a failed handshake_request did not tear down the generation on both ends",
+        )
+
+        request_drop.cleanup(vm)
+        second = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": [fresh_payload],
+            },
+        )
+        assert_completed(second, "sender after request emit failure")
+        server_result = server.communicate(timeout=20)
+        assert_completed(server_result, "receiver after request emit failure")
+        server_data = parse_guest_json(server_result.stdout, "request emit failure receiver stdout")
+        if received_messages(server_data) != [fresh_payload]:
+            pytest.fail(f"expected only the payload sent after reopening, got {server_data!r}")
+        if stale_probe.packets(vm, "stale_payload_emitted") != 0:
+            pytest.fail("payload queued on the failed generation was sent after reopening")
+    finally:
+        request_drop.cleanup(vm)
+        stale_probe.cleanup(vm)
+        if server.proc.poll() is None:
+            server.terminate()
+        cleanup_netns_topology(vm)
+
+
+def test_handshake_response_emit_failure_tears_down_responder_generation(phantun_module, vm):
+    load_loss_module(phantun_module, handshake_request=REQ, handshake_response=RESP)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    stale_payload = "opened-before-response"
+    fresh_payload = "sent-after-reopen"
+    ready_file = f"/tmp/phantun-response-emit-failure-{uuid.uuid4().hex}"
+    response_drop = make_netns_tcp_payload_probe(
+        vm,
+        NS_B,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "payload": RESP,
+                "action": "drop",
+                "comment": "drop_response_local_emit",
+            }
+        ],
+    )
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 1,
+            "timeout_sec": 20,
+            "ready_file": ready_file,
+        },
+    )
+
+    try:
+        wait_for_guest_ready_file(vm, ready_file, timeout=5)
+        baseline_stats = read_module_stats(vm)
+        first = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": [stale_payload],
+            },
+        )
+        assert_completed(first, "response emit failure sender")
+        wait_for_probe_packets(vm, response_drop, "drop_response_local_emit")
+
+        # The responder drops the generation it could not announce. Data the
+        # initiator already sent on it hits an unknown tuple and is reset, so
+        # both ends drain and none of it reaches the responder's UDP socket.
+        wait_for_flows_current(
+            vm,
+            baseline_stats["flows_current"],
+            reason="a failed handshake_response did not tear down the generation on both ends",
+        )
+
+        response_drop.cleanup(vm)
+        second = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": [fresh_payload],
+            },
+        )
+        assert_completed(second, "sender after response emit failure")
+        server_result = server.communicate(timeout=20)
+        assert_completed(server_result, "receiver after response emit failure")
+        server_data = parse_guest_json(server_result.stdout, "response emit failure receiver stdout")
+        if received_messages(server_data) != [fresh_payload]:
+            pytest.fail(f"responder delivered data from a generation whose handshake_response failed: {server_data!r}")
+    finally:
+        response_drop.cleanup(vm)
+        if server.proc.poll() is None:
+            server.terminate()
+        cleanup_netns_topology(vm)
+
+
 def test_final_ack_shaping_payload_drop_is_one_shot(phantun_module, vm):
     load_loss_module(phantun_module, handshake_request=REQ)
     ensure_netns_topology(vm)
@@ -1428,6 +1728,121 @@ def test_duplicate_outbound_udp_while_half_open_queues_only_one_skb(phantun_modu
             pytest.fail(f"expected later duplicate UDP to count as queue-full drop, got {final_stats!r}")
     finally:
         probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_cold_start_udp_gso_superframe_queues_only_first_segment(phantun_module, vm):
+    load_loss_module(phantun_module)
+    ensure_netns_topology(vm)
+
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port = PORTS_A[0]
+    dst_port = PORTS_B[0]
+    chunks = [c * 1000 for c in "ABCD"]
+    sentinel = "after-handshake"
+    ready_file = f"/tmp/phantun-gso-half-open-{uuid.uuid4().hex}"
+    first_received_file = f"/tmp/phantun-gso-first-received-{uuid.uuid4().hex}"
+    # Hold the initiator in SYN_SENT: on veth the handshake can otherwise
+    # complete inside the first segment's send, before the rest of the
+    # superframe is translated.
+    synack_drop = make_netns_ingress_flag_drop_probe(
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "drop_synack",
+            }
+        ],
+    )
+    raw_probe = make_netns_output_probe(vm, NS_A, [(NS_ADDR_A, src_port, NS_ADDR_B, dst_port)])
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "recv_many",
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+            "timeout_sec": 20,
+            "ready_file": ready_file,
+            "first_received_file": first_received_file,
+        },
+    )
+
+    try:
+        wait_for_guest_ready_file(vm, ready_file, timeout=5)
+        baseline_stats = read_module_stats(vm)
+        gso = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["".join(chunks)],
+                "gso_size": 1000,
+            },
+            timeout=10,
+        )
+        assert_completed(gso, "cold-start UDP GSO sender")
+
+        # The superframe is split inside sendto(), so every datagram has been
+        # queued or dropped by now: one fills the half-open queue and the rest
+        # are queue-full drops.
+        half_open_stats = read_module_stats(vm)
+        queued = half_open_stats["udp_packets_queued"] - baseline_stats["udp_packets_queued"]
+        queue_full = half_open_stats["udp_queue_full_dropped"] - baseline_stats["udp_queue_full_dropped"]
+        if queued != 1 or queue_full != len(chunks) - 1:
+            pytest.fail(
+                f"expected 1 queued and {len(chunks) - 1} queue-full GSO segments while half-open: "
+                f"before={baseline_stats!r} after={half_open_stats!r}"
+            )
+
+        synack_drop.cleanup(vm)
+        # Barrier on the application itself: the flow counters advance before
+        # the opening payload is reinjected, so they do not prove delivery.
+        wait_for_guest_ready_file(vm, first_received_file, timeout=10)
+        after = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": [sentinel],
+            },
+        )
+        assert_completed(after, "post-handshake sentinel sender")
+
+        server_result = server.communicate(timeout=20)
+        assert_completed(server_result, "cold-start UDP GSO receiver")
+        server_data = parse_guest_json(server_result.stdout, "cold-start UDP GSO receiver stdout")
+        # The sentinel is only sent after the receiver reported the first
+        # segment, so any other segment the flow emitted for the superframe
+        # would precede it.
+        if received_messages(server_data) != [chunks[0], sentinel]:
+            pytest.fail(f"unexpected payloads after cold-start GSO superframe: {received_messages(server_data)!r}")
+        if raw_probe.packets(vm, probe_comment("udp", NS_ADDR_A, src_port, NS_ADDR_B, dst_port)) != 0:
+            pytest.fail("cold-start GSO segment escaped LOCAL_OUT as raw UDP")
+    finally:
+        synack_drop.cleanup(vm)
+        raw_probe.cleanup(vm)
+        if server.proc.poll() is None:
+            server.terminate()
+        vm.run(["rm", "-f", first_received_file], check=False)
         cleanup_netns_topology(vm)
 
 
