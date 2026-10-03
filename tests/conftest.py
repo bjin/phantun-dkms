@@ -72,13 +72,14 @@ class VM:
         return res
 
     def start(self):
+        guest_bootstrap = Path(__file__).resolve().parent / "guest" / "bootstrap.py"
         cmd = [
             "vng",
             "--ssh",
             "--user",
             "root",
             "--exec",
-            "sleep 3600",
+            f"python3 {shlex.quote(str(guest_bootstrap))} && exec sleep 3600",
         ]
 
         self.ubuntu_kernel_dir = None

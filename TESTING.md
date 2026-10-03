@@ -11,6 +11,15 @@ The integration tests use `pytest` and `virtme-ng` (vng). `virtme-ng` boots a QE
 > **Important:** `virtme-ng` uses a **COW (Copy-on-Write)** filesystem. This means the guest VM sees a "snapshot" of the host filesystem at the moment it is created. Any subsequent modifications to host files (e.g. editing source code) will **not** be visible to the guest until the VM is restarted. 
 >
 > The test framework handles this by preparing a source tarball (`.dkms_copy.tar`) **before** spawning the VM, ensuring the latest git-tracked changes are captured.
+
+### Arch Linux guest SSH startup
+
+Arch's OpenSSH uses `/usr/share/empty.sshd` as its pre-authentication chroot. If that directory inherits non-root ownership or group/other write permissions, OpenSSH rejects it and VM startup times out. Debian/Ubuntu use `/run/sshd`, which virtme-ng already creates as guest root, so they need no such workaround.
+
+The harness runs `tests/guest/bootstrap.py` through `vng --exec`, independently of SSH. For the existing Arch directory, it sets non-root ownership to `0:0` and removes group/other write bits as needed. Valid or absent directories are left alone. Changes stay in the guest's COW overlay and do not modify the host.
+
+This guest-SSH setup gap was reproduced on 2026-10-04 with upstream virtme-ng [`main` at `da73944`](https://github.com/arighi/virtme-ng/blob/da73944e81bafd74de78fe37e08ff944b53e4d4e/virtme/guest/virtme-sshd-script). Upstream could handle Arch's chroot in that script before starting `sshd`.
+
 ## Preparing Kernels
 
 Before testing against a specific Ubuntu kernel version, you must prepare it on the host:
@@ -66,6 +75,7 @@ Logs are automatically saved to `~/.cache/logs/phantun_tests/YYYYMMDD_HHMMSS/`.
   - `phantun_module`: installs via DKMS once per session and reloads module parameters through `/etc/modprobe.d/phantun.conf`
   - `dmesg`: waits for new kernel log lines
 - `tests/helpers.py`: Shared helper API for namespaces, guest scenario execution, nft probes, and module stat reads.
+- `tests/guest/bootstrap.py`: repairs Arch's pre-auth chroot ownership and permissions inside the guest.
 - `tests/guest/scenarios.py`: Small checked-in guest-side Python scenarios used by the tests.
 - `tests/test_dkms.py`: DKMS install/load/reload and parameter validation coverage.
 - `tests/test_config_stats.py`: selector configuration, `/sys/module/phantun/stats/*`, and basic selector-path behavior.
