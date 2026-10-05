@@ -1,4 +1,5 @@
 subdir-ccflags-y += -I$(src)
 
 obj-m := phantun.o
-phantun-y := src/phantun_main.o src/phantun_packet.o src/phantun_flow.o src/phantun_stats.o
+phantun-y := src/phantun_main.o src/phantun_config.o src/phantun_netns.o \
+	src/phantun_packet.o src/phantun_flow.o src/phantun_stats.o

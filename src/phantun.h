@@ -23,7 +23,7 @@
 #define PHANTUN_DEFAULT_REPLACEMENT_PROTECT_MS 0U
 /* PRE_ROUTING uses -399 so IPv4/IPv6 defrag at -400 runs first. The
  * raw-UDP drop and fake-TCP hooks intentionally share this priority and
- * depend on registration order in src/phantun_main.c.
+ * depend on registration order in src/phantun_netns.c.
  */
 #define PHANTUN_PRE_ROUTING_PRIORITY (-399)
 #define PHANTUN_LOCAL_OUT_PRIORITY (-199)
@@ -70,5 +70,24 @@ struct phantun_config {
     unsigned int replacement_protect_ms;
     unsigned int effective_replacement_protect_ms;
 };
+
+/* Constructed before namespace attachment; immutable until all users detach. */
+extern struct phantun_config phantun_cfg;
+int phantun_config_init(void);
+void phantun_config_exit(void);
+
+struct pht_flow_table;
+struct nf_hook_state;
+
+int phantun_netns_init(void);
+void phantun_netns_exit(void);
+struct pht_flow_table *phantun_net_hook_flows(const struct net *net);
+
+unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
+                               const struct nf_hook_state *state);
+unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
+                                 const struct nf_hook_state *state);
+unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb,
+                                          const struct nf_hook_state *state);
 
 #endif

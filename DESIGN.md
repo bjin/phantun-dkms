@@ -92,6 +92,17 @@ That fits netfilter plus direct `sk_buff` ownership better than eBPF, xtables-ta
 
 ## 4. Top-level architecture
 
+`src/phantun_config.c` parses and validates module parameters once, owns the
+decoded shaping payloads, and finishes construction before any namespace or
+packet hook can read the configuration. Configuration is immutable while the
+module is attached and is released only after all namespaces have detached.
+
+`src/phantun_netns.c` owns namespace attachment, TCP port reservations,
+defragmentation, and topology notifiers. Failed attachment and normal exit use
+the same readiness-guarded cleanup: unregister packet hooks before destroying
+their flow table. `src/phantun_main.c` retains module entry/exit and the packet
+hooks and protocol state machine.
+
 ### 4.1 Symmetric nodes
 
 Every host runs the same module.
