@@ -263,10 +263,7 @@ Half-open flow buffering is intentionally small:
 - bound memory and complexity
 - anything beyond the first queued skb is dropped
 
-Queued transmit metadata is meaningful only while the associated skb is
-present. Taking a packet transfers that exact metadata to the caller; an empty
-take still initializes the caller's metadata output but need not rewrite the
-unused internal metadata. Persistent local transmit policy remains separate.
+Queued skb metadata is separate from the persistent local transmit policy.
 
 ## 6. Per-flow state machine
 
@@ -534,8 +531,9 @@ Behavior:
 - allow unmatched or merely forwarded inbound UDP normally
 - do not apply this drop to module-reinjected translated UDP
 
-One `PRE_ROUTING` hook per family parses L3 and discovers the final TCP/UDP
-protocol before dispatching raw-UDP ownership or fake-TCP handling. IPv6
+One `PRE_ROUTING` hook per family selects its IP parser from `state->pf`,
+not `skb->protocol`, then parses L3 and discovers the final TCP/UDP protocol
+before dispatching raw-UDP ownership or fake-TCP handling. IPv6
 extension headers are walked once from the outer header, and borrowed header
 pointers are refreshed after any pull that can relocate the skb head. Parsing
 does not advance `skb->transport_header`, so unowned packets can resume normal

@@ -280,20 +280,6 @@ static int phantun_parse_udp_skb(struct sk_buff *skb, struct pht_l4_view *view) 
     return pht_parse_ipv6_udp(skb, view);
 }
 
-static int phantun_parse_transport_skb(struct sk_buff *skb, struct pht_l4_view *view) {
-    int ret;
-
-    if (skb->protocol == htons(ETH_P_IP))
-        return pht_parse_ipv4_transport(skb, view);
-    if (skb->protocol == htons(ETH_P_IPV6))
-        return pht_parse_ipv6_transport(skb, view);
-
-    ret = pht_parse_ipv4_transport(skb, view);
-    if (!ret)
-        return 0;
-    return pht_parse_ipv6_transport(skb, view);
-}
-
 static int phantun_validate_tcp_checksums(const struct sk_buff *skb,
                                           const struct pht_l4_view *view) {
     if (view->family == AF_INET)
@@ -2181,7 +2167,19 @@ unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     if (phantun_pre_routing_uses_loopback_dev(skb, state))
         return NF_ACCEPT;
 
-    ret = phantun_parse_transport_skb(skb, &ctx.view);
+    /* Netfilter selected the family before invoking this hook; do not infer
+     * it again from skb metadata or probe an unrelated IP parser.
+     */
+    switch (state->pf) {
+    case NFPROTO_IPV4:
+        ret = pht_parse_ipv4_transport(skb, &ctx.view);
+        break;
+    case NFPROTO_IPV6:
+        ret = pht_parse_ipv6_transport(skb, &ctx.view);
+        break;
+    default:
+        return NF_ACCEPT;
+    }
     if (ret)
         return NF_ACCEPT;
     if (!phantun_family_enabled(ctx.view.family))

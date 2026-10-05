@@ -147,6 +147,9 @@ struct pht_flow {
      * is waiting for the injected handshake_response to clear.
      */
     struct sk_buff *queued_skb;
+    /* Valid only while queued_skb != NULL. Publish the skb and its metadata
+     * together under flow->lock; an empty queue's metadata is not transmit policy.
+     */
     struct pht_tx_meta queued_tx_meta;
     unsigned int retries_done;
     unsigned int max_retries;
@@ -280,6 +283,7 @@ bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
                                  const struct pht_tx_meta *meta);
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb,
                              const struct pht_tx_meta *meta);
+/* Transfer the packet and its metadata; initialize @meta even for an empty queue. */
 struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow, struct pht_tx_meta *meta);
 enum pht_flow_complete_result
 pht_flow_complete_handshake(struct pht_flow *flow,

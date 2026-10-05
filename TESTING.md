@@ -91,11 +91,11 @@ Logs are automatically saved to `~/.cache/logs/phantun_tests/YYYYMMDD_HHMMSS/`.
 - `tests/test_wireguard.py`: end-to-end coverage for kernel WireGuard and `wireguard-go`.
 
 The raw-IP checksum cases verify packet bytes independently of skb checksum
-flags. Veth/GSO delivery does not guarantee a nonlinear source skb or an odd
-source offset. Copy-helper changes also need an isolated kernel probe with
-linear, page-fragment, and frag-list skbs, odd offsets, invalid ranges, and
-computed-zero checksums; the integration suite alone does not cover those
-internal layouts.
+flags, but do not force nonlinear source skbs or odd source offsets.
+Dedicated coverage of nonlinear layouts, odd offsets, source-range rejection,
+and computed-zero checksums is not part of the persistent suite. Those cases
+were exercised using a temporary kernel probe; no reusable probe is checked
+into this repository.
 
 ### Best Practices
 
