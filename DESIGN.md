@@ -286,6 +286,23 @@ Each flow stores:
 - initiator bare-`SYN` replacement-protection deadline
 - refcount and lock
 
+Established ACK/data processing has a locked preparation phase and an unlocked
+execution phase. The initial flow lock covers generation classification,
+quarantine, response-release and replay decisions, shaping-slot consumption,
+ACK/window progress, and liveness updates. A small stack action then selects
+ignore/quarantine, queue flush, payload delivery, or oversized rejection.
+Pure ACKs refresh liveness without advancing the payload ACK; replayed opening
+payloads do not refresh progress, and oversized delivery is rejected before
+ACK/liveness changes.
+
+The hook retains its lookup reference across both phases. Handshake payload
+delivery rechecks `ESTABLISHED` when committing progress; an already committed
+action can finish concurrently with later teardown without losing that
+reference. No packet allocation, routing, reinjection, or transmission occurs
+under the preparation lock. Queue flushing remains before the idle-ACK
+suppression decision so a just-flushed or concurrent local payload can carry
+the ACK. The separate `tx_lock` still orders sequence reservation and rollback.
+
 ### 6.1 Initiator states
 
 #### `SYN_SENT`

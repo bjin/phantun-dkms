@@ -1174,9 +1174,7 @@ void pht_flow_touch_inbound(struct pht_flow *flow) {
         return;
 
     spin_lock_bh(&flow->lock);
-    flow->last_inbound_jiffies = jiffies;
-    flow->last_activity_jiffies = jiffies;
-    flow->keepalives_sent = 0;
+    pht_flow_touch_inbound_locked(flow);
     spin_unlock_bh(&flow->lock);
 }
 

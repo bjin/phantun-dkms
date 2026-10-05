@@ -435,27 +435,31 @@ static bool phantun_flow_matches_current_generation_locked(const struct pht_flow
     return phantun_seq_between(ack, flow->local_seq_window_start, flow->seq);
 }
 
+static bool phantun_flow_should_drop_quarantined_packet_locked(struct pht_flow *flow,
+                                                               const struct pht_l4_view *view) {
+    lockdep_assert_held(&flow->lock);
+    if (phantun_tcp_is_bare_syn(view) || !flow->quarantine_prev_active)
+        return false;
+    if (time_after_eq(jiffies, flow->quarantine_until_jiffies)) {
+        flow->quarantine_prev_active = false;
+        return false;
+    }
+    if (!phantun_flow_matches_quarantine_locked(flow, view))
+        return false;
+    if (flow->state == PHT_FLOW_STATE_ESTABLISHED &&
+        phantun_flow_matches_current_generation_locked(flow, view))
+        return false;
+    return true;
+}
+
 static bool phantun_flow_should_drop_quarantined_packet(struct pht_flow *flow,
                                                         const struct pht_l4_view *view) {
-    bool drop = false;
+    bool drop;
 
     if (!flow || !view || phantun_tcp_is_bare_syn(view))
         return false;
-
     spin_lock_bh(&flow->lock);
-    if (!flow->quarantine_prev_active)
-        goto out;
-    if (time_after_eq(jiffies, flow->quarantine_until_jiffies)) {
-        flow->quarantine_prev_active = false;
-        goto out;
-    }
-    if (!phantun_flow_matches_quarantine_locked(flow, view))
-        goto out;
-    if (flow->state == PHT_FLOW_STATE_ESTABLISHED &&
-        phantun_flow_matches_current_generation_locked(flow, view))
-        goto out;
-    drop = true;
-out:
+    drop = phantun_flow_should_drop_quarantined_packet_locked(flow, view);
     spin_unlock_bh(&flow->lock);
     if (drop)
         pht_stats_inc(PHT_STAT_REPLACEMENT_QUARANTINE_DROPPED);
@@ -918,11 +922,29 @@ static int phantun_reinject_inbound_payload(const struct pht_endpoint_pair *ep,
                                              flows->reinject_mark);
 }
 
-static void phantun_refresh_inbound_progress(struct pht_flow *flow, const struct pht_l4_view *view,
-                                             bool *allow_flush) {
+enum phantun_rx_action_kind {
+    PHT_RX_DONE,
+    PHT_RX_FLUSH,
+    PHT_RX_DELIVER,
+    PHT_RX_REJECT_OVERSIZED,
+    PHT_RX_QUARANTINED,
+};
+
+/* Prepared under flow->lock and executed without it. The hook keeps its flow
+ * reference across both phases; this record owns no skb or dst reference.
+ */
+struct phantun_rx_action {
+    enum phantun_rx_action_kind kind;
+    bool reinject_payload;
+    bool allow_flush;
+    bool shaping_dropped;
+};
+
+static bool phantun_refresh_inbound_progress_locked(struct pht_flow *flow,
+                                                    const struct pht_l4_view *view) {
     u32 seq_end = ntohl(view->tcp->seq) + view->payload_len;
 
-    spin_lock_bh(&flow->lock);
+    lockdep_assert_held(&flow->lock);
     /* Reserved shaping payloads can arrive after higher-sequence real data.
      * Keep our advertised ACK monotonic when we silently drop that delayed
      * control packet.
@@ -942,16 +964,14 @@ static void phantun_refresh_inbound_progress(struct pht_flow *flow, const struct
         flow->drop_next_rx_seq = 0;
     }
     phantun_flow_refresh_remote_seq_window_locked(flow);
-    flow->last_activity_jiffies = jiffies;
-    flow->last_inbound_jiffies = jiffies;
-    flow->keepalives_sent = 0;
-    if (allow_flush)
-        *allow_flush = !flow->response_pending_ack;
-    spin_unlock_bh(&flow->lock);
+    pht_flow_touch_inbound_locked(flow);
+    return !flow->response_pending_ack;
 }
 
 static void phantun_note_inbound_payload(struct pht_flow *flow, const struct pht_l4_view *view) {
-    phantun_refresh_inbound_progress(flow, view, NULL);
+    spin_lock_bh(&flow->lock);
+    phantun_refresh_inbound_progress_locked(flow, view);
+    spin_unlock_bh(&flow->lock);
 }
 
 /* Caller holds flow->lock. */
@@ -993,27 +1013,28 @@ static bool phantun_should_suppress_idle_ack(struct pht_flow *flow) {
     return suppress;
 }
 
-static int
-phantun_finalize_established_rx(struct pht_flow *flow, const struct pht_endpoint_pair *ep,
-                                const struct sk_buff *skb, const struct pht_l4_view *view,
-                                struct net *net, struct net_device *dev, bool reinject_payload,
-                                bool send_idle_ack, const struct pht_tx_meta *reply_meta) {
-    bool allow_flush;
+/* The caller classified a live established generation under this same lock.
+ * Oversized payloads must not advance ACK/liveness state or attempt allocation.
+ */
+static void phantun_prepare_payload_locked(struct pht_flow *flow, const struct pht_l4_view *view,
+                                           bool reinject, struct phantun_rx_action *action) {
+    lockdep_assert_held(&flow->lock);
+    if (view->payload_len && phantun_payload_exceeds_udp_reinject_limit(view)) {
+        action->kind = PHT_RX_REJECT_OVERSIZED;
+        return;
+    }
+    action->kind = PHT_RX_DELIVER;
+    action->reinject_payload = reinject;
+    action->allow_flush = phantun_refresh_inbound_progress_locked(flow, view);
+}
+
+static int phantun_finalize_established_rx(
+    struct pht_flow *flow, const struct pht_endpoint_pair *ep, const struct sk_buff *skb,
+    const struct pht_l4_view *view, struct net *net, struct net_device *dev,
+    const struct phantun_rx_action *action, const struct pht_tx_meta *reply_meta) {
     int ret = 0;
 
-    /* Oversized inbound payload is a protocol violation for this translator.
-     * We cannot truthfully repackage it into a local UDP skb within our fixed
-     * packet budget, so reject it before any ACK/liveness state is refreshed
-     * or any large atomic allocation is attempted.
-     */
-    if (view->payload_len && phantun_payload_exceeds_udp_reinject_limit(view)) {
-        pht_stats_inc(PHT_STAT_OVERSIZED_PAYLOADS_DROPPED);
-        return -EMSGSIZE;
-    }
-
-    phantun_refresh_inbound_progress(flow, view, &allow_flush);
-
-    if (reinject_payload) {
+    if (action->reinject_payload) {
         ret = phantun_reinject_inbound_payload(ep, skb, view, net, dev);
         if (ret == -ENOBUFS || ret == -ENOMEM) {
             pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
@@ -1024,7 +1045,7 @@ phantun_finalize_established_rx(struct pht_flow *flow, const struct pht_endpoint
         }
     }
 
-    if (allow_flush) {
+    if (action->allow_flush) {
         ret = phantun_flush_queued_udp(flow, net, NULL);
         if (ret) {
             phantun_discard_queued_udp_translation_failure(flow);
@@ -1032,11 +1053,11 @@ phantun_finalize_established_rx(struct pht_flow *flow, const struct pht_endpoint
         }
     }
 
-    if (send_idle_ack && view->payload_len) {
+    if (view->payload_len) {
         /* Reserved first-payload control drops are not application data; they
          * still need the prompt pure ACK that releases control-response state.
          */
-        if (reinject_payload && phantun_should_suppress_idle_ack(flow)) {
+        if (action->reinject_payload && phantun_should_suppress_idle_ack(flow)) {
             pht_stats_inc(PHT_STAT_IDLE_ACKS_SUPPRESSED);
         } else {
             ret = phantun_send_idle_ack(flow, net, reply_meta);
@@ -1465,9 +1486,9 @@ struct phantun_pre_routing_ctx {
     struct pht_tx_meta tx_meta;
 };
 
-/* Flow fields sampled once under flow->lock to classify a packet. Handlers
- * that change protocol state revalidate it under the lock, e.g. through
- * pht_flow_complete_handshake().
+/* Half-open and control-packet slow paths need a snapshot. Established ACK/data
+ * instead commits classification and progress under the initial flow lock.
+ * Handshake completion still revalidates its expected state under that lock.
  */
 struct phantun_pre_routing_snapshot {
     enum pht_flow_state state;
@@ -1511,19 +1532,40 @@ static bool phantun_pre_routing_flush_queue(const struct phantun_pre_routing_ctx
     return false;
 }
 
-/* Finish an inbound segment on an ESTABLISHED flow: advance ACK state,
- * reinject its payload as local UDP when @reinject, flush queued UDP, and ACK.
- * Any failure ends the generation; oversized payload is a protocol violation
- * and is answered with RST|ACK first. @what names the segment in the log.
+/* Execute a committed RX decision without holding flow->lock. Queue flushing
+ * and ACK suppression intentionally stay ordered after reinjection: a flushed
+ * payload (or a concurrent sender) can make the immediate ACK unnecessary.
  */
-static void phantun_pre_routing_deliver(const struct phantun_pre_routing_ctx *ctx,
-                                        struct pht_flow *flow, bool reinject, const char *what) {
+static void phantun_pre_routing_finish_rx(const struct phantun_pre_routing_ctx *ctx,
+                                          struct pht_flow *flow,
+                                          const struct phantun_rx_action *action,
+                                          const char *what) {
     int ret;
 
-    ret = phantun_finalize_established_rx(flow, &ctx->ep, ctx->skb, &ctx->view, ctx->net,
-                                          ctx->in_dev, reinject, true, &ctx->tx_meta);
-    if (!ret)
+    if (action->shaping_dropped)
+        pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
+    switch (action->kind) {
+    case PHT_RX_DONE:
         return;
+    case PHT_RX_QUARANTINED:
+        pht_stats_inc(PHT_STAT_REPLACEMENT_QUARANTINE_DROPPED);
+        return;
+    case PHT_RX_FLUSH:
+        phantun_pre_routing_flush_queue(ctx, flow);
+        return;
+    case PHT_RX_REJECT_OVERSIZED:
+        pht_stats_inc(PHT_STAT_OVERSIZED_PAYLOADS_DROPPED);
+        ret = -EMSGSIZE;
+        break;
+    case PHT_RX_DELIVER:
+        ret = phantun_finalize_established_rx(flow, &ctx->ep, ctx->skb, &ctx->view, ctx->net,
+                                              ctx->in_dev, action, &ctx->tx_meta);
+        if (!ret)
+            return;
+        break;
+    default:
+        return;
+    }
 
     pht_pr_warn("failed to process %s: %d\n", what, ret);
     if (ret == -EMSGSIZE) {
@@ -1531,6 +1573,20 @@ static void phantun_pre_routing_deliver(const struct phantun_pre_routing_ctx *ct
         phantun_send_rstack(ctx->net, &ctx->ep, &ctx->view, &ctx->tx_meta);
     }
     pht_flow_remove(flow);
+}
+
+/* The winning responder completion has already consumed its opening shaping
+ * slot. Only commit payload progress here, not the ordinary ACK/replay policy.
+ */
+static void phantun_pre_routing_deliver(const struct phantun_pre_routing_ctx *ctx,
+                                        struct pht_flow *flow, bool reinject, const char *what) {
+    struct phantun_rx_action action = {.kind = PHT_RX_DONE};
+
+    spin_lock_bh(&flow->lock);
+    if (flow->state == PHT_FLOW_STATE_ESTABLISHED)
+        phantun_prepare_payload_locked(flow, &ctx->view, reinject, &action);
+    spin_unlock_bh(&flow->lock);
+    phantun_pre_routing_finish_rx(ctx, flow, &action, what);
 }
 
 /* Allocate an unpublished SYN_RCVD responder generation answering the bare
@@ -1785,19 +1841,26 @@ static void phantun_pre_routing_syn_sent(const struct phantun_pre_routing_ctx *c
     pht_flow_remove(flow);
 }
 
-/* ACK/data on an ESTABLISHED flow. @raced_final_ack marks a responder final
- * ACK whose handshake completion lost to another CPU: payload that replays
- * the opening payload the winner claimed, or that flow->ack already covers,
- * is not delivered twice.
+/* Commit ACK/data classification and progress in one critical section. The
+ * handshake loser uses the same transaction but retains final-ACK replay
+ * suppression and its existing bypass of previous-generation quarantine.
+ * False means the generation is no longer established; no state was changed.
  */
-static void phantun_pre_routing_established_data(const struct phantun_pre_routing_ctx *ctx,
-                                                 struct pht_flow *flow, bool raced_final_ack) {
-    const struct pht_l4_view *view = &ctx->view;
+static bool phantun_prepare_established_data_locked(struct pht_flow *flow,
+                                                    const struct pht_l4_view *view,
+                                                    bool raced_final_ack,
+                                                    struct phantun_rx_action *action) {
     bool response_unblocked = false;
     bool replayed_payload = false;
-    bool drop_payload = false;
 
-    spin_lock_bh(&flow->lock);
+    lockdep_assert_held(&flow->lock);
+    if (flow->state != PHT_FLOW_STATE_ESTABLISHED)
+        return false;
+    *action = (struct phantun_rx_action){.kind = PHT_RX_DONE};
+    if (!raced_final_ack && phantun_flow_should_drop_quarantined_packet_locked(flow, view)) {
+        action->kind = PHT_RX_QUARANTINED;
+        return true;
+    }
     if (flow->response_pending_ack) {
         if (view->tcp->ack &&
             phantun_seq_after_eq(ntohl(view->tcp->ack_seq),
@@ -1824,28 +1887,21 @@ static void phantun_pre_routing_established_data(const struct phantun_pre_routin
              payload_end == flow->opening_rx_seq_end) ||
             phantun_seq_after_eq(flow->ack, payload_end);
     }
-    if (phantun_consume_drop_next_rx_payload_locked(flow, view)) {
-        drop_payload = true;
-        pht_stats_inc(PHT_STAT_SHAPING_PAYLOADS_DROPPED);
-    }
-    spin_unlock_bh(&flow->lock);
-
+    action->shaping_dropped = phantun_consume_drop_next_rx_payload_locked(flow, view);
     if (replayed_payload) {
         if (response_unblocked)
-            phantun_pre_routing_flush_queue(ctx, flow);
-        return;
+            action->kind = PHT_RX_FLUSH;
+        return true;
     }
-
-    if (view->payload_len == 0) {
-        pht_flow_touch_inbound(flow);
+    if (!view->payload_len) {
+        pht_flow_touch_inbound_locked(flow);
         if (response_unblocked)
-            phantun_pre_routing_flush_queue(ctx, flow);
-        return;
+            action->kind = PHT_RX_FLUSH;
+        return true;
     }
 
-    phantun_pre_routing_deliver(ctx, flow, !drop_payload,
-                                raced_final_ack ? "raced responder payload"
-                                                : "established inbound payload");
+    phantun_prepare_payload_locked(flow, view, !action->shaping_dropped, action);
+    return true;
 }
 
 /* Exact final ACK in SYN_RCVD: complete the handshake, then either inject the
@@ -1875,8 +1931,17 @@ phantun_pre_routing_complete_responder(const struct phantun_pre_routing_ctx *ctx
     if (complete == PHT_FLOW_COMPLETE_STALE)
         return;
     if (complete == PHT_FLOW_COMPLETE_ALREADY_ESTABLISHED) {
-        /* Another CPU completed the handshake after our SYN_RCVD snapshot. */
-        phantun_pre_routing_established_data(ctx, flow, true);
+        struct phantun_rx_action action;
+        bool prepared;
+
+        /* Recheck under the commit lock in case this generation was detached
+         * after handshake completion reported the winner on another CPU.
+         */
+        spin_lock_bh(&flow->lock);
+        prepared = phantun_prepare_established_data_locked(flow, &ctx->view, true, &action);
+        spin_unlock_bh(&flow->lock);
+        if (prepared)
+            phantun_pre_routing_finish_rx(ctx, flow, &action, "raced responder payload");
         return;
     }
 
@@ -2017,45 +2082,34 @@ static void phantun_pre_routing_established_syn(const struct phantun_pre_routing
     phantun_pre_routing_accept_syn(ctx, NULL, &prev);
 }
 
-/* ESTABLISHED handling still prioritizes flags over payload. Duplicate open
- * packets are absorbed, bare SYN can replace the generation, any other SYN is
- * fatal, and plain ACK/data continues the stream.
- */
-static void phantun_pre_routing_established(const struct phantun_pre_routing_ctx *ctx,
-                                            struct pht_flow *flow,
-                                            const struct phantun_pre_routing_snapshot *snap) {
-    if (phantun_flow_should_drop_quarantined_packet(flow, &ctx->view))
-        return;
-
-    if (ctx->view.tcp->syn) {
-        phantun_pre_routing_established_syn(ctx, flow, snap);
-        return;
-    }
-
-    if (!phantun_tcp_is_established_ack(&ctx->view)) {
-        phantun_account_tcp_protocol_rejected();
-        phantun_pre_routing_send_rstack(ctx, "unsupported established flags");
-        pht_flow_remove(flow);
-        return;
-    }
-
-    phantun_pre_routing_established_data(ctx, flow, false);
-}
-
 /* Classify an owned packet against the flow hashed on its tuple. @flow is
  * borrowed; the hook drops the lookup reference.
  */
 static void phantun_pre_routing_dispatch(const struct phantun_pre_routing_ctx *ctx,
                                          struct pht_flow *flow) {
     struct phantun_pre_routing_snapshot snap;
+    struct phantun_rx_action action;
+    bool quarantined = false;
 
     spin_lock_bh(&flow->lock);
+    if (phantun_tcp_is_established_ack(&ctx->view) &&
+        phantun_prepare_established_data_locked(flow, &ctx->view, false, &action)) {
+        spin_unlock_bh(&flow->lock);
+        phantun_pre_routing_finish_rx(ctx, flow, &action, "established inbound payload");
+        return;
+    }
     snap.state = flow->state;
     snap.role = flow->role;
     snap.local_isn = flow->local_isn;
     snap.peer_syn_next = flow->peer_syn_next;
     snap.had_queued = flow->queued_skb != NULL;
+    if (snap.state == PHT_FLOW_STATE_ESTABLISHED)
+        quarantined = phantun_flow_should_drop_quarantined_packet_locked(flow, &ctx->view);
     spin_unlock_bh(&flow->lock);
+    if (quarantined) {
+        pht_stats_inc(PHT_STAT_REPLACEMENT_QUARANTINE_DROPPED);
+        return;
+    }
 
     /* Allocation-failure tombstone: keep it hashed as the previous sequence
      * source unless this packet publishes a replacement SYN.
@@ -2067,7 +2121,8 @@ static void phantun_pre_routing_dispatch(const struct phantun_pre_routing_ctx *c
 
     /* RST ends a live generation unless it fits the quarantined previous one. */
     if (ctx->view.tcp->rst) {
-        if (!phantun_flow_should_drop_quarantined_packet(flow, &ctx->view))
+        if (snap.state == PHT_FLOW_STATE_ESTABLISHED ||
+            !phantun_flow_should_drop_quarantined_packet(flow, &ctx->view))
             pht_flow_remove(flow);
         return;
     }
@@ -2080,7 +2135,16 @@ static void phantun_pre_routing_dispatch(const struct phantun_pre_routing_ctx *c
         phantun_pre_routing_syn_rcvd(ctx, flow, &snap);
         break;
     case PHT_FLOW_STATE_ESTABLISHED:
-        phantun_pre_routing_established(ctx, flow, &snap);
+        /* Valid ACK/data already committed above. The remaining established
+         * packets are SYN controls or unsupported flags; RST was handled first.
+         */
+        if (ctx->view.tcp->syn) {
+            phantun_pre_routing_established_syn(ctx, flow, &snap);
+        } else {
+            phantun_account_tcp_protocol_rejected();
+            phantun_pre_routing_send_rstack(ctx, "unsupported established flags");
+            pht_flow_remove(flow);
+        }
         break;
     default:
         break;

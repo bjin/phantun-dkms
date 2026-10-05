@@ -6,6 +6,7 @@
 
 #include <linux/jiffies.h>
 #include <linux/list.h>
+#include <linux/lockdep.h>
 #include <linux/refcount.h>
 #include <linux/skbuff.h>
 #include <linux/spinlock.h>
@@ -263,6 +264,17 @@ int pht_flow_emit_established_payload(struct pht_flow *flow, struct net *net,
                                       size_t payload_len, const struct pht_tx_meta *meta,
                                       int *out_ifindex);
 void pht_flow_touch_inbound(struct pht_flow *flow);
+
+/* Caller holds flow->lock; both liveness clocks describe the same RX event. */
+static inline void pht_flow_touch_inbound_locked(struct pht_flow *flow) {
+    unsigned long now = jiffies;
+
+    lockdep_assert_held(&flow->lock);
+    flow->last_inbound_jiffies = now;
+    flow->last_activity_jiffies = now;
+    flow->keepalives_sent = 0;
+}
+
 void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex);
 bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
                                  const struct pht_tx_meta *meta);

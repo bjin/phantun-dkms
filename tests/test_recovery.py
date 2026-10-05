@@ -703,6 +703,7 @@ def test_established_duplicate_current_generation_syn_dispatch(phantun_module, v
     dst_port = PORTS_B[0]
     syn_ready = f"/tmp/phantun-capture-syn-{uuid.uuid4().hex}"
     synack_ready = f"/tmp/phantun-capture-synack-{uuid.uuid4().hex}"
+    server_ready = f"/tmp/phantun-duplicate-syn-server-{uuid.uuid4().hex}"
     capture_syn = spawn_netns_scenario(
         vm,
         NS_B,
@@ -782,12 +783,14 @@ def test_established_duplicate_current_generation_syn_dispatch(phantun_module, v
             "bind_port": dst_port,
             "count": 1,
             "timeout_sec": 10,
+            "ready_file": server_ready,
         },
     )
 
     try:
         wait_for_guest_ready_file(vm, syn_ready, timeout=5)
         wait_for_guest_ready_file(vm, synack_ready, timeout=5)
+        wait_for_guest_ready_file(vm, server_ready, timeout=5)
         client_result = run_netns_scenario(
             vm,
             NS_A,
@@ -874,6 +877,9 @@ def test_established_duplicate_current_generation_syn_dispatch(phantun_module, v
         if read_module_stats(vm)["flows_created"] != baseline_stats["flows_created"]:
             pytest.fail("duplicate current-generation SYN should not replace the flow")
     finally:
+        for process in (server, capture_syn, capture_synack):
+            process.terminate()
+        vm.run(["rm", "-f", syn_ready, synack_ready, server_ready], check=False)
         initiator_probe.cleanup(vm)
         responder_probe.cleanup(vm)
         cleanup_netns_topology(vm)
@@ -1605,6 +1611,105 @@ def test_unknown_tuple_rst_sequence_follows_ack_flag(phantun_module, vm):
         assert stats["tcp_unknown_tuple_rejected"] == baseline["tcp_unknown_tuple_rejected"] + 2
         assert stats["rst_sent"] == baseline["rst_sent"] + 2
     finally:
+        cleanup_netns_topology(vm)
+
+
+def test_established_pure_ack_does_not_advance_payload_ack(phantun_module, vm):
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, keepalive_interval_sec=60)
+    ensure_netns_topology(vm)
+    src_port, dst_port = PORTS_A[0], PORTS_B[0]
+    ready_file = f"/tmp/phantun-pure-ack-{uuid.uuid4().hex}"
+    server = first_capture = reply_capture = None
+    try:
+        server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_many_reply",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 2,
+                "replies": ["ready", "after-ready"],
+                "ready_file": ready_file,
+                "timeout_sec": 30,
+            },
+        )
+        wait_for_guest_ready_file(vm, ready_file)
+        first_capture = spawn_ready_capture(
+            vm,
+            NS_B,
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payload": "warmup",
+                "timeout_sec": 20,
+            },
+        )
+        client_config = {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+        }
+        warmup = run_netns_scenario(vm, NS_A, "ping_client", {**client_config, "payload": "warmup"}, timeout=10)
+        assert_completed(warmup, "pure-ACK warm-up")
+        if parse_guest_json(warmup.stdout, "pure-ACK warm-up")["reply"] != "ready":
+            pytest.fail("pure-ACK warm-up did not establish bidirectional delivery")
+        first_result = first_capture.communicate(timeout=20)
+        assert_completed(first_result, "initial payload sequence capture")
+        first = parse_guest_json(first_result.stdout, "initial payload sequence")
+        next_seq = (first["seq"] + len("warmup")) & 0xFFFFFFFF
+
+        # An ACK-only keepalive consumes no sequence space. A future seq must
+        # not move the receiver's advertised payload ACK past real later data.
+        injected = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_tcp_packet",
+            {
+                **client_config,
+                "flags": "ack",
+                "seq": (next_seq + 65536) & 0xFFFFFFFF,
+                "ack": (first["ack"] + len("ready")) & 0xFFFFFFFF,
+                "payload": "",
+            },
+            timeout=10,
+        )
+        assert_completed(injected, "future-sequence pure ACK")
+        reply_capture = spawn_ready_capture(
+            vm,
+            NS_A,
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "payload": "after-ready",
+                "timeout_sec": 20,
+            },
+        )
+        later = run_netns_scenario(vm, NS_A, "ping_client", {**client_config, "payload": "after-ack"}, timeout=10)
+        assert_completed(later, "payload after pure ACK")
+        if parse_guest_json(later.stdout, "payload after pure ACK")["reply"] != "after-ready":
+            pytest.fail("application reply after pure ACK was corrupted")
+        reply_result = reply_capture.communicate(timeout=20)
+        assert_completed(reply_result, "payload ACK capture")
+        reply = parse_guest_json(reply_result.stdout, "payload ACK capture")
+        expected_ack = (next_seq + len("after-ack")) & 0xFFFFFFFF
+        if reply["ack"] != expected_ack:
+            pytest.fail(f"pure ACK advanced the receive sequence window: {reply!r}")
+        server_result = server.communicate(timeout=20)
+        assert_completed(server_result, "pure-ACK receiver")
+        received = parse_guest_json(server_result.stdout, "pure-ACK receiver")["received"]
+        if [entry["message"] for entry in received] != ["warmup", "after-ack"]:
+            pytest.fail(f"pure ACK altered UDP delivery: {received!r}")
+    finally:
+        for process in (reply_capture, first_capture, server):
+            if process is not None:
+                process.terminate()
+        vm.run(["rm", "-f", ready_file], check=False)
         cleanup_netns_topology(vm)
 
 

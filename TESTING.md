@@ -84,7 +84,8 @@ Logs are automatically saved to `~/.cache/logs/phantun_tests/YYYYMMDD_HHMMSS/`.
   real reinjection-cookie collisions on TCP, and raw-IP checksum verification
   for odd/maximal UDP payloads and odd-sized GSO segments in both families.
 - `tests/test_packet_loss.py`: handshake retries, payload-loss behavior, local send failures, and state-machine behavior under packet loss.
-- `tests/test_recovery.py`: collision handling, same-tuple replacement, quarantine, and unknown-packet recovery behavior.
+- `tests/test_recovery.py`: collisions, tuple replacement, quarantine,
+  unknown-packet recovery, and wire-level pure-ACK receive sequence accounting.
 - `tests/test_ipv6.py`: IPv6 translation, routing, WireGuard, and final-protocol
   ownership classification behind IPv6 Destination Options headers.
 - `tests/test_wireguard.py`: end-to-end coverage for kernel WireGuard and `wireguard-go`.
