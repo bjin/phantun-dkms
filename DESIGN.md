@@ -525,6 +525,9 @@ For inbound established fake-TCP data:
 
 - build a new UDP skb using the oriented tuple
 - preserve original UDP source/destination IPs and ports
+- fuse copying and checksum accumulation for head-contiguous payloads; for fragmented skbs, use a checked copy followed by one contiguous checksum to avoid per-fragment checksum folding
+- complete the checksum by adding the UDP header and family-specific pseudo-header to the payload sum
+- retain a complete nonzero UDP checksum (`CSUM_MANGLED_0` for a computed zero) and mark the manufactured skb `CHECKSUM_UNNECESSARY`
 - inject through the original ingress device with `netif_rx()` so receive processing uses that device's network namespace
 - require the original ingress device namespace to match the netfilter hook namespace before reinjecting
 - mark reinjected UDP so the module's raw-UDP drop hook exempts the manufactured skb on its second `PRE_ROUTING` pass

@@ -1178,6 +1178,61 @@ def capture_tcp_packet(config):
                 Path(ready_file).unlink(missing_ok=True)
 
 
+def capture_udp_packets(config):
+    src_addr = config["bind_addr"]
+    dst_addr = config["target_addr"]
+    family = socket.AF_INET6 if ":" in src_addr else socket.AF_INET
+    ready_file = config.get("ready_file")
+    packets = []
+
+    # Raw IP sockets observe the manufactured UDP packet before UDP delivery,
+    # independently of CHECKSUM_UNNECESSARY. IPv6 raw sockets omit the IP
+    # header; binding the exact destination supplies its pseudo-header address.
+    with socket.socket(family, socket.SOCK_RAW, socket.IPPROTO_UDP) as raw_sock:
+        raw_sock.bind(_addr_tuple(dst_addr, 0))
+        raw_sock.settimeout(config.get("timeout_sec", TIMEOUT_SEC))
+        if ready_file:
+            Path(ready_file).write_text("ready\n")
+        try:
+            while len(packets) < config["count"]:
+                packet, peer = raw_sock.recvfrom(65535)
+                if peer[0] != src_addr:
+                    continue
+                if family == socket.AF_INET:
+                    if len(packet) < 20:
+                        continue
+                    ihl = (packet[0] & 0x0F) * 4
+                    total_len = struct.unpack("!H", packet[2:4])[0]
+                    segment = packet[ihl:total_len]
+                    src_bytes, dst_bytes = packet[12:16], packet[16:20]
+                else:
+                    segment = packet
+                    src_bytes = socket.inet_pton(family, peer[0])
+                    dst_bytes = socket.inet_pton(family, dst_addr)
+                if len(segment) < 8:
+                    continue
+                src_port, dst_port, udp_len, udp_check = struct.unpack("!HHHH", segment[:8])
+                if src_port != config["bind_port"] or dst_port != config["target_port"]:
+                    continue
+                if udp_len < 8 or udp_len > len(segment):
+                    continue
+                segment = segment[:udp_len]
+                if family == socket.AF_INET:
+                    pseudo = struct.pack("!4s4sBBH", src_bytes, dst_bytes, 0, socket.IPPROTO_UDP, udp_len)
+                else:
+                    pseudo = struct.pack("!16s16sI3xB", src_bytes, dst_bytes, udp_len, socket.IPPROTO_UDP)
+                packets.append(
+                    {
+                        "payload": segment[8:].decode(),
+                        "checksum_valid": udp_check != 0 and _checksum(pseudo + segment) == 0,
+                    }
+                )
+        finally:
+            if ready_file:
+                Path(ready_file).unlink(missing_ok=True)
+    _emit({"packets": packets})
+
+
 SCENARIOS = {
     "ping_server": ping_server,
     "ping_client": ping_client,
@@ -1198,6 +1253,7 @@ SCENARIOS = {
     "send_ipv4_udp_fragments": send_ipv4_udp_fragments,
     "send_l2_tcp_packet": send_l2_tcp_packet,
     "capture_tcp_packet": capture_tcp_packet,
+    "capture_udp_packets": capture_udp_packets,
     "recv_many_reply": recv_many_reply,
     "send_many_with_barrier": send_many_with_barrier,
     "recv_many_then_inject_tcp": recv_many_then_inject_tcp,

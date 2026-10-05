@@ -177,10 +177,13 @@ int pht_parse_ipv6_tcp(struct sk_buff *skb, struct pht_l4_view *view);
 int pht_validate_ipv6_tcp_checksums(const struct sk_buff *skb, const struct pht_l4_view *view);
 
 void pht_ipv4_complete(struct iphdr *iph, u16 total_len, u8 protocol, __be32 saddr, __be32 daddr);
-void pht_udp_v4_complete(struct iphdr *iph, struct udphdr *uh, u16 udp_len);
+/* UDP completion adds the header and pseudo-header to a checksum of the
+ * already-written payload, relative to the start of that payload.
+ */
+void pht_udp_v4_complete(struct iphdr *iph, struct udphdr *uh, u16 udp_len, __wsum payload_csum);
 void pht_ipv6_complete(struct ipv6hdr *ip6h, u16 payload_len, u8 nexthdr,
                        const struct in6_addr *saddr, const struct in6_addr *daddr);
-void pht_udp_v6_complete(struct ipv6hdr *ip6h, struct udphdr *uh, u16 udp_len);
+void pht_udp_v6_complete(struct ipv6hdr *ip6h, struct udphdr *uh, u16 udp_len, __wsum payload_csum);
 
 struct sk_buff *pht_build_fake_tcp_v4(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                                       u8 flags, const void *payload, size_t payload_len);

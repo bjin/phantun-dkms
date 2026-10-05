@@ -8,6 +8,8 @@ from helpers import (
     NS_ADDR_A,
     NS_ADDR_B,
     NS_B,
+    NS6_ADDR_A,
+    NS6_ADDR_B,
     VETH_A,
     VETH_B,
     VETH_A_ALT,
@@ -717,6 +719,106 @@ def test_netns_generated_fake_tcp_checksum_state_is_valid_or_partial(phantun_mod
         if capture is not None:
             capture.terminate()
         server.terminate()
+        cleanup_netns_topology(vm)
+
+
+@pytest.mark.parametrize("ipv6", [False, True], ids=["ipv4", "ipv6"])
+@pytest.mark.parametrize("gso", [False, True], ids=["datagrams", "gso"])
+def test_netns_reinjected_udp_checksums_cover_payload_boundaries(phantun_module, vm, ipv6, gso):
+    load_netns_module(phantun_module)
+    ensure_netns_topology(vm, with_ipv6=ipv6)
+    src_addr, dst_addr = (NS6_ADDR_A, NS6_ADDR_B) if ipv6 else (NS_ADDR_A, NS_ADDR_B)
+    src_port, dst_port = PORTS_A[0], PORTS_B[0]
+    # Odd GSO segments exercise checksum boundaries after segmentation; normal
+    # sends cover tiny odd lengths and the largest translated payload per family.
+    payloads = (
+        [c * 1439 for c in "ABCD"]
+        if gso
+        else ["A", "BCD", "e" * 17, "f" * 127, "g" * 1439, "h" * (1440 if ipv6 else 1460)]
+    )
+    ready_file = f"/tmp/phantun-udp-csum-recv-{uuid.uuid4().hex}"
+    capture_ready = f"/tmp/phantun-udp-csum-capture-{uuid.uuid4().hex}"
+    server = capture = None
+    try:
+        server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_many_reply",
+            {
+                "bind_addr": dst_addr,
+                "bind_port": dst_port,
+                "count": len(payloads) + 1,
+                "replies": ["ready"],
+                "timeout_sec": 20,
+                "ready_file": ready_file,
+            },
+        )
+        wait_for_guest_ready_file(vm, ready_file)
+        warmup = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            {
+                "bind_addr": src_addr,
+                "bind_port": src_port,
+                "target_addr": dst_addr,
+                "target_port": dst_port,
+                "payload": "warmup",
+            },
+            timeout=10,
+        )
+        assert_completed(warmup, "UDP checksum warm-up")
+        if parse_guest_json(warmup.stdout, "UDP checksum warm-up")["reply"] != "ready":
+            pytest.fail("UDP checksum warm-up did not reach the receiver")
+
+        capture = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "capture_udp_packets",
+            {
+                "bind_addr": src_addr,
+                "bind_port": src_port,
+                "target_addr": dst_addr,
+                "target_port": dst_port,
+                "count": len(payloads),
+                "timeout_sec": 20,
+                "ready_file": capture_ready,
+            },
+        )
+        wait_for_guest_ready_file(vm, capture_ready)
+        sender = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_many",
+            {
+                "bind_addr": src_addr,
+                "bind_port": src_port,
+                "target_addr": dst_addr,
+                "target_port": dst_port,
+                "payloads": ["".join(payloads)] if gso else payloads,
+                "gso_size": 1439 if gso else None,
+            },
+            timeout=10,
+        )
+        assert_completed(sender, "UDP checksum boundary sender")
+        capture_result = capture.communicate(timeout=25)
+        assert_completed(capture_result, "reinjected UDP checksum capture")
+        packets = parse_guest_json(capture_result.stdout, "UDP checksum capture")["packets"]
+        if [packet["payload"] for packet in packets] != payloads:
+            pytest.fail(f"reinjected UDP payload boundaries changed: {packets!r}")
+        if not all(packet["checksum_valid"] for packet in packets):
+            pytest.fail(f"reinjected UDP checksum is invalid: {packets!r}")
+        server_result = server.communicate(timeout=25)
+        assert_completed(server_result, "UDP checksum boundary receiver")
+        received = parse_guest_json(server_result.stdout, "UDP checksum receiver")["received"]
+        if [entry["message"] for entry in received] != ["warmup", *payloads]:
+            pytest.fail(f"application UDP payload boundaries changed: {received!r}")
+    finally:
+        if capture is not None:
+            capture.terminate()
+        if server is not None:
+            server.terminate()
+        vm.run(["rm", "-f", ready_file, capture_ready], check=False)
         cleanup_netns_topology(vm)
 
 

@@ -580,10 +580,10 @@ void pht_ipv4_complete(struct iphdr *iph, u16 total_len, u8 protocol, __be32 sad
     ip_send_check(iph);
 }
 
-void pht_udp_v4_complete(struct iphdr *iph, struct udphdr *uh, u16 udp_len) {
+void pht_udp_v4_complete(struct iphdr *iph, struct udphdr *uh, u16 udp_len, __wsum payload_csum) {
     uh->check = 0;
     uh->check = csum_tcpudp_magic(iph->saddr, iph->daddr, udp_len, IPPROTO_UDP,
-                                  csum_partial(uh, udp_len, 0));
+                                  csum_partial(uh, sizeof(*uh), payload_csum));
     if (!uh->check)
         uh->check = CSUM_MANGLED_0;
 }
@@ -709,11 +709,11 @@ struct sk_buff *pht_build_fake_tcp_v4(const struct pht_endpoint_pair *ep, u32 se
     return skb;
 }
 
-static void pht_udp_v4_complete_skb(struct sk_buff *skb) {
+static void pht_udp_v4_complete_skb(struct sk_buff *skb, __wsum payload_csum) {
     struct iphdr *iph = ip_hdr(skb);
     struct udphdr *uh = udp_hdr(skb);
 
-    pht_udp_v4_complete(iph, uh, ntohs(uh->len));
+    pht_udp_v4_complete(iph, uh, ntohs(uh->len), payload_csum);
     skb->ip_summed = CHECKSUM_UNNECESSARY;
 }
 
@@ -831,11 +831,46 @@ int pht_reinject_udp_v4(struct sk_buff *skb, struct net_device *dev, u32 reinjec
     return ret == NET_RX_DROP ? -ENOBUFS : 0;
 }
 
+/* Callers bound payload_len to the family packet budget and require src for
+ * nonempty payloads. The checksum is relative to payload start, independent
+ * of source offset.
+ */
+static int pht_copy_payload_and_csum(const struct sk_buff *src, unsigned int payload_offset,
+                                     size_t payload_len, void *payload, __wsum *payload_csum) {
+    unsigned int head_len;
+    int ret;
+
+    *payload_csum = 0;
+    if (!payload_len)
+        return 0;
+    if (payload_offset > INT_MAX)
+        return -EFAULT;
+
+    /* A head-bounded copy proves both the source range and contiguity, so
+     * these payloads need no general skb traversal.
+     */
+    head_len = skb_headlen(src);
+    if (payload_offset <= head_len && payload_len <= head_len - payload_offset) {
+        *payload_csum =
+            csum_partial_copy_nocheck(src->data + payload_offset, payload, (int)payload_len);
+        return 0;
+    }
+    /* For fragmented sources, one checked copy followed by a contiguous
+     * checksum avoids the per-fragment checksum folding of the fused walker.
+     */
+    ret = skb_copy_bits(src, (int)payload_offset, payload, (int)payload_len);
+    if (ret)
+        return ret;
+    *payload_csum = csum_partial(payload, (int)payload_len, 0);
+    return 0;
+}
+
 int pht_reinject_udp_payload_from_skb_v4(struct net_device *dev, const struct pht_endpoint_pair *ep,
                                          const struct sk_buff *src, unsigned int payload_offset,
                                          size_t payload_len, u32 reinject_mark) {
     struct sk_buff *skb;
     void *payload;
+    __wsum payload_csum;
     int ret;
 
     if (payload_len > pht_udp_max_payload_len(AF_INET))
@@ -847,15 +882,13 @@ int pht_reinject_udp_payload_from_skb_v4(struct net_device *dev, const struct ph
     if (!skb)
         return -ENOMEM;
 
-    if (payload_len) {
-        ret = skb_copy_bits(src, payload_offset, payload, (int)payload_len);
-        if (ret) {
-            kfree_skb(skb);
-            return ret;
-        }
+    ret = pht_copy_payload_and_csum(src, payload_offset, payload_len, payload, &payload_csum);
+    if (ret) {
+        kfree_skb(skb);
+        return ret;
     }
 
-    pht_udp_v4_complete_skb(skb);
+    pht_udp_v4_complete_skb(skb, payload_csum);
     return pht_reinject_udp_v4(skb, dev, reinject_mark);
 }
 
@@ -871,9 +904,11 @@ void pht_ipv6_complete(struct ipv6hdr *ip6h, u16 payload_len, u8 nexthdr,
     ip6h->daddr = *daddr;
 }
 
-void pht_udp_v6_complete(struct ipv6hdr *ip6h, struct udphdr *uh, u16 udp_len) {
+void pht_udp_v6_complete(struct ipv6hdr *ip6h, struct udphdr *uh, u16 udp_len,
+                         __wsum payload_csum) {
     uh->check = 0;
-    uh->check = udp_v6_check(udp_len, &ip6h->saddr, &ip6h->daddr, csum_partial(uh, udp_len, 0));
+    uh->check = udp_v6_check(udp_len, &ip6h->saddr, &ip6h->daddr,
+                             csum_partial(uh, sizeof(*uh), payload_csum));
     if (!uh->check)
         uh->check = CSUM_MANGLED_0;
 }
@@ -998,11 +1033,11 @@ struct sk_buff *pht_build_fake_tcp_v6(const struct pht_endpoint_pair *ep, u32 se
     return skb;
 }
 
-static void pht_udp_v6_complete_skb(struct sk_buff *skb) {
+static void pht_udp_v6_complete_skb(struct sk_buff *skb, __wsum payload_csum) {
     struct ipv6hdr *ip6h = ipv6_hdr(skb);
     struct udphdr *uh = udp_hdr(skb);
 
-    pht_udp_v6_complete(ip6h, uh, ntohs(uh->len));
+    pht_udp_v6_complete(ip6h, uh, ntohs(uh->len), payload_csum);
     skb->ip_summed = CHECKSUM_UNNECESSARY;
 }
 
@@ -1119,6 +1154,7 @@ int pht_reinject_udp_payload_from_skb_v6(struct net_device *dev, const struct ph
                                          size_t payload_len, u32 reinject_mark) {
     struct sk_buff *skb;
     void *payload;
+    __wsum payload_csum;
     int ret;
 
     if (payload_len > pht_udp_max_payload_len(AF_INET6))
@@ -1130,22 +1166,21 @@ int pht_reinject_udp_payload_from_skb_v6(struct net_device *dev, const struct ph
     if (!skb)
         return -ENOMEM;
 
-    if (payload_len) {
-        ret = skb_copy_bits(src, payload_offset, payload, (int)payload_len);
-        if (ret) {
-            kfree_skb(skb);
-            return ret;
-        }
+    ret = pht_copy_payload_and_csum(src, payload_offset, payload_len, payload, &payload_csum);
+    if (ret) {
+        kfree_skb(skb);
+        return ret;
     }
 
-    pht_udp_v6_complete_skb(skb);
+    pht_udp_v6_complete_skb(skb, payload_csum);
     return pht_reinject_udp_v6(skb, dev, reinject_mark);
 }
 #else
 void pht_ipv6_complete(struct ipv6hdr *ip6h, u16 payload_len, u8 nexthdr,
                        const struct in6_addr *saddr, const struct in6_addr *daddr) {}
 
-void pht_udp_v6_complete(struct ipv6hdr *ip6h, struct udphdr *uh, u16 udp_len) {}
+void pht_udp_v6_complete(struct ipv6hdr *ip6h, struct udphdr *uh, u16 udp_len,
+                         __wsum payload_csum) {}
 
 struct sk_buff *pht_build_fake_tcp_v6(const struct pht_endpoint_pair *ep, u32 seq, u32 ack,
                                       u8 flags, const void *payload, size_t payload_len) {

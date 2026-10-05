@@ -80,10 +80,17 @@ Logs are automatically saved to `~/.cache/logs/phantun_tests/YYYYMMDD_HHMMSS/`.
 - `tests/test_dkms.py`: DKMS install/load/reload and parameter validation coverage.
 - `tests/test_config_stats.py`: selector configuration, `/sys/module/phantun/stats/*`, and basic selector-path behavior.
 - `tests/test_handshakes.py`: shaping semantics and control-payload visibility rules.
-- `tests/test_netns_udp.py`: basic namespace UDP-to-fake-TCP operation and multi-channel behavior.
+- `tests/test_netns_udp.py`: namespace UDP-to-fake-TCP operation, multi-channel behavior, and raw-IP verification of reinjected UDP checksums for odd/maximal payloads and odd-sized GSO segments in both families.
 - `tests/test_packet_loss.py`: handshake retries, payload-loss behavior, local send failures, and state-machine behavior under packet loss.
 - `tests/test_recovery.py`: collision handling, same-tuple replacement, quarantine, and unknown-packet recovery behavior.
 - `tests/test_wireguard.py`: end-to-end coverage for kernel WireGuard and `wireguard-go`.
+
+The raw-IP checksum cases verify packet bytes independently of skb checksum
+flags. Veth/GSO delivery does not guarantee a nonlinear source skb or an odd
+source offset. Copy-helper changes also need an isolated kernel probe with
+linear, page-fragment, and frag-list skbs, odd offsets, invalid ranges, and
+computed-zero checksums; the integration suite alone does not cover those
+internal layouts.
 
 ### Best Practices
 
