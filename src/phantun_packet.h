@@ -131,10 +131,14 @@ struct pht_tx_route_result {
  * Parsed L3/L4 view into an skb. Header pointers and payload offsets borrow
  * the skb's current linear/nonlinear data; callers must not keep this after
  * the skb is modified or freed. payload_offset/payload_len describe exactly
- * the bytes translated between UDP payload and fake-TCP payload.
+ * the bytes translated between UDP payload and fake-TCP payload. protocol is
+ * IPPROTO_TCP or IPPROTO_UDP on success and selects the L4 header union.
+ * Parsing may pull headers but leaves the transport-header position intact
+ * so unowned packets can resume normal extension-header processing.
  */
 struct pht_l4_view {
     u8 family;
+    u8 protocol;
 
     union {
         struct iphdr *iph;
@@ -170,10 +174,10 @@ int pht_prepare_fake_tcp_ack_payload_from_skb(const struct pht_endpoint_pair *ep
                                               struct sk_buff **out_skb);
 
 int pht_parse_ipv4_udp(struct sk_buff *skb, struct pht_l4_view *view);
-int pht_parse_ipv4_tcp(struct sk_buff *skb, struct pht_l4_view *view);
+int pht_parse_ipv4_transport(struct sk_buff *skb, struct pht_l4_view *view);
 int pht_validate_ipv4_tcp_checksums(const struct sk_buff *skb, const struct pht_l4_view *view);
 int pht_parse_ipv6_udp(struct sk_buff *skb, struct pht_l4_view *view);
-int pht_parse_ipv6_tcp(struct sk_buff *skb, struct pht_l4_view *view);
+int pht_parse_ipv6_transport(struct sk_buff *skb, struct pht_l4_view *view);
 int pht_validate_ipv6_tcp_checksums(const struct sk_buff *skb, const struct pht_l4_view *view);
 
 void pht_ipv4_complete(struct iphdr *iph, u16 total_len, u8 protocol, __be32 saddr, __be32 daddr);

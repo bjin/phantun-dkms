@@ -280,18 +280,18 @@ static int phantun_parse_udp_skb(struct sk_buff *skb, struct pht_l4_view *view) 
     return pht_parse_ipv6_udp(skb, view);
 }
 
-static int phantun_parse_tcp_skb(struct sk_buff *skb, struct pht_l4_view *view) {
+static int phantun_parse_transport_skb(struct sk_buff *skb, struct pht_l4_view *view) {
     int ret;
 
     if (skb->protocol == htons(ETH_P_IP))
-        return pht_parse_ipv4_tcp(skb, view);
+        return pht_parse_ipv4_transport(skb, view);
     if (skb->protocol == htons(ETH_P_IPV6))
-        return pht_parse_ipv6_tcp(skb, view);
+        return pht_parse_ipv6_transport(skb, view);
 
-    ret = pht_parse_ipv4_tcp(skb, view);
+    ret = pht_parse_ipv4_transport(skb, view);
     if (!ret)
         return 0;
-    return pht_parse_ipv6_tcp(skb, view);
+    return pht_parse_ipv6_transport(skb, view);
 }
 
 static int phantun_validate_tcp_checksums(const struct sk_buff *skb,
@@ -1404,60 +1404,35 @@ static unsigned int phantun_pre_routing_segment_gso(void *priv, struct sk_buff *
         unsigned int verdict;
 
         skb_mark_not_on_list(seg);
-        /* The recursive handler must not consume seg; the segmentation loop
-         * owns every segment and frees it exactly once for NF_ACCEPT or NF_DROP.
+        /* The dispatcher owns NF_STOLEN segments; the loop releases every
+         * other verdict exactly once, including unexpected unowned traffic.
          */
         verdict = phantun_pre_routing(priv, seg, state);
         if (verdict == NF_ACCEPT)
             pht_pr_warn_rl("segmented inbound TCP packet unexpectedly escaped fake-TCP handler\n");
-        kfree_skb(seg);
+        if (verdict != NF_STOLEN)
+            kfree_skb(seg);
     }
 
     return NF_STOLEN;
 }
 
-/* Selector-matched raw inbound UDP is dropped before local delivery so a
- * tuple is owned either by fake-TCP translation or by nothing. UDP carrying
- * this netns' private reinjection mark is exempt because it already came out
- * of the translator.
+/* The dispatcher has already handled the reinjection exemption and supplied
+ * a validated UDP view. Only locally delivered selector-owned UDP is dropped.
  */
-unsigned int phantun_pre_routing_udp_drop(void *priv, struct sk_buff *skb,
-                                          const struct nf_hook_state *state) {
-    struct pht_l4_view view;
+static unsigned int phantun_pre_routing_udp_drop(struct sk_buff *skb,
+                                                 const struct nf_hook_state *state,
+                                                 const struct pht_l4_view *view) {
     struct pht_addr local_addr;
     struct pht_addr remote_addr;
-    struct pht_flow_table *flows;
-    int ret;
 
-    if (!state || !skb)
-        return NF_ACCEPT;
-
-    flows = phantun_net_hook_flows(state->net);
-    if (!flows)
-        return NF_ACCEPT;
-
-    if (skb->mark == flows->reinject_mark) {
-        skb->mark = 0;
-        return NF_ACCEPT;
-    }
-
-    if (phantun_pre_routing_uses_loopback_dev(skb, state))
-        return NF_ACCEPT;
-
-    ret = phantun_parse_udp_skb(skb, &view);
-    if (ret)
-        return NF_ACCEPT;
-    if (!phantun_family_enabled(view.family))
-        return NF_ACCEPT;
-
-    phantun_view_remote_addr(&view, true, &remote_addr);
-    /* Selector matching is cheap cached config; test it before local-delivery
-     * checks that may require a FIB lookup.
+    phantun_view_remote_addr(view, true, &remote_addr);
+    /* Reject unmatched traffic before the potentially expensive local FIB
+     * lookup, just as on the fake-TCP branch.
      */
-    if (!phantun_selectors_allow(view.udp->dest, &remote_addr, view.udp->source))
+    if (!phantun_selectors_allow(view->udp->dest, &remote_addr, view->udp->source))
         return NF_ACCEPT;
-
-    phantun_view_local_addr(&view, true, &local_addr);
+    phantun_view_local_addr(view, true, &local_addr);
     if (!phantun_pre_routing_targets_local_host(state->net, &local_addr))
         return NF_ACCEPT;
 
@@ -2112,9 +2087,9 @@ static void phantun_pre_routing_dispatch(const struct phantun_pre_routing_ctx *c
     }
 }
 
-/* PRE_ROUTING owns selector-matched fake-TCP before the real TCP stack sees
- * it. Unknown owned packets are rejected unless they are valid bare SYNs that
- * create a new responder flow.
+/* Parse ingress once, then enforce raw-UDP ownership or process fake TCP
+ * before the real transport stack sees it. A private mark exempts UDP only;
+ * an externally marked TCP packet must still pass fake-TCP validation.
  */
 unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                                  const struct nf_hook_state *state) {
@@ -2123,12 +2098,10 @@ unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     struct pht_addr remote_addr;
     struct pht_flow *flow;
     unsigned int verdict;
+    bool reinjected;
     int ret;
 
     if (!state || !skb)
-        return NF_ACCEPT;
-
-    if (phantun_pre_routing_uses_loopback_dev(skb, state))
         return NF_ACCEPT;
 
     ctx.flows = phantun_net_hook_flows(state->net);
@@ -2138,11 +2111,19 @@ unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
     if (!ctx.flows)
         return NF_ACCEPT;
 
-    ret = phantun_parse_tcp_skb(skb, &ctx.view);
+    reinjected = skb->mark == ctx.flows->reinject_mark;
+    if (reinjected)
+        skb->mark = 0;
+    if (phantun_pre_routing_uses_loopback_dev(skb, state))
+        return NF_ACCEPT;
+
+    ret = phantun_parse_transport_skb(skb, &ctx.view);
     if (ret)
         return NF_ACCEPT;
     if (!phantun_family_enabled(ctx.view.family))
         return NF_ACCEPT;
+    if (ctx.view.protocol == IPPROTO_UDP)
+        return reinjected ? NF_ACCEPT : phantun_pre_routing_udp_drop(skb, state, &ctx.view);
 
     phantun_view_remote_addr(&ctx.view, true, &remote_addr);
     /* Selector matching is cheap cached config; test it before local-delivery
@@ -2166,6 +2147,10 @@ unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
         return NF_DROP;
     }
 
+    /* From here the packet is owned and cannot resume normal IPv6 extension
+     * processing. Supply the TCP offset expected by segmentation helpers.
+     */
+    skb_set_transport_header(skb, ctx.view.ip_hdr_len);
     verdict = phantun_pre_routing_segment_gso(priv, skb, state);
     if (verdict != NF_ACCEPT)
         return verdict;

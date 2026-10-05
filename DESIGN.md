@@ -183,7 +183,7 @@ Reason:
 - selector-matched traffic must have one owner
 - allowing both raw UDP delivery and translated fake-TCP delivery would create ambiguous mixed delivery
 - forwarded UDP is not translator-owned traffic and must continue through the normal routing path
-- reinjected translated UDP enters after `PRE_ROUTING`, so translated traffic is not black-holed by this drop rule
+- reinjected translated UDP re-enters `PRE_ROUTING` with a namespace-private mark that exempts it from raw-UDP dropping
 
 ## 5. Flow identity and conflict handling
 
@@ -517,7 +517,18 @@ Behavior:
 - allow unmatched or merely forwarded inbound UDP normally
 - do not apply this drop to module-reinjected translated UDP
 
-raw-UDP drop and fake-TCP interception both use priority `-399`. Linux inserts equal-priority hooks before existing entries, so the ops arrays register `phantun_pre_routing` before `phantun_pre_routing_udp_drop` and selector-matched raw UDP executes first.
+One `PRE_ROUTING` hook per family parses L3 and discovers the final TCP/UDP
+protocol before dispatching raw-UDP ownership or fake-TCP handling. IPv6
+extension headers are walked once from the outer header, and borrowed header
+pointers are refreshed after any pull that can relocate the skb head. Parsing
+does not advance `skb->transport_header`, so unowned packets can resume normal
+IPv6 extension-header processing. Only owned TCP gets its transport offset
+set for segmentation. There is no equal-priority registration-order dependency.
+
+The dispatcher consumes the private reinjection mark before loopback and
+protocol dispatch, but exempts only UDP from raw-UDP dropping. TCP carrying an
+externally applied matching mark still follows normal selector checks and
+fake-TCP validation; the cookie must never become a TCP bypass.
 
 ### 8.4 Decapsulated UDP reinjection
 
@@ -530,13 +541,13 @@ For inbound established fake-TCP data:
 - retain a complete nonzero UDP checksum (`CSUM_MANGLED_0` for a computed zero) and mark the manufactured skb `CHECKSUM_UNNECESSARY`
 - inject through the original ingress device with `netif_rx()` so receive processing uses that device's network namespace
 - require the original ingress device namespace to match the netfilter hook namespace before reinjecting
-- mark reinjected UDP so the module's raw-UDP drop hook exempts the manufactured skb on its second `PRE_ROUTING` pass
+- mark reinjected UDP so the UDP branch of the ingress dispatcher exempts the manufactured skb on its second `PRE_ROUTING` pass
 
 Result:
 
 - local UDP sockets, including kernel WireGuard and `wireguard-go`, receive data as normal UDP
 - later inbound firewall and delivery hooks still run in the same netns as the intercepted fake-TCP packet
-- translated UDP avoids the raw-UDP drop hook because the reinjection mark is consumed by that hook
+- translated UDP avoids raw-UDP dropping because the ingress dispatcher consumes its reinjection mark
 
 #### IPv4 reverse-path filtering
 
@@ -580,7 +591,7 @@ A flow stores only `local_tx_meta`: the last known local outbound UDP transmit p
 - keepalive `ACK`s
 - local liveness / teardown control packets such as best-effort `RST`
 
-`local_tx_meta` is used only for outbound generated fake-TCP packets. It must not be updated from inbound fake-TCP packets and must not affect inbound UDP reinjection. Decapsulated UDP reinjection uses its own receive-path skb and only uses the private reinjection mark needed to bypass the module's raw-UDP drop hook.
+`local_tx_meta` is used only for outbound generated fake-TCP packets. It must not be updated from inbound fake-TCP packets and must not affect inbound UDP reinjection. Decapsulated UDP uses its own receive-path skb and only the private mark needed to bypass the ingress dispatcher's raw-UDP drop branch.
 
 ## 9. Best-effort local flow invalidation
 

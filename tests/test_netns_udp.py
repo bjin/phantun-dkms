@@ -822,6 +822,143 @@ def test_netns_reinjected_udp_checksums_cover_payload_boundaries(phantun_module,
         cleanup_netns_topology(vm)
 
 
+def test_netns_tcp_mark_collision_does_not_bypass_translation(phantun_module, vm):
+    if not require_guest_command(vm, "nft"):
+        pytest.skip("nft is not available in the guest")
+    load_netns_module(phantun_module)
+    ensure_netns_topology(vm)
+    src_port, dst_port = PORTS_A[0], PORTS_B[0]
+    table = f"phantun_cookie_{uuid.uuid4().hex[:8]}"
+    ready_file = f"/tmp/phantun-cookie-ready-{uuid.uuid4().hex}"
+    received_file = f"/tmp/phantun-cookie-received-{uuid.uuid4().hex}"
+    server = None
+    try:
+        run_in_netns(vm, NS_B, ["nft", "add", "table", "inet", table])
+        run_in_netns(vm, NS_B, ["nft", "add", "set", "inet", table, "cookies", "{ type mark; flags dynamic; size 4; }"])
+        run_in_netns(
+            vm,
+            NS_B,
+            [
+                "nft",
+                "add",
+                "chain",
+                "inet",
+                table,
+                "ingress",
+                "{ type filter hook prerouting priority -450; policy accept; }",
+            ],
+        )
+        # Observe the actual per-netns cookie on manufactured UDP before the
+        # module clears it, without depending on private struct layout.
+        run_in_netns(
+            vm,
+            NS_B,
+            [
+                "nft",
+                "add",
+                "rule",
+                "inet",
+                table,
+                "ingress",
+                "ip",
+                "saddr",
+                NS_ADDR_A,
+                "ip",
+                "daddr",
+                NS_ADDR_B,
+                "udp",
+                "dport",
+                str(dst_port),
+                "meta",
+                "mark",
+                "!=",
+                "0",
+                "add",
+                "@cookies",
+                "{ meta mark }",
+            ],
+        )
+        server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_many",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 2,
+                "timeout_sec": 20,
+                "ready_file": ready_file,
+                "first_received_file": received_file,
+            },
+        )
+        wait_for_guest_ready_file(vm, ready_file)
+        sender_config = {
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
+        }
+        warmup = run_netns_scenario(vm, NS_A, "send_many", {**sender_config, "payloads": ["warmup"]}, timeout=10)
+        assert_completed(warmup, "mark-collision warm-up")
+        wait_for_guest_ready_file(vm, received_file)
+        cookie_result = run_in_netns(vm, NS_B, ["nft", "-j", "list", "set", "inet", table, "cookies"])
+        cookie_data = parse_guest_json(cookie_result.stdout, "reinjection cookie set")
+        cookies = [
+            value for entry in cookie_data["nftables"] if "set" in entry for value in entry["set"].get("elem", [])
+        ]
+        if len(cookies) != 1:
+            pytest.fail(f"expected one observed reinjection cookie: {cookie_data!r}")
+        cookie = int(cookies[0], 0) if isinstance(cookies[0], str) else cookies[0]
+        if not isinstance(cookie, int) or cookie == 0:
+            pytest.fail(f"invalid observed reinjection cookie: {cookie_data!r}")
+        run_in_netns(
+            vm,
+            NS_B,
+            [
+                "nft",
+                "add",
+                "rule",
+                "inet",
+                table,
+                "ingress",
+                "ip",
+                "saddr",
+                NS_ADDR_A,
+                "ip",
+                "daddr",
+                NS_ADDR_B,
+                "tcp",
+                "sport",
+                str(src_port),
+                "tcp",
+                "dport",
+                str(dst_port),
+                "meta",
+                "mark",
+                "set",
+                str(cookie),
+                "counter",
+                "comment",
+                "cookie_collision",
+            ],
+        )
+        sender = run_netns_scenario(vm, NS_A, "send_many", {**sender_config, "payloads": ["marked-data"]}, timeout=10)
+        assert_completed(sender, "mark-collision sender")
+        result = server.communicate(timeout=25)
+        assert_completed(result, "mark-collision receiver")
+        received = parse_guest_json(result.stdout, "mark-collision receiver")["received"]
+        if [entry["message"] for entry in received] != ["warmup", "marked-data"]:
+            pytest.fail(f"TCP carrying the UDP reinjection cookie bypassed translation: {received!r}")
+        if NetnsNftProbe(NS_B, "inet", table, "ingress").packets(vm, "cookie_collision") == 0:
+            pytest.fail("the TCP reinjection-mark collision was not exercised")
+    finally:
+        if server is not None:
+            server.terminate()
+        run_in_netns(vm, NS_B, ["nft", "delete", "table", "inet", table], check=False)
+        vm.run(["rm", "-f", ready_file, received_file], check=False)
+        cleanup_netns_topology(vm)
+
+
 def test_netns_outbound_mark_propagates_to_fake_tcp(phantun_module, vm):
     load_netns_module(phantun_module)
     ensure_netns_topology(vm)

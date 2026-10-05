@@ -1053,3 +1053,63 @@ def test_kernel_wireguard_roaming_between_ipv4_and_ipv6_endpoints(phantun_module
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
         cleanup_wireguard(vm, key_a_path, key_b_path)
+
+
+@pytest.mark.parametrize("managed", [True, False], ids=["owned", "unowned"])
+def test_ipv6_destination_options_udp_ownership(phantun_module, vm, managed):
+    phantun_module.load(managed_netns="all", managed_local_ports=str(PORT_B))
+    ensure_netns_topology(vm, with_ipv6=True)
+    dst_port = PORT_B if managed else PORT_B + 1
+    ready_file = f"/tmp/phantun-ipv6-options-{uuid.uuid4().hex}"
+    stop_file = f"/tmp/phantun-ipv6-options-stop-{uuid.uuid4().hex}"
+    receiver = None
+    before = read_module_stat(vm, "udp_raw_inbound_dropped")
+    try:
+        receiver = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "recv_until_timeout",
+            {
+                "bind_addr": NS6_ADDR_B,
+                "bind_port": dst_port,
+                "count": 1,
+                "timeout_sec": 20,
+                "ready_file": ready_file,
+                "stop_file": stop_file,
+            },
+        )
+        wait_for_guest_ready_file(vm, ready_file)
+        sender = run_netns_scenario(
+            vm,
+            NS_A,
+            "send_ipv6_udp_options",
+            {
+                "bind_addr": NS6_ADDR_A,
+                "bind_port": 45678,
+                "target_addr": NS6_ADDR_B,
+                "target_port": dst_port,
+                "payload": "destination-options",
+            },
+            timeout=10,
+        )
+        assert_completed(sender, "IPv6 Destination Options sender")
+        if managed:
+            deadline = time.monotonic() + 20
+            while read_module_stat(vm, "udp_raw_inbound_dropped") == before:
+                if time.monotonic() >= deadline:
+                    pytest.fail("owned IPv6 extension-header UDP was not dropped")
+                time.sleep(0.1)
+            vm.run(["touch", stop_file])
+        result = receiver.communicate(timeout=25)
+        assert_completed(result, "IPv6 Destination Options receiver")
+        received = parse_guest_json(result.stdout, "IPv6 Destination Options receiver")["received"]
+        expected = [] if managed else [{"message": "destination-options", "peer": [NS6_ADDR_A, 45678]}]
+        if received != expected:
+            pytest.fail(f"incorrect IPv6 extension-header UDP ownership: {received!r}")
+        if read_module_stat(vm, "udp_raw_inbound_dropped") - before != int(managed):
+            pytest.fail("IPv6 extension-header UDP was not classified by its final transport protocol")
+    finally:
+        if receiver is not None:
+            receiver.terminate()
+        vm.run(["rm", "-f", ready_file, stop_file], check=False)
+        cleanup_netns_topology(vm)

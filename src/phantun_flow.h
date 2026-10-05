@@ -227,8 +227,8 @@ struct pht_flow_table {
     u32 hash_seed;
     /* Per-netns cookie used as a private reinjection mark in shared skb->mark
      * space. The random high-bit value avoids common low firewall marks but
-     * cannot prevent collisions; an externally marked skb with the same value
-     * is treated as reinjected and has its mark cleared.
+     * cannot prevent collisions. A matching mark is cleared on any packet,
+     * but only UDP receives the reinjection exemption; TCP is still classified.
      */
     u32 reinject_mark;
     /* Serializes half-open admission and exact insert->established/dead

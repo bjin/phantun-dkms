@@ -80,9 +80,13 @@ Logs are automatically saved to `~/.cache/logs/phantun_tests/YYYYMMDD_HHMMSS/`.
 - `tests/test_dkms.py`: DKMS install/load/reload and parameter validation coverage.
 - `tests/test_config_stats.py`: selector configuration, `/sys/module/phantun/stats/*`, and basic selector-path behavior.
 - `tests/test_handshakes.py`: shaping semantics and control-payload visibility rules.
-- `tests/test_netns_udp.py`: namespace UDP-to-fake-TCP operation, multi-channel behavior, and raw-IP verification of reinjected UDP checksums for odd/maximal payloads and odd-sized GSO segments in both families.
+- `tests/test_netns_udp.py`: namespace translation, multi-channel behavior,
+  real reinjection-cookie collisions on TCP, and raw-IP checksum verification
+  for odd/maximal UDP payloads and odd-sized GSO segments in both families.
 - `tests/test_packet_loss.py`: handshake retries, payload-loss behavior, local send failures, and state-machine behavior under packet loss.
 - `tests/test_recovery.py`: collision handling, same-tuple replacement, quarantine, and unknown-packet recovery behavior.
+- `tests/test_ipv6.py`: IPv6 translation, routing, WireGuard, and final-protocol
+  ownership classification behind IPv6 Destination Options headers.
 - `tests/test_wireguard.py`: end-to-end coverage for kernel WireGuard and `wireguard-go`.
 
 The raw-IP checksum cases verify packet bytes independently of skb checksum

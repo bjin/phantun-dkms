@@ -260,6 +260,16 @@ def send_many(config):
     _emit({"sent": payloads, "errors": errors})
 
 
+def send_ipv6_udp_options(config):
+    with _socket(config["bind_addr"], config["bind_port"]) as sock:
+        # One Destination Options header containing PadN; the kernel supplies
+        # the IPv6 header and UDP checksum while retaining normal socket I/O.
+        options = bytes((socket.IPPROTO_UDP, 0, 1, 4, 0, 0, 0, 0))
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_DSTOPTS, options)
+        sock.sendto(config["payload"].encode(), _addr_tuple(config["target_addr"], config["target_port"]))
+    _emit({"sent": config["payload"]})
+
+
 def recv_many_reply(config):
     received = []
     replies = []
@@ -1240,6 +1250,7 @@ SCENARIOS = {
     "echo_client": echo_client,
     "recv_many": recv_many,
     "send_many": send_many,
+    "send_ipv6_udp_options": send_ipv6_udp_options,
     "delayed_send": delayed_send,
     "simultaneous_exchange": simultaneous_exchange,
     "hold_tcp_listener": hold_tcp_listener,

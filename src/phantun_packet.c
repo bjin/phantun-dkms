@@ -307,97 +307,99 @@ static int pht_tx_apply_fake_tcp_meta(struct sk_buff *skb, u8 family,
     return 0;
 }
 
-static int pht_parse_ipv4_l4(struct sk_buff *skb, u8 protocol, unsigned int min_l4_len,
-                             struct pht_l4_view *view) {
+/* L3 parsing supplies the final transport protocol and offset. Publish header
+ * pointers only after every pull: pskb_may_pull() can relocate the skb head.
+ * Do not move skb->transport_header while inspecting unowned traffic: IPv6
+ * input still needs it to point at the next extension header after NF_ACCEPT.
+ */
+static int pht_parse_transport_l4(struct sk_buff *skb, struct pht_l4_view *view,
+                                  unsigned int total_len) {
+    unsigned int l4_len;
+
+    if (total_len < view->ip_hdr_len)
+        return -EINVAL;
+    l4_len = total_len - view->ip_hdr_len;
+
+    switch (view->protocol) {
+    case IPPROTO_UDP: {
+        struct udphdr *uh;
+        unsigned int udp_len;
+
+        if (l4_len < sizeof(*uh) || !pskb_may_pull(skb, view->ip_hdr_len + sizeof(*uh)))
+            return -EINVAL;
+        uh = (struct udphdr *)(skb_network_header(skb) + view->ip_hdr_len);
+        udp_len = ntohs(uh->len);
+        if (udp_len < sizeof(*uh) || udp_len > l4_len)
+            return -EINVAL;
+        view->udp = uh;
+        view->l4_hdr_len = sizeof(*uh);
+        view->payload_len = udp_len - sizeof(*uh);
+        break;
+    }
+    case IPPROTO_TCP: {
+        struct tcphdr *th;
+        unsigned int tcp_len;
+
+        if (l4_len < sizeof(*th) || !pskb_may_pull(skb, view->ip_hdr_len + sizeof(*th)))
+            return -EINVAL;
+        th = (struct tcphdr *)(skb_network_header(skb) + view->ip_hdr_len);
+        tcp_len = th->doff * 4;
+        if (tcp_len < sizeof(*th) || tcp_len > l4_len ||
+            !pskb_may_pull(skb, view->ip_hdr_len + tcp_len))
+            return -EINVAL;
+        view->tcp = (struct tcphdr *)(skb_network_header(skb) + view->ip_hdr_len);
+        view->l4_hdr_len = tcp_len;
+        view->payload_len = l4_len - tcp_len;
+        break;
+    }
+    default:
+        return -EPROTO;
+    }
+
+    view->payload_offset = view->ip_hdr_len + view->l4_hdr_len;
+    return 0;
+}
+
+/* required_protocol == 0 discovers TCP or UDP for the ingress dispatcher;
+ * LOCAL_OUT requires UDP and rejects other protocols before pulling L4.
+ */
+static int pht_parse_ipv4_l4(struct sk_buff *skb, u8 required_protocol, struct pht_l4_view *view) {
     struct iphdr *iph;
-    unsigned int ip_hdr_len;
     unsigned int total_len;
+    int ret;
 
     if (!skb || !view)
         return -EINVAL;
-
     memset(view, 0, sizeof(*view));
-
     if (!pskb_may_pull(skb, sizeof(struct iphdr)))
         return -EINVAL;
-
     iph = ip_hdr(skb);
     if (!iph || iph->version != 4 || iph->ihl < 5)
         return -EINVAL;
-
-    ip_hdr_len = iph->ihl * 4;
-    if (!pskb_may_pull(skb, ip_hdr_len + min_l4_len))
-        return -EINVAL;
-
-    iph = ip_hdr(skb);
-    total_len = ntohs(iph->tot_len);
-    if (iph->protocol != protocol)
+    if (required_protocol && iph->protocol != required_protocol)
         return -EPROTO;
     if (iph->frag_off & htons(IP_MF | IP_OFFSET))
         return -EINVAL;
-    if (skb->len < total_len || total_len < ip_hdr_len + min_l4_len)
+    total_len = ntohs(iph->tot_len);
+    if (skb->len < total_len)
         return -EINVAL;
 
-    skb_set_transport_header(skb, ip_hdr_len);
-    view->iph = iph;
     view->family = AF_INET;
-    view->ip_hdr_len = ip_hdr_len;
+    view->protocol = iph->protocol;
+    view->ip_hdr_len = iph->ihl * 4;
+    ret = pht_parse_transport_l4(skb, view, total_len);
+    if (ret)
+        return ret;
+    view->iph = ip_hdr(skb);
     return 0;
 }
 
 int pht_parse_ipv4_udp(struct sk_buff *skb, struct pht_l4_view *view) {
-    struct iphdr *iph;
-    struct udphdr *uh;
-    unsigned int udp_len;
-    int ret;
-
-    ret = pht_parse_ipv4_l4(skb, IPPROTO_UDP, sizeof(struct udphdr), view);
-    if (ret)
-        return ret;
-
-    iph = view->iph;
-    uh = udp_hdr(skb);
-    udp_len = ntohs(uh->len);
-    if (udp_len < sizeof(*uh) || view->ip_hdr_len + udp_len > ntohs(iph->tot_len))
-        return -EINVAL;
-
-    view->udp = uh;
-    view->l4_hdr_len = sizeof(*uh);
-    view->payload_offset = view->ip_hdr_len + sizeof(*uh);
-    view->payload_len = udp_len - sizeof(*uh);
-    return 0;
+    return pht_parse_ipv4_l4(skb, IPPROTO_UDP, view);
 }
 
-int pht_parse_ipv4_tcp(struct sk_buff *skb, struct pht_l4_view *view) {
-    struct iphdr *iph;
-    struct tcphdr *th;
-    unsigned int tcp_len;
-    unsigned int total_len;
-    int ret;
-
-    ret = pht_parse_ipv4_l4(skb, IPPROTO_TCP, sizeof(struct tcphdr), view);
-    if (ret)
-        return ret;
-
-    th = tcp_hdr(skb);
-    tcp_len = th->doff * 4;
-    if (tcp_len < sizeof(*th))
-        return -EINVAL;
-    if (!pskb_may_pull(skb, view->ip_hdr_len + tcp_len))
-        return -EINVAL;
-
-    iph = ip_hdr(skb);
-    th = tcp_hdr(skb);
-    total_len = ntohs(iph->tot_len);
-    if (view->ip_hdr_len + tcp_len > total_len)
-        return -EINVAL;
-
-    view->iph = iph;
-    view->tcp = th;
-    view->l4_hdr_len = tcp_len;
-    view->payload_offset = view->ip_hdr_len + tcp_len;
-    view->payload_len = total_len - view->payload_offset;
-    return 0;
+int pht_parse_ipv4_transport(struct sk_buff *skb, struct pht_l4_view *view) {
+    return pht_parse_ipv4_l4(skb, 0, view);
 }
 
 int pht_validate_ipv4_tcp_checksums(const struct sk_buff *skb, const struct pht_l4_view *view) {
@@ -433,104 +435,61 @@ int pht_validate_ipv4_tcp_checksums(const struct sk_buff *skb, const struct pht_
 }
 
 #if IS_ENABLED(CONFIG_IPV6)
-static int pht_parse_ipv6_l4(struct sk_buff *skb, u8 protocol, unsigned int min_l4_len,
-                             struct pht_l4_view *view) {
+static int pht_parse_ipv6_l4(struct sk_buff *skb, u8 required_protocol, struct pht_l4_view *view) {
     struct ipv6hdr *ip6h;
     unsigned int total_len;
-    int offset = sizeof(struct ipv6hdr);
+    unsigned int offset = sizeof(struct ipv6hdr);
     unsigned short frag_off = 0;
     int flags = 0;
     int nexthdr;
+    int ret;
 
     if (!skb || !view)
         return -EINVAL;
-
     memset(view, 0, sizeof(*view));
-
     if (!pskb_may_pull(skb, sizeof(struct ipv6hdr)))
         return -EINVAL;
-
     ip6h = ipv6_hdr(skb);
     if (!ip6h || ip6h->version != 6)
         return -EINVAL;
-
     total_len = sizeof(*ip6h) + ntohs(ip6h->payload_len);
-    if (skb->len < total_len || total_len < sizeof(*ip6h) + min_l4_len)
+    if (skb->len < total_len)
         return -EINVAL;
 
-    if (ip6h->nexthdr == protocol) {
-        nexthdr = protocol;
-    } else {
-        nexthdr = ipv6_find_hdr(skb, &offset, protocol, &frag_off, &flags);
+    nexthdr = ip6h->nexthdr;
+    if (nexthdr != IPPROTO_UDP && nexthdr != IPPROTO_TCP) {
+        /* A zero input starts at the outer IPv6 header; a nonzero offset
+         * asks ipv6_find_hdr() to parse an inner IPv6 header instead.
+         * Discover UDP/TCP in one extension-header walk.
+         */
+        offset = 0;
+        nexthdr = ipv6_find_hdr(skb, &offset, -1, &frag_off, &flags);
         if (nexthdr < 0)
             return nexthdr;
-        if (nexthdr != protocol)
-            return -EPROTO;
         if (flags & IP6_FH_F_FRAG)
             return -EINVAL;
     }
-    if (offset < sizeof(*ip6h) || !pskb_may_pull(skb, offset + min_l4_len))
+    if (required_protocol && nexthdr != required_protocol)
+        return -EPROTO;
+    if (offset < sizeof(*ip6h))
         return -EINVAL;
 
-    ip6h = ipv6_hdr(skb);
-    skb_set_transport_header(skb, offset);
-    view->ip6h = ip6h;
     view->family = AF_INET6;
+    view->protocol = nexthdr;
     view->ip_hdr_len = offset;
+    ret = pht_parse_transport_l4(skb, view, total_len);
+    if (ret)
+        return ret;
+    view->ip6h = ipv6_hdr(skb);
     return 0;
 }
 
 int pht_parse_ipv6_udp(struct sk_buff *skb, struct pht_l4_view *view) {
-    struct udphdr *uh;
-    unsigned int udp_len;
-    unsigned int total_len;
-    int ret;
-
-    ret = pht_parse_ipv6_l4(skb, IPPROTO_UDP, sizeof(struct udphdr), view);
-    if (ret)
-        return ret;
-
-    uh = udp_hdr(skb);
-    udp_len = ntohs(uh->len);
-    total_len = sizeof(*view->ip6h) + ntohs(view->ip6h->payload_len);
-    if (udp_len < sizeof(*uh) || view->ip_hdr_len + udp_len > total_len)
-        return -EINVAL;
-
-    view->udp = uh;
-    view->l4_hdr_len = sizeof(*uh);
-    view->payload_offset = view->ip_hdr_len + sizeof(*uh);
-    view->payload_len = udp_len - sizeof(*uh);
-    return 0;
+    return pht_parse_ipv6_l4(skb, IPPROTO_UDP, view);
 }
 
-int pht_parse_ipv6_tcp(struct sk_buff *skb, struct pht_l4_view *view) {
-    struct tcphdr *th;
-    unsigned int tcp_len;
-    unsigned int total_len;
-    int ret;
-
-    ret = pht_parse_ipv6_l4(skb, IPPROTO_TCP, sizeof(struct tcphdr), view);
-    if (ret)
-        return ret;
-
-    th = tcp_hdr(skb);
-    tcp_len = th->doff * 4;
-    if (tcp_len < sizeof(*th))
-        return -EINVAL;
-    if (!pskb_may_pull(skb, view->ip_hdr_len + tcp_len))
-        return -EINVAL;
-
-    th = tcp_hdr(skb);
-    view->ip6h = ipv6_hdr(skb);
-    total_len = sizeof(*view->ip6h) + ntohs(view->ip6h->payload_len);
-    if (view->ip_hdr_len + tcp_len > total_len)
-        return -EINVAL;
-
-    view->tcp = th;
-    view->l4_hdr_len = tcp_len;
-    view->payload_offset = view->ip_hdr_len + tcp_len;
-    view->payload_len = total_len - view->payload_offset;
-    return 0;
+int pht_parse_ipv6_transport(struct sk_buff *skb, struct pht_l4_view *view) {
+    return pht_parse_ipv6_l4(skb, 0, view);
 }
 
 int pht_validate_ipv6_tcp_checksums(const struct sk_buff *skb, const struct pht_l4_view *view) {
@@ -560,7 +519,9 @@ int pht_validate_ipv6_tcp_checksums(const struct sk_buff *skb, const struct pht_
 #else
 int pht_parse_ipv6_udp(struct sk_buff *skb, struct pht_l4_view *view) { return -EAFNOSUPPORT; }
 
-int pht_parse_ipv6_tcp(struct sk_buff *skb, struct pht_l4_view *view) { return -EAFNOSUPPORT; }
+int pht_parse_ipv6_transport(struct sk_buff *skb, struct pht_l4_view *view) {
+    return -EAFNOSUPPORT;
+}
 
 int pht_validate_ipv6_tcp_checksums(const struct sk_buff *skb, const struct pht_l4_view *view) {
     return -EAFNOSUPPORT;
@@ -817,9 +778,9 @@ int pht_reinject_udp_v4(struct sk_buff *skb, struct net_device *dev, u32 reinjec
     }
 
     /* Re-enter through ingress so conntrack and LOCAL_IN firewall policy see
-     * the packet exactly as a real receive. The PRE_ROUTING UDP drop hook
-     * clears the table-private reinjection mark and skips re-capturing this
-     * manufactured skb.
+     * the packet exactly as a real receive. The PRE_ROUTING dispatcher clears
+     * the table-private reinjection mark and exempts this manufactured UDP
+     * skb from raw-UDP dropping.
      */
     skb->mark = reinject_mark;
     skb->dev = dev;
