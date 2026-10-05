@@ -82,8 +82,7 @@ int phantun_netns_init(void);
 void phantun_netns_exit(void);
 struct pht_flow_table *phantun_net_hook_flows(const struct net *net);
 
-unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
-                               const struct nf_hook_state *state);
+unsigned int phantun_local_out(void *priv, struct sk_buff *skb, const struct nf_hook_state *state);
 unsigned int phantun_pre_routing(void *priv, struct sk_buff *skb,
                                  const struct nf_hook_state *state);
 

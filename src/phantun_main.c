@@ -1318,8 +1318,7 @@ static void phantun_local_out_dispatch(const struct phantun_local_out_ctx *ctx,
  * immediately, half-open flows keep only one queued skb, and DEAD flows are
  * reopened from scratch with a guarded ISN.
  */
-unsigned int phantun_local_out(void *priv, struct sk_buff *skb,
-                               const struct nf_hook_state *state) {
+unsigned int phantun_local_out(void *priv, struct sk_buff *skb, const struct nf_hook_state *state) {
     struct phantun_local_out_ctx ctx;
     struct pht_addr remote_addr;
     unsigned int verdict;
