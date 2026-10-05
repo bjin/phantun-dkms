@@ -256,6 +256,11 @@ Half-open flow buffering is intentionally small:
 - bound memory and complexity
 - anything beyond the first queued skb is dropped
 
+Queued transmit metadata is meaningful only while the associated skb is
+present. Taking a packet transfers that exact metadata to the caller; an empty
+take still initializes the caller's metadata output but need not rewrite the
+unused internal metadata. Persistent local transmit policy remains separate.
+
 ## 6. Per-flow state machine
 
 Each flow stores:
@@ -268,7 +273,7 @@ Each flow stores:
 - one queued UDP skb pointer
 - reserved first-payload ignore slot
 - responder control-response pending-ACK / pending-release flag
-- retransmit timer state
+- retransmit timer state, with expiry owned by the kernel timer itself
 - idle and inbound-liveness timestamps
 - last successful established local-payload transmit timestamp for ACK suppression
 - initiator bare-`SYN` replacement-protection deadline

@@ -37,7 +37,6 @@ struct pht_retired_flow {
     unsigned long expires_jiffies;
 };
 
-static void pht_flow_tx_dst_cache_init(struct pht_flow_tx_dst_cache *cache);
 static void pht_flow_tx_dst_cache_reset(struct pht_flow_tx_dst_cache *cache);
 static struct dst_entry *pht_flow_tx_dst_cache_reset_locked(struct pht_flow_tx_dst_cache *cache);
 
@@ -197,7 +196,6 @@ static void pht_flow_retransmit_timer(struct timer_list *timer) {
 
     flow->retries_done++;
     next = jiffies + flow->table->handshake_timeout_jiffies;
-    flow->retransmit_at_jiffies = next;
     spin_unlock_bh(&flow->lock);
 
     if (pht_flow_retransmit_now(flow))
@@ -430,9 +428,7 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
         table->idle_ack_suppression_window_jiffies = 1;
     table->keepalive_misses = cfg->keepalive_misses;
     table->hard_idle_timeout_jiffies = msecs_to_jiffies(cfg->hard_idle_timeout_sec * 1000U);
-    table->reopen_guard_bytes = cfg->reopen_guard_bytes;
     table->half_open_limit = cfg->half_open_limit;
-    table->half_open_current = 0;
     table->hash_seed = get_random_u32();
     table->reinject_mark = get_random_u32() | BIT(31);
     table->gc_interval_jiffies = msecs_to_jiffies(PHT_FLOW_GC_INTERVAL_SEC * 1000U);
@@ -445,7 +441,6 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
     }
     table->handshake_retries = cfg->handshake_retries;
     table->net = net;
-    table->cfg = cfg;
     INIT_DELAYED_WORK(&table->gc_work, pht_flow_gc_worker);
     INIT_WORK(&table->finalize_work, pht_flow_finalize_worker);
     schedule_delayed_work(&table->gc_work, table->gc_interval_jiffies);
@@ -702,13 +697,6 @@ void pht_flow_put(struct pht_flow *flow) {
  *   dst_clone() for the skb;
  * - reset/replacement returns the old cache ref and releases it after unlock.
  */
-static void pht_flow_tx_dst_cache_init(struct pht_flow_tx_dst_cache *cache) {
-    if (!cache)
-        return;
-
-    memset(cache, 0, sizeof(*cache));
-}
-
 static struct dst_entry *pht_flow_tx_dst_cache_reset_locked(struct pht_flow_tx_dst_cache *cache) {
     struct dst_entry *old;
 
@@ -952,18 +940,12 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table, const struct pht_
     flow->table = table;
     flow->endpoints = *ep;
     pht_tx_meta_init(&flow->local_tx_meta);
-    pht_flow_tx_dst_cache_init(&flow->tx_dst_cache);
     pht_tx_meta_init(&flow->queued_tx_meta);
     flow->role = role;
     flow->state = state;
     flow->max_retries = table->handshake_retries;
     flow->last_activity_jiffies = jiffies;
     flow->last_inbound_jiffies = jiffies;
-    flow->last_established_payload_tx_jiffies = 0;
-    flow->keepalives_sent = 0;
-    flow->retransmit_at_jiffies = jiffies;
-    flow->retransmit_armed = false;
-    flow->half_open_tracked = false;
     return flow;
 }
 
@@ -1272,10 +1254,12 @@ struct sk_buff *pht_flow_take_queued_skb(struct pht_flow *flow, struct pht_tx_me
 
     spin_lock_bh(&flow->lock);
     skb = flow->queued_skb;
-    if (skb && meta)
-        *meta = flow->queued_tx_meta;
-    flow->queued_skb = NULL;
-    pht_tx_meta_init(&flow->queued_tx_meta);
+    if (skb) {
+        if (meta)
+            *meta = flow->queued_tx_meta;
+        flow->queued_skb = NULL;
+        pht_tx_meta_init(&flow->queued_tx_meta);
+    }
     spin_unlock_bh(&flow->lock);
     return skb;
 }
@@ -1361,7 +1345,6 @@ void pht_flow_arm_retransmit(struct pht_flow *flow) {
         flow->retransmit_armed = true;
     }
     when = jiffies + flow->table->handshake_timeout_jiffies;
-    flow->retransmit_at_jiffies = when;
     mod_timer(&flow->retransmit_timer, when);
     spin_unlock_bh(&flow->lock);
 }

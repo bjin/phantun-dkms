@@ -155,7 +155,6 @@ struct pht_flow {
      * again when 32-bit jiffies wraps on long-lived receive-heavy flows.
      */
     u64 last_established_payload_tx_jiffies;
-    unsigned long retransmit_at_jiffies;
     unsigned long quarantine_until_jiffies;
     unsigned long replacement_protect_until_jiffies;
     unsigned int keepalives_sent;
@@ -219,7 +218,6 @@ struct pht_flow_table {
     unsigned long gc_interval_jiffies;
     unsigned int keepalive_misses;
     unsigned int handshake_retries;
-    unsigned int reopen_guard_bytes;
     unsigned int half_open_limit;
     unsigned int half_open_current;
     /* Per-table jhash seed keeps bucket selection stable for one table instance
@@ -238,7 +236,6 @@ struct pht_flow_table {
      */
     spinlock_t half_open_lock;
     struct net *net;
-    const struct phantun_config *cfg;
 };
 
 bool pht_flow_state_is_half_open(enum pht_flow_state state);
