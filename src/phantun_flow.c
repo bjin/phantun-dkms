@@ -40,20 +40,18 @@ struct pht_retired_flow {
 static void pht_flow_tx_dst_cache_reset(struct pht_flow_tx_dst_cache *cache);
 static struct dst_entry *pht_flow_tx_dst_cache_reset_locked(struct pht_flow_tx_dst_cache *cache);
 
-static u32 pht_addr_hash(const struct pht_addr *addr, u32 seed) {
-    if (!addr)
-        return seed;
-
-    seed = jhash(&addr->family, sizeof(addr->family), seed);
+static unsigned int pht_addr_hash_words(const struct pht_addr *addr, u32 *words) {
     switch (addr->family) {
     case AF_INET:
-        return jhash(&addr->v4, sizeof(addr->v4), seed);
+        words[0] = (__force u32)addr->v4;
+        return 1;
 #if IS_ENABLED(CONFIG_IPV6)
     case AF_INET6:
-        return jhash(&addr->v6, sizeof(addr->v6), seed);
+        memcpy(words, &addr->v6, sizeof(addr->v6));
+        return sizeof(addr->v6) / sizeof(*words);
 #endif
     default:
-        return seed;
+        return 0;
     }
 }
 
@@ -66,14 +64,19 @@ static bool pht_endpoint_pair_equal(const struct pht_endpoint_pair *a,
 
 static u32 pht_flow_hash_key(const struct pht_flow_table *table,
                              const struct pht_endpoint_pair *ep) {
-    u32 hash;
+    u32 key[3 + 2 * sizeof(struct in6_addr) / sizeof(u32)];
+    unsigned int words = 3;
 
-    hash = pht_addr_hash(&ep->local_addr, table->hash_seed);
-    hash = pht_addr_hash(&ep->remote_addr, hash);
-    hash = jhash(&ep->local_port, sizeof(ep->local_port), hash);
-    hash = jhash(&ep->remote_port, sizeof(ep->remote_port), hash);
-    hash = jhash(&ep->scope_ifindex, sizeof(ep->scope_ifindex), hash);
-    return hash & (PHT_FLOW_BUCKETS - 1);
+    /* Hash only semantic fields, never struct padding or unused IPv4 union
+     * bytes. Both families and scope participate in identity. Every word
+     * passed to jhash2 is initialized; the unused IPv4 tail needs no clearing.
+     */
+    key[0] = ((u32)ep->local_addr.family << 8) | ep->remote_addr.family;
+    key[1] = ((u32)(__force u16)ep->local_port << 16) | (__force u16)ep->remote_port;
+    key[2] = (u32)ep->scope_ifindex;
+    words += pht_addr_hash_words(&ep->local_addr, &key[words]);
+    words += pht_addr_hash_words(&ep->remote_addr, &key[words]);
+    return jhash2(key, words, table->hash_seed) & (PHT_FLOW_BUCKETS - 1);
 }
 
 static void pht_flow_reset_tx_dst_cache(struct pht_flow *flow) {

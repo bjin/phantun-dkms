@@ -202,6 +202,13 @@ A flow is keyed by the packet-boundary local/remote endpoint pair, including add
 The flow still stores oriented local/remote addresses and role.
 The canonical key exists only for lookup and collision prevention.
 
+Bucket selection hashes one compact sequence of initialized `u32` words:
+both endpoint families, both ports, scope, and only the active address bytes.
+It excludes structure padding and unused IPv4 union storage, so equal
+endpoints always choose the same bucket regardless of their backing bytes.
+Each table retains its random hash seed; bucket collisions still require
+full endpoint equality under the bucket lock.
+
 ### 5.2 Duplicate local initiation rule
 
 Before creating a new outbound flow for a tuple:
