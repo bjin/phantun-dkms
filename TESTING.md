@@ -71,7 +71,7 @@ Logs are automatically saved to `~/.cache/logs/phantun_tests/YYYYMMDD_HHMMSS/`.
 ## Framework Structure
 
 - `tests/conftest.py`: Core framework. Provides:
-  - `vm`: manages the virtme-ng / QEMU lifecycle
+  - `vm`: manages the virtme-ng / QEMU lifecycle (4G guest RAM)
   - `phantun_module`: installs via DKMS once per session and reloads module parameters through `/etc/modprobe.d/phantun.conf`
   - `dmesg`: waits for new kernel log lines
   - `ipv6_runtime`: skips the test unless this module build loads with `ip_families=ipv6`; request it with `@pytest.mark.usefixtures("ipv6_runtime")`

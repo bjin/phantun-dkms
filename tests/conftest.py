@@ -80,6 +80,12 @@ class VM:
             "--ssh",
             "--user",
             "root",
+            # vng defaults to 1G and one vCPU per host CPU. With >= 6 vCPUs the
+            # DKMS build compiles all six units at once (~200 MiB per cc1), so
+            # 1G OOM-kills it. Avoid exactly 2G: QEMU 11.1 microvm guests hang
+            # at boot with exactly 2 GiB of RAM.
+            "--memory",
+            "4G",
             "--exec",
             f"python3 {shlex.quote(str(guest_bootstrap))} && exec sleep 3600",
         ]
