@@ -21,6 +21,12 @@ NS6_ADDR_B = "fd00:200::2"
 PORTS_A = (2222, 4444)
 PORTS_B = (3333, 5555)
 
+# Default selector and shaping payloads for tests that do not exercise the
+# selector or payload parsing themselves.
+MANAGED_LOCAL_PORTS = "2222,3333,4444,5555"
+REQ = "HSREQ42"
+RESP = "HSRESP42"
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 GUEST_SCENARIOS = str(PROJECT_ROOT / "tests/guest/scenarios.py")
 MODULE_STAT_NAMES = (
@@ -207,6 +213,10 @@ def wait_for_guest_ready_file(vm, path, timeout=5):
     wait_for_guest_condition(vm, ["test", "-e", path], timeout, f"guest readiness file {path!r}")
 
 
+def write_guest_text(vm, path, content):
+    vm.run(["python3", "-c", f"from pathlib import Path; Path({path!r}).write_text({content!r})"])
+
+
 def spawn_ready_capture(vm, namespace, config):
     ready_file = f"/tmp/phantun-capture-{uuid.uuid4().hex}"
     capture = spawn_netns_scenario(
@@ -219,6 +229,18 @@ def spawn_ready_capture(vm, namespace, config):
     return capture
 
 
+def spawn_ready_recv_until_timeout(vm, namespace, config):
+    ready_file = f"/tmp/phantun-recv-{time.time_ns()}"
+    receiver = spawn_netns_scenario(
+        vm,
+        namespace,
+        "recv_until_timeout",
+        {**config, "ready_file": ready_file},
+    )
+    wait_for_guest_ready_file(vm, ready_file, timeout=config.get("timeout_sec", 10))
+    return receiver
+
+
 def parse_guest_json(stdout, context):
     body = stdout.strip()
     try:
@@ -227,9 +249,33 @@ def parse_guest_json(stdout, context):
         raise AssertionError(f"{context}: invalid guest JSON: {exc}: {body}") from exc
 
 
+def received_messages(payload):
+    # echo_server reports plain strings; receivers that also record the sender
+    # report {"message": ..., "peer": ...} entries.
+    return [entry["message"] if isinstance(entry, dict) else entry for entry in payload.get("received", [])]
+
+
+def reply_messages(payload):
+    return [entry["message"] for entry in payload.get("replies", [])]
+
+
+def assert_receiver_messages(result, expected, context, timed_out):
+    assert_completed(result, context)
+    data = parse_guest_json(result.stdout, f"{context} stdout")
+    messages = received_messages(data)
+    if messages != expected or data.get("timed_out") is not timed_out:
+        pytest.fail(f"{context}: expected messages={expected!r} timed_out={timed_out}, got {data!r}")
+
+
 def require_guest_command(vm, command):
     res = vm.run(f"command -v {shlex.quote(command)}", check=False)
     return res.returncode == 0
+
+
+def require_nft_or_skip(vm):
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
 
 
 def kernel_has_base64_support(vm):
@@ -266,6 +312,70 @@ print(json.dumps(stats))
 """ % (MODULE_STAT_NAMES,),
     )
     return parse_guest_json(res.stdout, "module stats stdout")
+
+
+def wait_for_flows_current(vm, expected, timeout=10, reason=None):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        stats = read_module_stats(vm)
+        if stats["flows_current"] == expected:
+            return stats
+        time.sleep(0.1)
+
+    prefix = f"{reason}: " if reason else ""
+    pytest.fail(f"{prefix}flows_current did not reach {expected}: current={stats!r}")
+
+
+def wait_for_stat_greater(vm, name, baseline, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        stats = read_module_stats(vm)
+        if stats[name] > baseline:
+            return stats
+        time.sleep(0.1)
+
+    pytest.fail(f"{name} did not exceed {baseline}: current={stats!r}")
+
+
+def load_managed_module(phantun_module, **kwargs):
+    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, **kwargs)
+
+
+def load_fast_liveness_module(phantun_module, **kwargs):
+    # 1s keepalive interval x 2 misses: established flows lose liveness after
+    # about 2s, so recovery tests can force teardown/replacement quickly.
+    load_managed_module(
+        phantun_module,
+        keepalive_interval_sec=1,
+        keepalive_misses=2,
+        handshake_retries=20,
+        **kwargs,
+    )
+
+
+def require_runtime_ipv6_support(phantun_module):
+    # The probe result is cached on the session-scoped module fixture, so the
+    # extra ip_families=ipv6 load runs once per VM.
+    cached = getattr(phantun_module, "_runtime_ipv6_supported", None)
+    if cached is False:
+        pytest.skip("runtime IPv6 translation support is unavailable for this module build")
+    if cached is True:
+        return
+
+    try:
+        phantun_module.load(managed_netns="all", managed_local_ports=str(PORTS_A[0]), ip_families="ipv6")
+    except subprocess.CalledProcessError as exc:
+        phantun_module._runtime_ipv6_supported = False
+        phantun_module.unload()
+        phantun_module.vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"], check=False)
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        pytest.skip(
+            "runtime IPv6 translation support is unavailable for this module build" + (f": {detail}" if detail else "")
+        )
+    else:
+        phantun_module._runtime_ipv6_supported = True
+        phantun_module.unload()
+        phantun_module.vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"], check=False)
 
 
 def cleanup_netns_topology(vm, namespaces=(NS_A, NS_B)):
@@ -332,6 +442,45 @@ def ensure_netns_second_path(vm, with_ipv6=False):
             NS_B,
             ["ip", "-6", "neigh", "replace", NS6_ADDR_A, "lladdr", mac_a, "dev", VETH_B_ALT, "nud", "permanent"],
         )
+
+
+def run_ping_pong(vm, src_addr, dst_addr, src_port=None, dst_port=None):
+    src_port = src_port or PORTS_A[0]
+    dst_port = dst_port or PORTS_B[0]
+    server = spawn_netns_scenario(
+        vm,
+        NS_B,
+        "ping_server",
+        {"bind_addr": dst_addr, "bind_port": dst_port, "reply": "pong"},
+    )
+    try:
+        time.sleep(0.2)
+        client_result = run_netns_scenario(
+            vm,
+            NS_A,
+            "ping_client",
+            {
+                "bind_addr": src_addr,
+                "bind_port": src_port,
+                "target_addr": dst_addr,
+                "target_port": dst_port,
+                "payload": "ping",
+            },
+            timeout=10,
+        )
+        server_result = server.communicate(timeout=10)
+    except Exception:
+        server.terminate()
+        raise
+
+    assert_completed(client_result, "ping client")
+    assert_completed(server_result, "ping server")
+    server_data = parse_guest_json(server_result.stdout, "ping server stdout")
+    client_data = parse_guest_json(client_result.stdout, "ping client stdout")
+    assert server_data.get("received") == "ping"
+    assert server_data.get("peer") == [src_addr, src_port]
+    assert client_data.get("reply") == "pong"
+    assert client_data.get("peer") == [dst_addr, dst_port]
 
 
 def nft_ip_prefix(addr):

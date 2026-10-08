@@ -9,6 +9,8 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 
+from helpers import require_runtime_ipv6_support
+
 
 def pytest_addoption(parser):
     parser.addoption(
@@ -378,3 +380,10 @@ def phantun_module(vm, project_info):
         yield mod
     finally:
         mod.uninstall()
+
+
+@pytest.fixture
+def ipv6_runtime(phantun_module):
+    # Request via @pytest.mark.usefixtures("ipv6_runtime") on tests that need
+    # this module build to load with ip_families=ipv6.
+    require_runtime_ipv6_support(phantun_module)

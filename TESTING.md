@@ -74,28 +74,49 @@ Logs are automatically saved to `~/.cache/logs/phantun_tests/YYYYMMDD_HHMMSS/`.
   - `vm`: manages the virtme-ng / QEMU lifecycle
   - `phantun_module`: installs via DKMS once per session and reloads module parameters through `/etc/modprobe.d/phantun.conf`
   - `dmesg`: waits for new kernel log lines
-- `tests/helpers.py`: Shared helper API for namespaces, guest scenario execution, nft probes, and module stat reads.
+  - `ipv6_runtime`: skips the test unless this module build loads with `ip_families=ipv6`; request it with `@pytest.mark.usefixtures("ipv6_runtime")`
+- `tests/helpers.py`: Shared helper API for namespaces, guest scenario execution, nft probes, module loading, and module stat reads.
 - `tests/guest/bootstrap.py`: repairs Arch's pre-auth chroot ownership and permissions inside the guest.
 - `tests/guest/scenarios.py`: Small checked-in guest-side Python scenarios used by the tests.
-- `tests/test_dkms.py`: DKMS install/load/reload and parameter validation coverage.
-- `tests/test_config_stats.py`: selector configuration, `/sys/module/phantun/stats/*`, and basic selector-path behavior.
-- `tests/test_handshakes.py`: shaping semantics and control-payload visibility rules.
-- `tests/test_netns_udp.py`: namespace translation, multi-channel behavior,
-  real reinjection-cookie collisions on TCP, and raw-IP checksum verification
-  for odd/maximal UDP payloads and odd-sized GSO segments in both families.
-- `tests/test_packet_loss.py`: handshake retries, payload-loss behavior, local send failures, and state-machine behavior under packet loss.
-- `tests/test_recovery.py`: collisions, tuple replacement, quarantine,
-  unknown-packet recovery, and wire-level pure-ACK receive sequence accounting.
-- `tests/test_ipv6.py`: IPv6 translation, routing, WireGuard, and final-protocol
-  ownership classification behind IPv6 Destination Options headers.
-- `tests/test_wireguard.py`: end-to-end coverage for kernel WireGuard and `wireguard-go`.
 
-The raw-IP checksum cases verify packet bytes independently of skb checksum
-flags, but do not force nonlinear source skbs or odd source offsets.
-Dedicated coverage of nonlinear layouts, odd offsets, source-range rejection,
-and computed-zero checksums is not part of the persistent suite. Those cases
-were exercised using a temporary kernel probe; no reusable probe is checked
-into this repository.
+Test modules are grouped by the behavior under test, not by address family; IPv6 cases sit next to their IPv4 counterparts.
+
+| Module | Covers |
+|---|---|
+| `tests/test_module_lifecycle.py` | Kernel-version sanity, DKMS-installed module load, unload, and reload |
+| `tests/test_module_params.py` | Load-time parameter parsing and rejection (shaping payload encodings and sizes, `reopen_guard_bytes`, timers, selectors, `managed_netns`) and derived settings such as auto `replacement_protect_ms` |
+| `tests/test_module_stats.py` | `/sys/module/phantun/stats/*` counters and `skb:kfree_skb` drop attribution |
+| `tests/test_port_reservation.py` | `reserved_local_ports` TCP reservations across selector modes, namespaces, and address families |
+| `tests/test_selectors.py` | Which traffic is owned: `managed_local_ports`, `managed_remote_peers`, `managed_netns`, `ip_families`, loopback, and dropping raw UDP sent to owned ports (fragments, IPv6 Destination Options) |
+| `tests/test_translation.py` | Basic UDP to fake-TCP translation: IPv4/IPv6 ping-pong, echo, four concurrent channels, zero-length UDP |
+| `tests/test_checksums.py` | Generated fake-TCP checksum state, reinjected UDP checksums at payload and GSO boundaries in both families, inbound bad-checksum drops |
+| `tests/test_payload_size.py` | Established-flow UDP GSO superframes, oversized and path-MTU payloads in both directions |
+| `tests/test_netfilter.py` | Coexistence with conntrack/firewall policies, reinjection-cookie trust, forwarded fake TCP |
+| `tests/test_metadata_routing.py` | Mark, DSCP, traffic class, UID, and oif propagation to fake TCP and route-cache keying |
+| `tests/test_topology.py` | Secondary, deprecated, and link-local addresses; route changes, device down, and address removal |
+| `tests/test_handshake_half_open.py` | SYN and SYN\|ACK loss retries, retry exhaustion, half-open limits, `SYN_SENT` queueing |
+| `tests/test_handshake_shaping.py` | `handshake_request` / `handshake_response` injection, hiding from UDP apps, loss, and reserved sequence slots |
+| `tests/test_emit_failures.py` | Local fake-TCP send failures (drops on the sender's `OUTPUT`) in each handshake and established state |
+| `tests/test_liveness.py` | Keepalive liveness timeout and reinitiation, idle-ACK suppression |
+| `tests/test_replacement.py` | Simultaneous-open collisions, generation replacement and replacement protection, quarantine, retired-record eviction |
+| `tests/test_inbound_validation.py` | Inbound flag, ACK, and sequence validation; unknown-tuple RSTs |
+| `tests/test_wireguard.py` | End-to-end kernel WireGuard over IPv4 and IPv6 underlays, endpoint roaming, TIME_WAIT ACK metadata |
+
+The raw-IP checksum cases in `tests/test_checksums.py` verify packet bytes
+independently of skb checksum flags, but do not force nonlinear source skbs or
+odd source offsets. Dedicated coverage of nonlinear layouts, odd offsets,
+source-range rejection, and computed-zero checksums is not part of the
+persistent suite. Those cases were exercised using a temporary kernel probe; no
+reusable probe is checked into this repository.
+
+### Where new tests and helpers go
+
+- Add a test to the module that owns the behavior it asserts. An IPv6 variant goes next to its IPv4 counterpart and requests `ipv6_runtime`.
+- Helpers used by more than one test module live in `tests/helpers.py`; helpers used by a single module stay in that module. Test modules never import from other `test_*.py` modules.
+- Shared defaults in `tests/helpers.py`:
+  - `MANAGED_LOCAL_PORTS`, `REQ`, `RESP`: standard selector and shaping payloads.
+  - `load_managed_module(phantun_module, **kwargs)`: loads with `managed_netns=all` and `MANAGED_LOCAL_PORTS`.
+  - `load_fast_liveness_module(phantun_module, **kwargs)`: same, plus a 1s keepalive interval, 2 keepalive misses, and 20 handshake retries.
 
 ### Best Practices
 
@@ -127,7 +148,7 @@ into this repository.
 
 6. **For packet-loss tests, drop on veth ingress, not sender output**
    - Use the `netdev` ingress probes on `VETH_A` / `VETH_B` to simulate on-path loss.
-   - Do not drop on sender `OUTPUT` when you mean network loss; that turns the test into a local send failure instead.
+   - Do not drop on sender `OUTPUT` when you mean network loss; that turns the test into a local send failure instead (covered by `tests/test_emit_failures.py`).
 
 7. **Read stats and logs through helpers**
    - Use `read_module_stats(vm)` / `read_module_stat(vm, name)` for `/sys/module/phantun/stats/*`.
@@ -135,7 +156,7 @@ into this repository.
 
 8. **Handle expected failures explicitly**
    - Pass `check=False` when the test intentionally expects a guest command or `modprobe` to fail.
-   - For successful guest scenarios, use a local `assert_completed(...)` helper or explicit `pytest.fail(...)` checks for clearer errors.
+   - For successful guest scenarios, use `assert_completed(...)` from `tests/helpers.py` or explicit `pytest.fail(...)` checks for clearer errors.
 
 9. **Keep assertions specific to the behavior under test**
    - For selector tests, check whether raw UDP escaped vs translated TCP appeared.
@@ -144,8 +165,8 @@ into this repository.
 
 10. **Run the smallest useful subset first**
    - During development, prefer targeted invocations such as:
-   - `pytest tests/test_packet_loss.py -q`
-   - `pytest tests/test_recovery.py::test_established_bare_syn_replacement -q -vv`
+   - `pytest tests/test_handshake_half_open.py -q`
+   - `pytest tests/test_replacement.py::test_established_bare_syn_replacement -q -vv`
    - Expand to the broader regression suite once the focused case passes.
 
 11. **Control timing instead of hoping for it**

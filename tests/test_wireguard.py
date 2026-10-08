@@ -1,3 +1,5 @@
+"""End-to-end kernel WireGuard over phantun."""
+
 import re
 import shlex
 import time
@@ -6,12 +8,14 @@ import uuid
 import pytest
 
 from helpers import (
+    NS6_ADDR_A,
+    NS6_ADDR_B,
     NS_A,
     NS_ADDR_A,
     NS_ADDR_B,
     NS_B,
-    VETH_B,
     NetnsNftProbe,
+    VETH_B,
     assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
@@ -19,8 +23,8 @@ from helpers import (
     make_netns_tcp_payload_probe,
     parse_guest_json,
     probe_comment,
-    require_guest_command,
     read_module_stat,
+    require_guest_command,
     run_in_netns,
     run_netns_scenario,
     spawn_netns_scenario,
@@ -33,16 +37,22 @@ WG_PEER_A = "10.10.0.1"
 WG_PEER_B = "10.10.0.2"
 PORT_A = 2222
 PORT_B = 3333
-MANAGED_LOCAL_PORTS = "2222,3333"
-REQ = "WGREQ42"
-RESP = "WGRESP42"
+WG_MANAGED_LOCAL_PORTS = "2222,3333"
+WG_REQ = "WGREQ42"
+WG_RESP = "WGRESP42"
 NS_ADDR_B_ROAM = "10.200.0.22"
 TIMEWAIT_SERVER_PORT = 40404
 TIMEWAIT_CLIENT_PORTS = tuple(range(45000, 45008))
+WG6_ADDR_A = "fd10:200::1/64"
+WG6_ADDR_B = "fd10:200::2/64"
+WG6_PEER_A = "fd10:200::1"
+WG6_PEER_B = "fd10:200::2"
+WG6_MTU = 1408
+WG6_PING_PAYLOAD = 1360
 
 
 def load_wireguard_module(phantun_module, **kwargs):
-    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, **kwargs)
+    phantun_module.load(managed_netns="all", managed_local_ports=WG_MANAGED_LOCAL_PORTS, **kwargs)
 
 
 def require_wireguard_stack(vm):
@@ -263,13 +273,95 @@ def build_payload_probes(vm, handshake_request=None, handshake_response=None):
     return probe_a, probe_b
 
 
+def wg_endpoint(addr, port):
+    return f"[{addr}]:{port}" if ":" in addr else f"{addr}:{port}"
+
+
+def setup_wireguard_pair_ipv6(vm, endpoint_a=NS6_ADDR_A, endpoint_b=NS6_ADDR_B):
+    priv_a, pub_a = guest_keypair(vm)
+    priv_b, pub_b = guest_keypair(vm)
+    key_a_path = "/tmp/wg6-a.key"
+    key_b_path = "/tmp/wg6-b.key"
+
+    write_guest_secret(vm, key_a_path, priv_a)
+    write_guest_secret(vm, key_b_path, priv_b)
+    run_in_netns(vm, NS_A, ["ip", "link", "add", "wg0", "type", "wireguard"])
+    run_in_netns(vm, NS_B, ["ip", "link", "add", "wg0", "type", "wireguard"])
+    run_in_netns(vm, NS_A, ["ip", "-6", "address", "add", WG6_ADDR_A, "dev", "wg0", "nodad"])
+    run_in_netns(vm, NS_B, ["ip", "-6", "address", "add", WG6_ADDR_B, "dev", "wg0", "nodad"])
+    for namespace in (NS_A, NS_B):
+        run_in_netns(vm, namespace, ["ip", "link", "set", "wg0", "mtu", str(WG6_MTU)])
+
+    run_in_netns(
+        vm,
+        NS_A,
+        [
+            "wg",
+            "set",
+            "wg0",
+            "listen-port",
+            str(PORT_A),
+            "private-key",
+            key_a_path,
+            "peer",
+            pub_b,
+            "allowed-ips",
+            f"{WG6_PEER_B}/128",
+            "endpoint",
+            wg_endpoint(endpoint_b, PORT_B),
+            "persistent-keepalive",
+            "1",
+        ],
+    )
+    run_in_netns(
+        vm,
+        NS_B,
+        [
+            "wg",
+            "set",
+            "wg0",
+            "listen-port",
+            str(PORT_B),
+            "private-key",
+            key_b_path,
+            "peer",
+            pub_a,
+            "allowed-ips",
+            f"{WG6_PEER_A}/128",
+            "endpoint",
+            wg_endpoint(endpoint_a, PORT_A),
+            "persistent-keepalive",
+            "1",
+        ],
+    )
+    run_in_netns(vm, NS_A, ["ip", "link", "set", "wg0", "up"])
+    run_in_netns(vm, NS_B, ["ip", "link", "set", "wg0", "up"])
+    return key_a_path, key_b_path
+
+
+def ping6_wireguard_peer(vm, namespace, target, label, size=None):
+    command = ["ping", "-6", "-c", "3", "-i", "0.2", "-W", "2"]
+    if size is not None:
+        command.extend(["-s", str(size)])
+    command.append(target)
+    result = run_in_netns(vm, namespace, command)
+    assert_ping_clean(result, label)
+
+
+def cleanup_wireguard(vm, key_a_path, key_b_path):
+    run_in_netns(vm, NS_A, ["ip", "link", "del", "wg0"], check=False)
+    run_in_netns(vm, NS_B, ["ip", "link", "del", "wg0"], check=False)
+    vm.run(["rm", "-f", key_a_path, key_b_path], check=False)
+    cleanup_netns_topology(vm)
+
+
 @pytest.mark.parametrize(
     ("module_kwargs", "expect_request", "expect_response"),
     [
         pytest.param({}, False, False, id="plain"),
-        pytest.param({"handshake_request": REQ}, True, False, id="request"),
+        pytest.param({"handshake_request": WG_REQ}, True, False, id="request"),
         pytest.param(
-            {"handshake_request": REQ, "handshake_response": RESP},
+            {"handshake_request": WG_REQ, "handshake_response": WG_RESP},
             True,
             True,
             id="request-response",
@@ -506,3 +598,96 @@ def test_kernel_wireguard_roaming_updates_endpoint(phantun_module, vm):
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
         cleanup_netns_topology(vm)
+
+
+@pytest.mark.usefixtures("ipv6_runtime")
+def test_kernel_wireguard_over_ipv6_phantun_translates_underlay(phantun_module, vm):
+    require_wireguard_stack(vm)
+    phantun_module.load(managed_netns="all", managed_local_ports=f"{PORT_A},{PORT_B}")
+    ensure_netns_topology(vm, with_ipv6=True)
+    key_a_path = key_b_path = "/tmp/nonexistent"
+    underlay_a = [(NS6_ADDR_A, PORT_A, NS6_ADDR_B, PORT_B)]
+    underlay_b = [(NS6_ADDR_B, PORT_B, NS6_ADDR_A, PORT_A)]
+    probe_a = make_netns_output_probe(vm, NS_A, underlay_a)
+    probe_b = make_netns_output_probe(vm, NS_B, underlay_b)
+    try:
+        key_a_path, key_b_path = setup_wireguard_pair_ipv6(vm)
+        ping6_wireguard_peer(vm, NS_A, WG6_PEER_B, "ns_a -> ns_b IPv6 ping")
+        ping6_wireguard_peer(vm, NS_B, WG6_PEER_A, "ns_b -> ns_a IPv6 ping")
+        ping6_wireguard_peer(
+            vm,
+            NS_A,
+            WG6_PEER_B,
+            "ns_a -> ns_b IPv6 near-MTU ping",
+            size=WG6_PING_PAYLOAD,
+        )
+        ping6_wireguard_peer(
+            vm,
+            NS_B,
+            WG6_PEER_A,
+            "ns_b -> ns_a IPv6 near-MTU ping",
+            size=WG6_PING_PAYLOAD,
+        )
+        wait_for_handshake(vm)
+        wait_for_endpoint(vm, NS_A, wg_endpoint(NS6_ADDR_B, PORT_B))
+        wait_for_endpoint(vm, NS_B, wg_endpoint(NS6_ADDR_A, PORT_A))
+        assert_underlay_translation(vm, probe_a, probe_b, underlay_a, underlay_b, "wireguard IPv6")
+    finally:
+        probe_a.cleanup(vm)
+        probe_b.cleanup(vm)
+        cleanup_wireguard(vm, key_a_path, key_b_path)
+
+
+@pytest.mark.usefixtures("ipv6_runtime")
+def test_kernel_wireguard_roaming_between_ipv4_and_ipv6_endpoints(phantun_module, vm):
+    require_wireguard_stack(vm)
+    phantun_module.load(managed_netns="all", managed_local_ports=f"{PORT_A},{PORT_B}")
+    ensure_netns_topology(vm, with_ipv6=True)
+    key_a_path = key_b_path = "/tmp/nonexistent"
+    ipv6_a = (NS6_ADDR_A, PORT_A, NS6_ADDR_B, PORT_B)
+    ipv6_b = (NS6_ADDR_B, PORT_B, NS6_ADDR_A, PORT_A)
+    ipv4_a = (NS_ADDR_A, PORT_A, NS_ADDR_B, PORT_B)
+    ipv4_b = (NS_ADDR_B, PORT_B, NS_ADDR_A, PORT_A)
+    probe_a = make_netns_output_probe(vm, NS_A, [ipv6_a, ipv4_a])
+    probe_b = make_netns_output_probe(vm, NS_B, [ipv6_b, ipv4_b])
+    try:
+        key_a_path, key_b_path = setup_wireguard_pair_ipv6(vm)
+        ping6_wireguard_peer(vm, NS_A, WG6_PEER_B, "initial IPv6 underlay ping")
+        wait_for_endpoint(vm, NS_A, wg_endpoint(NS6_ADDR_B, PORT_B))
+        assert_underlay_translation(vm, probe_a, probe_b, [ipv6_a], [ipv6_b], "initial IPv6 underlay")
+
+        base_v4_a = sum_probe_packets(vm, probe_a, "tcp", [ipv4_a])
+        base_v4_b = sum_probe_packets(vm, probe_b, "tcp", [ipv4_b])
+        run_in_netns(
+            vm,
+            NS_B,
+            f"wg set wg0 peer $(wg show wg0 peers) endpoint {shlex.quote(wg_endpoint(NS_ADDR_A, PORT_A))}",
+        )
+        ping6_wireguard_peer(vm, NS_B, WG6_PEER_A, "roam to IPv4 underlay ping")
+        wait_for_endpoint(vm, NS_A, wg_endpoint(NS_ADDR_B, PORT_B))
+        if sum_probe_packets(vm, probe_a, "tcp", [ipv4_a]) <= base_v4_a:
+            pytest.fail("return traffic did not move to IPv4 translated TCP")
+        if sum_probe_packets(vm, probe_b, "tcp", [ipv4_b]) <= base_v4_b:
+            pytest.fail("roaming peer did not send IPv4 translated TCP")
+
+        base_v6_a = sum_probe_packets(vm, probe_a, "tcp", [ipv6_a])
+        base_v6_b = sum_probe_packets(vm, probe_b, "tcp", [ipv6_b])
+        run_in_netns(
+            vm,
+            NS_B,
+            f"wg set wg0 peer $(wg show wg0 peers) endpoint {shlex.quote(wg_endpoint(NS6_ADDR_A, PORT_A))}",
+        )
+        ping6_wireguard_peer(vm, NS_B, WG6_PEER_A, "roam back to IPv6 underlay ping")
+        wait_for_endpoint(vm, NS_A, wg_endpoint(NS6_ADDR_B, PORT_B))
+        if sum_probe_packets(vm, probe_a, "tcp", [ipv6_a]) <= base_v6_a:
+            pytest.fail("return traffic did not move back to IPv6 translated TCP")
+        if sum_probe_packets(vm, probe_b, "tcp", [ipv6_b]) <= base_v6_b:
+            pytest.fail("roaming peer did not send IPv6 translated TCP")
+        if sum_probe_packets(vm, probe_a, "udp", [ipv6_a, ipv4_a]) != 0:
+            pytest.fail("raw UDP escaped from ns_a during mixed-family roaming")
+        if sum_probe_packets(vm, probe_b, "udp", [ipv6_b, ipv4_b]) != 0:
+            pytest.fail("raw UDP escaped from ns_b during mixed-family roaming")
+    finally:
+        probe_a.cleanup(vm)
+        probe_b.cleanup(vm)
+        cleanup_wireguard(vm, key_a_path, key_b_path)
