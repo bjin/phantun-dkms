@@ -517,6 +517,12 @@ successful payload/immediate-control sends can also refresh activity, but
 periodic keepalive attempts do not. Healthy control traffic can thus sustain an
 application-idle generation indefinitely. A DEAD tombstone is collected using
 its retained activity timestamp, without granting a new timeout at retirement.
+If terminal removal cannot allocate retired sequence metadata, the hashed DEAD
+tombstone preserves the reopen sequence identity and still counts toward hash
+occupancy. Its abandoned queued UDP skb is detached under the flow lock and
+freed outside bucket/flow locks, releasing any attached socket reference without
+waiting for tombstone expiry. This terminal discard does not change half-open
+liveness-GC replay or simultaneous-open queue transfer.
 
 Inbound flag priority in established state:
 

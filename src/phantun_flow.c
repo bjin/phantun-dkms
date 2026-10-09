@@ -1241,7 +1241,11 @@ void pht_flow_remove(struct pht_flow *flow) {
 
     pht_flow_untrack_half_open(flow);
     if (!retired) {
+        struct sk_buff *queued_skb = pht_flow_take_queued_skb(flow, NULL);
+
         spin_unlock_bh(&bucket->lock);
+        /* DEAD blocks new queue admission; the caller still owns a flow ref. */
+        kfree_skb(queued_skb);
         pht_flow_reset_tx_dst_cache(flow);
         pht_pr_warn_rl("keeping DEAD flow tombstone after retired metadata allocation failure\n");
         pht_flow_cancel_retransmit(flow);
