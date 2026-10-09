@@ -254,10 +254,11 @@ static void pht_flow_untrack_half_open(struct pht_flow *flow) {
         return;
 
     spin_lock_bh(&flow->table->half_open_lock);
-    if (flow->half_open_tracked) {
-        flow->half_open_tracked = false;
-        if (flow->table->half_open_current > 0)
-            flow->table->half_open_current--;
+    if (flow->half_open_origin != PHT_HALF_OPEN_NONE) {
+        if (flow->half_open_origin == PHT_HALF_OPEN_REMOTE)
+            flow->table->half_open_remote_current--;
+        flow->table->half_open_current--;
+        flow->half_open_origin = PHT_HALF_OPEN_NONE;
     }
     spin_unlock_bh(&flow->table->half_open_lock);
 }
@@ -433,6 +434,9 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
         table->keepalive_interval_jiffies * ((u64)cfg->keepalive_misses + 1);
     table->hard_idle_timeout_jiffies = msecs_to_jiffies(cfg->hard_idle_timeout_sec * 1000U);
     table->half_open_limit = cfg->half_open_limit;
+    table->half_open_remote_limit =
+        cfg->half_open_limit -
+        (cfg->half_open_limit > 1 ? max(1U, cfg->half_open_limit / 4) : 0);
     table->hash_seed = get_random_u32();
     table->reinject_mark = get_random_u32() | BIT(31);
     table->gc_interval_jiffies = msecs_to_jiffies(PHT_FLOW_GC_INTERVAL_SEC * 1000U);
@@ -971,18 +975,30 @@ static bool pht_flow_unhash_and_queue_finalize(struct pht_flow *flow, bool send_
 }
 
 static int pht_flow_admit_half_open_locked(struct pht_flow_table *table, struct pht_flow *flow) {
-    if (!pht_flow_state_is_half_open(flow->state) || flow->half_open_tracked)
+    enum pht_half_open_origin origin;
+
+    if (!pht_flow_state_is_half_open(flow->state))
         return 0;
 
+    /* Role classifies only a fresh publication, never release or replacement. */
+    origin = flow->role == PHT_FLOW_ROLE_INITIATOR ? PHT_HALF_OPEN_LOCAL : PHT_HALF_OPEN_REMOTE;
     spin_lock(&table->half_open_lock);
-    if (table->half_open_current >= table->half_open_limit) {
+    if (flow->half_open_origin != PHT_HALF_OPEN_NONE) {
+        spin_unlock(&table->half_open_lock);
+        return 0;
+    }
+    if (table->half_open_current >= table->half_open_limit ||
+        (origin == PHT_HALF_OPEN_REMOTE &&
+         table->half_open_remote_current >= table->half_open_remote_limit)) {
         spin_unlock(&table->half_open_lock);
         pht_stats_inc(PHT_STAT_HALF_OPEN_REJECTED);
         return -ENOSPC;
     }
 
     table->half_open_current++;
-    flow->half_open_tracked = true;
+    if (origin == PHT_HALF_OPEN_REMOTE)
+        table->half_open_remote_current++;
+    flow->half_open_origin = origin;
     spin_unlock(&table->half_open_lock);
     return 0;
 }
@@ -1093,6 +1109,88 @@ int pht_flow_replace_dead(struct pht_flow_table *table, struct pht_flow *dead_fl
 
     pht_flow_finish_publish(new_flow);
     return 0;
+}
+
+int pht_flow_replace_half_open(struct pht_flow_table *table, struct pht_flow *old_flow,
+                               struct pht_flow *new_flow, enum pht_flow_state expected_state) {
+    struct pht_flow_bucket *bucket;
+    unsigned long expires;
+
+    if (!table || !old_flow || !new_flow || old_flow == new_flow ||
+        !pht_flow_state_is_half_open(expected_state))
+        return -EINVAL;
+    if (old_flow->table != table || new_flow->table != table ||
+        !pht_endpoint_pair_equal(&old_flow->endpoints, &new_flow->endpoints) ||
+        !hlist_unhashed(&new_flow->hnode) || new_flow->state != PHT_FLOW_STATE_SYN_RCVD ||
+        new_flow->role != PHT_FLOW_ROLE_RESPONDER || new_flow->queued_skb ||
+        new_flow->half_open_origin != PHT_HALF_OPEN_NONE || new_flow->retransmit_armed)
+        return -EINVAL;
+
+    bucket = &table->buckets[pht_flow_hash_key(table, &old_flow->endpoints)];
+    spin_lock_bh(&bucket->lock);
+    spin_lock(&old_flow->lock);
+    if (hlist_unhashed(&old_flow->hnode) || old_flow->state != expected_state)
+        goto out_old;
+    /* While a callback emits unlocked, retries_done includes its attempt but
+     * timer.expires still holds the preceding deadline. Leave ownership alone
+     * until it rearms rather than consuming the next retry immediately.
+     */
+    if (old_flow->retransmit_armed && !timer_pending(&old_flow->retransmit_timer))
+        goto out_old;
+
+    /* Completion sets ESTABLISHED before releasing its charge. Revalidate and
+     * retire under the old lock to exclude that race; the admission lock
+     * serializes token ownership with every untrack path.
+     */
+    spin_lock(&table->half_open_lock);
+    if (old_flow->half_open_origin == PHT_HALF_OPEN_NONE) {
+        spin_unlock(&table->half_open_lock);
+        goto out_old;
+    }
+    new_flow->half_open_origin = old_flow->half_open_origin;
+    old_flow->half_open_origin = PHT_HALF_OPEN_NONE;
+    spin_unlock(&table->half_open_lock);
+
+    /* @new_flow is exclusively caller-owned until publication/timer arming.
+     * Preserve both metadata owners, even when newer local UDP filled no slot.
+     */
+    new_flow->queued_skb = old_flow->queued_skb;
+    new_flow->queued_tx_meta = old_flow->queued_tx_meta;
+    new_flow->local_tx_meta = old_flow->local_tx_meta;
+    old_flow->queued_skb = NULL;
+    pht_tx_meta_init(&old_flow->queued_tx_meta);
+    new_flow->retries_done = old_flow->retries_done;
+    new_flow->max_retries = old_flow->max_retries;
+    new_flow->last_activity_jiffies = old_flow->last_activity_jiffies;
+    new_flow->last_inbound_jiffies = old_flow->last_inbound_jiffies;
+    new_flow->next_probe_jiffies = old_flow->next_probe_jiffies;
+    expires = old_flow->retransmit_armed
+                  ? old_flow->retransmit_timer.expires
+                  : old_flow->last_activity_jiffies + table->handshake_timeout_jiffies;
+    old_flow->state = PHT_FLOW_STATE_DEAD;
+    hlist_del_init(&old_flow->hnode);
+    pht_stats_dec(PHT_STAT_FLOWS_CURRENT);
+    spin_unlock(&old_flow->lock);
+
+    /* Arm before making the tuple reachable and hold the new lock across
+     * both steps: no late finish-publish may revive a concurrently dead timer.
+     * A callback already running on old_flow retains its own timer reference.
+     */
+    spin_lock(&new_flow->lock);
+    pht_flow_get(new_flow);
+    new_flow->retransmit_armed = true;
+    mod_timer(&new_flow->retransmit_timer, expires);
+    pht_flow_publish_locked(bucket, new_flow);
+    pht_stats_inc(PHT_STAT_FLOWS_CREATED);
+    spin_unlock(&new_flow->lock);
+    pht_flow_queue_finalize(old_flow, false);
+    spin_unlock_bh(&bucket->lock);
+    return 0;
+
+out_old:
+    spin_unlock(&old_flow->lock);
+    spin_unlock_bh(&bucket->lock);
+    return -EAGAIN;
 }
 
 /* Idempotent detach: once a flow leaves the table, mark it DEAD immediately
@@ -1212,6 +1310,10 @@ bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
         return false;
 
     spin_lock_bh(&flow->lock);
+    if (flow->state == PHT_FLOW_STATE_DEAD) {
+        spin_unlock_bh(&flow->lock);
+        return false;
+    }
     if (meta)
         flow->local_tx_meta = *meta;
     if (!flow->queued_skb) {

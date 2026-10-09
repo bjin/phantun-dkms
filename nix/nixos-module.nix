@@ -286,7 +286,7 @@ in
     halfOpenLimit = mkOption {
       type = nullableIntType;
       default = null;
-      description = "Positive maximum concurrent half-open flows per network namespace, or null to use the kernel default.";
+      description = "Positive total half-open ceiling L per network namespace, or null for the kernel default. Remote-origin opens are limited to L - max(1, floor(L/4)) when L > 1; L = 1 reserves no local slot. Local-origin opens may use all unused capacity and retain their charge across simultaneous-open role changes.";
     };
 
     replacementQuarantineMs = mkOption {

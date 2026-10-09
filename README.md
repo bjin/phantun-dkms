@@ -274,7 +274,7 @@ Validation rules:
 | `keepalive_misses` | `3` | Positive number of response intervals after the first probe opportunity. Teardown follows `(keepalive_misses + 1) * keepalive_interval_sec` of inbound silence, not a count of unanswered packets. |
 | `hard_idle_timeout_sec` | `300` | Hard upper bound for idle flow lifetime. |
 | `reopen_guard_bytes` | `4194304` | Minimum sequence-space distance before reopening same tuple; accepts `0..1073741823` and rejects values `>= 1073741824`. |
-| `half_open_limit` | `4096` | Maximum concurrent half-open flows per network namespace. New SYN-created or outbound half-open flows beyond this limit are rejected until existing half-open flows establish or time out. |
+| `half_open_limit` | `4096` | Total admitted half-open ceiling `L` per network namespace, shared by families/selectors. Reserve `R = max(1, floor(L / 4))` for local-origin handshakes when `L > 1`, otherwise `R = 0`. Remote-origin flows are capped at `L - R`; local opens may use all unused total capacity. A simultaneous-open role change retains its local-origin charge. Establishment or teardown releases the slot. |
 | `replacement_quarantine_ms` | `3000` | Previous-generation quarantine window after tuple replacement. Matching old-generation packets are silently dropped during this window. |
 | `replacement_protect_ms` | `0` (auto) | Established-initiator bare-SYN replacement protection window. During the window, aligned bare replacement SYNs to an established initiator are silently dropped to suppress stale simultaneous-initiation loser SYNs. After the window expires, normal replacement handling resumes. |
 
@@ -427,7 +427,7 @@ can increment both an aggregate and a more specific reason counter:
 | `flows_created` | Flow objects successfully inserted into the flow table. |
 | `flows_established` | Flows that reached `ESTABLISHED`. |
 | `flows_current` | Flow objects currently present in the flow table. |
-| `half_open_rejected` | Valid half-open openers rejected because the per-netns half-open limit was full. |
+| `half_open_rejected` | Valid half-open openers rejected because the per-netns total ceiling or remote-origin allowance was full. |
 | `handshake_retries_exhausted` | Half-open flows torn down after the handshake retransmit budget ran out. |
 | `established_liveness_timeouts` | Established flows torn down after the configured inbound-silence timeout. |
 | **Replacement and simultaneous-init recovery** | |

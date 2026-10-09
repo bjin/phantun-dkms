@@ -1246,7 +1246,7 @@ static struct sk_buff *phantun_local_out_open_initiator(const struct phantun_loc
             pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
         else
             phantun_account_udp_translation_failure();
-        pht_pr_warn("failed to insert initiator flow: %d\n", ret);
+        pht_pr_warn_rl("failed to insert initiator flow: %d\n", ret);
         /* Freeing the unpublished flow also frees @skb from its queue. */
         pht_flow_put(new_flow);
         return NULL;
@@ -1675,41 +1675,20 @@ static void phantun_pre_routing_unknown_tuple(const struct phantun_pre_routing_c
  */
 static void phantun_pre_routing_yield_initiator(const struct phantun_pre_routing_ctx *ctx,
                                                 struct pht_flow *flow) {
-    struct pht_tx_meta queued_tx_meta;
-    struct pht_tx_meta local_tx_meta;
-    struct sk_buff *queued_skb;
     struct pht_flow *new_flow;
     int ret;
 
-    pht_pr_info("collision on tuple; switching to responder role\n");
-    pht_stats_inc(PHT_STAT_COLLISIONS_LOST);
-    pht_flow_detach(flow);
-    queued_skb = pht_flow_take_queued_skb(flow, &queued_tx_meta);
-    spin_lock_bh(&flow->lock);
-    local_tx_meta = flow->local_tx_meta;
-    spin_unlock_bh(&flow->lock);
-
     new_flow = phantun_pre_routing_new_responder(ctx);
-    if (IS_ERR(new_flow)) {
-        kfree_skb(queued_skb);
+    if (IS_ERR(new_flow))
         return;
-    }
 
-    /* queued_tx_meta stays tied to the transferred skb. local_tx_meta may be
-     * newer when later UDP arrived while the one-skb queue was full, so
-     * preserve it separately for retransmits and keepalives.
-     */
-    spin_lock_bh(&new_flow->lock);
-    new_flow->local_tx_meta = local_tx_meta;
-    spin_unlock_bh(&new_flow->lock);
-    if (queued_skb)
-        pht_flow_set_queued_skb(new_flow, queued_skb, &queued_tx_meta);
-
-    ret = pht_flow_insert(ctx->flows, new_flow);
+    ret = pht_flow_replace_half_open(ctx->flows, flow, new_flow, PHT_FLOW_STATE_SYN_SENT);
     if (ret) {
         pht_flow_put(new_flow);
         return;
     }
+    pht_pr_info("collision on tuple; switching to responder role\n");
+    pht_stats_inc(PHT_STAT_COLLISIONS_LOST);
 
     ret = phantun_send_synack(new_flow, ctx->net, &ctx->tx_meta);
     if (ret) {

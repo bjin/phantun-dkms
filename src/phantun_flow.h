@@ -28,6 +28,13 @@ enum pht_flow_role {
     PHT_FLOW_ROLE_RESPONDER,
 };
 
+/* Admission charge origin survives role changes during simultaneous open. */
+enum pht_half_open_origin {
+    PHT_HALF_OPEN_NONE = 0,
+    PHT_HALF_OPEN_LOCAL,
+    PHT_HALF_OPEN_REMOTE,
+};
+
 enum pht_flow_state {
     /* Local SYN sent; waiting for a valid SYN|ACK or a tie-break SYN collision. */
     PHT_FLOW_STATE_SYN_SENT = 0,
@@ -186,7 +193,8 @@ struct pht_flow {
     bool retransmit_armed;
     bool quarantine_prev_active;
     bool replacement_protect_active;
-    bool half_open_tracked;
+    /* Protected by table->half_open_lock, not inferred from state or role. */
+    enum pht_half_open_origin half_open_origin;
     /* Latched post-detach action: established liveness teardown should send
      * best-effort RST. Half-open liveness teardown keeps the existing no-RST
      * reinitiation path.
@@ -227,6 +235,8 @@ struct pht_flow_table {
     unsigned int handshake_retries;
     unsigned int half_open_limit;
     unsigned int half_open_current;
+    unsigned int half_open_remote_limit;
+    unsigned int half_open_remote_current;
     /* Per-table jhash seed keeps bucket selection stable for one table instance
      * while preventing a fixed, attacker-known collision set across netns or
      * module reloads.
@@ -238,8 +248,8 @@ struct pht_flow_table {
      * but only UDP receives the reinjection exemption; TCP is still classified.
      */
     u32 reinject_mark;
-    /* Serializes half-open admission and exact insert->established/dead
-     * accounting so SYN_SENT/SYN_RCVD pressure is bounded per netns.
+    /* Serializes total/remote admission and token release/transfer. Lock order
+     * is bucket -> flow -> admission; established flows carry no charge.
      */
     spinlock_t half_open_lock;
     struct net *net;
@@ -259,6 +269,16 @@ bool pht_flow_lookup_retired_seq(struct pht_flow_table *table, const struct pht_
                                  u32 *prev_seq);
 int pht_flow_replace_dead(struct pht_flow_table *table, struct pht_flow *dead_flow,
                           struct pht_flow *new_flow);
+/* Atomically replace expected SYN_SENT/SYN_RCVD with an unpublished SYN_RCVD
+ * responder on the same tuple/table. @new_flow must have an empty queue and no
+ * admission charge or timer. Caller retains both references on every outcome.
+ * Success transfers the old charge, queue+metadata, local transmit policy, and
+ * remaining retry/lifetime bounds; finalization owns the old table reference.
+ * -EAGAIN means old state/ownership changed or a retry callback is in flight;
+ * failure leaves the old flow intact.
+ */
+int pht_flow_replace_half_open(struct pht_flow_table *table, struct pht_flow *old_flow,
+                               struct pht_flow *new_flow, enum pht_flow_state expected_state);
 void pht_flow_remove(struct pht_flow *flow);
 void pht_flow_detach(struct pht_flow *flow);
 

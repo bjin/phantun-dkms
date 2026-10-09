@@ -268,10 +268,23 @@ The design wants **one surviving flow per canonical tuple**.
 Tie-break rule for `SYN_SENT` receiving a bare `SYN` on the same canonical tuple:
 
 - lower ISN wins initiator role
-- higher ISN loses initiator role and reprocesses inbound `SYN` as responder
+- higher ISN loses initiator role and atomically replaces its generation with a responder
 - exact ISN tie: drop and rely on retransmission
 
 This avoids NAT-sensitive endpoint heuristics and keeps shaping unambiguous.
+
+The losing handoff retains its **local-origin** admission token without
+releasing/reacquiring capacity. With the tuple bucket and old flow lock held,
+the replacement transaction revalidates the expected half-open state before
+moving the queued skb, its packet metadata, and the independently maintained
+local transmit policy. Allocation or revalidation failure leaves the old owner
+and queue intact; a concurrent handshake completion cannot be replaced.
+Publication retains the remaining retry budget, retry deadline, and lifetime
+timestamps rather than restarting them. Replacement waits for another opener
+if a retransmit callback is currently emitting, because its next timer expiry
+has not yet been committed. The old table reference transfers to process-context
+finalization only after dropping its flow lock; the new timer and table take
+their own references before the bucket is unlocked.
 
 ### 5.5 One queued UDP skb
 
@@ -283,6 +296,27 @@ Half-open flow buffering is intentionally small:
 - anything beyond the first queued skb is dropped
 
 Queued skb metadata is separate from the persistent local transmit policy.
+
+### 5.6 Protected half-open admission
+
+`half_open_limit = L` remains the total admitted half-open ceiling per selected
+network namespace, shared by enabled address families and selectors. Reserve
+`R = max(1, floor(L / 4))` slots for **local-origin** work when `L > 1`; for
+`L = 1`, use `R = 0` so remote initiation remains possible.
+
+Remote-origin flows may occupy at most `L - R` slots. Local-origin flows may
+use all unused total capacity. The token records its charged origin independently
+of state and role: a simultaneous-open loser remains local-origin even as a
+responder. The admission lock serializes total/remote charging, token transfer,
+and exactly-once release on establishment or any terminal exit. Neither a
+handoff nor a failed duplicate publication releases and reacquires a live token.
+An already detached generation cannot accept a newly queued skb through a
+cached pre-handoff state snapshot.
+
+This bounds admitted half-opens, not all module memory: allocation precedes
+admission, finalizing objects may retain references, and established flows are
+outside this count. A one-slot namespace cannot guarantee both remote admission
+and a protected local slot.
 
 ## 6. Per-flow state machine
 

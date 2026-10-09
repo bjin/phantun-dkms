@@ -79,7 +79,9 @@ MODULE_PARM_DESC(hard_idle_timeout_sec, "Maximum idle flow timeout in seconds (h
 module_param(reopen_guard_bytes, uint, 0444);
 MODULE_PARM_DESC(reopen_guard_bytes, "Minimum sequence space separation for new connections");
 module_param(half_open_limit, uint, 0444);
-MODULE_PARM_DESC(half_open_limit, "Maximum concurrent half-open flows per network namespace");
+MODULE_PARM_DESC(half_open_limit,
+                 "Total half-open ceiling per netns; reserve max(1, limit/4) for local origin "
+                 "when limit > 1");
 module_param(replacement_quarantine_ms, uint, 0444);
 MODULE_PARM_DESC(replacement_quarantine_ms,
                  "Previous-generation quarantine window in milliseconds after tuple replacement");

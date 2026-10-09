@@ -53,8 +53,14 @@ def sequence_distance(a, b):
     return diff if diff < 0x80000000 else 0x100000000 - diff
 
 
-def test_syn_isn_tie_break(phantun_module, vm):
-    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
+@pytest.mark.parametrize("saturate_remote", [False, True])
+def test_syn_isn_tie_break(phantun_module, vm, saturate_remote):
+    phantun_module.load(
+        managed_netns="all",
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        half_open_limit=2 if saturate_remote else 4096,
+        handshake_retries=100,
+    )
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -67,6 +73,7 @@ def test_syn_isn_tie_break(phantun_module, vm):
     initial_stats = read_module_stats(vm)
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
+    admission_drops = []
 
     probe_a = make_netns_ingress_flag_drop_probe(
         vm,
@@ -104,6 +111,57 @@ def test_syn_isn_tie_break(phantun_module, vm):
     vm.run(["ip", "netns", "exec", NS_B, "tc", "qdisc", "add", "dev", VETH_B, "root", "netem", "delay", "150ms"])
 
     try:
+        if saturate_remote:
+            # Fill each namespace's sole remote-origin slot before either
+            # local UDP open. Both ISN outcomes must retain local admission.
+            for namespace, addr, port, peer_ns, peer_addr, peer_dev in [
+                (NS_A, NS_ADDR_A, src_port, NS_B, NS_ADDR_B, VETH_B),
+                (NS_B, NS_ADDR_B, dst_port, NS_A, NS_ADDR_A, VETH_A),
+            ]:
+                admission_drops.append(
+                    make_netns_ingress_flag_drop_probe(
+                        vm,
+                        peer_ns,
+                        peer_dev,
+                        [
+                            {
+                                "src_addr": addr,
+                                "dst_addr": peer_addr,
+                                "src_port": port,
+                                "dst_port": flood_port,
+                                "flags_expr": "syn | ack",
+                                "comment": f"hold_remote_{flood_port}",
+                            }
+                            for flood_port in (41001, 41002)
+                        ],
+                    )
+                )
+                run_netns_scenario(
+                    vm,
+                    peer_ns,
+                    "send_tcp_packets",
+                    {
+                        "packets": [
+                            {
+                                "bind_addr": peer_addr,
+                                "bind_port": flood_port,
+                                "target_addr": addr,
+                                "target_port": port,
+                                "flags": "syn",
+                                "seq": 4095,
+                            }
+                            for flood_port in (41001, 41002)
+                        ]
+                    },
+                )
+            saturated = wait_for_stat_greater(
+                vm, "half_open_rejected", initial_stats["half_open_rejected"] + 1
+            )
+            assert saturated["flows_created"] - initial_stats["flows_created"] == 2
+            assert saturated["flows_current"] - initial_stats["flows_current"] == 2
+            assert saturated["half_open_rejected"] - initial_stats["half_open_rejected"] == 2
+            initial_stats = saturated
+
         client_a = spawn_netns_scenario(
             vm,
             NS_A,
@@ -157,11 +215,61 @@ def test_syn_isn_tie_break(phantun_module, vm):
             )
         if lost_diff != 1:
             pytest.fail(f"expected exactly one collision loss, got {lost_diff} (stats {final_stats!r})")
+        if saturate_remote:
+            assert final_stats["half_open_rejected"] == initial_stats["half_open_rejected"]
+            assert final_stats["collisions_won"] > initial_stats["collisions_won"]
+            assert final_stats["flows_current"] - initial_stats["flows_current"] == 2
+
+            # Completion releases exactly one local charge at each endpoint,
+            # including the endpoint that is now a local-origin responder.
+            # Keep the next open half-open and ensure a further open is refused.
+            for namespace, addr, port, peer_ns, peer_addr, peer_dev in [
+                (NS_A, NS_ADDR_A, src_port, NS_B, NS_ADDR_B, VETH_B),
+                (NS_B, NS_ADDR_B, dst_port, NS_A, NS_ADDR_A, VETH_A),
+            ]:
+                admission_drops.append(
+                    make_netns_ingress_flag_drop_probe(
+                        vm,
+                        peer_ns,
+                        peer_dev,
+                        [
+                            {
+                                "src_addr": addr,
+                                "dst_addr": peer_addr,
+                                "src_port": port,
+                                "dst_port": remote_port,
+                                "flags_expr": "syn",
+                                "comment": f"hold_new_local_{remote_port}",
+                            }
+                            for remote_port in (6666, 6667)
+                        ],
+                    )
+                )
+                for remote_port in (6666, 6667):
+                    run_netns_scenario(
+                        vm,
+                        namespace,
+                        "send_many",
+                        {
+                            "bind_addr": addr,
+                            "bind_port": port,
+                            "target_addr": peer_addr,
+                            "target_port": remote_port,
+                            "payloads": ["next-local"],
+                        },
+                    )
+            released = read_module_stats(vm)
+            assert released["flows_created"] - final_stats["flows_created"] == 2
+            assert released["flows_current"] - final_stats["flows_current"] == 2
+            assert released["half_open_rejected"] - final_stats["half_open_rejected"] == 2
     finally:
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
         vm.run(["ip", "netns", "exec", NS_A, "tc", "qdisc", "del", "dev", VETH_A, "root", "netem"], check=False)
         vm.run(["ip", "netns", "exec", NS_B, "tc", "qdisc", "del", "dev", VETH_B, "root", "netem"], check=False)
+        for probe in admission_drops:
+            probe.cleanup(vm)
+        cleanup_netns_topology(vm)
 
 
 def test_established_bare_syn_replacement(phantun_module, vm):
