@@ -182,9 +182,11 @@ def test_fragmented_syn_is_rejected_without_creating_flow(phantun_module, vm):
         ("syn|ack|fin", "fin"),
         ("syn|ack|psh", "psh"),
         ("syn|ack|urg", "urg"),
+        ("ack|fin", "ackfin"),
+        ("ack|urg", "ackurg"),
     ),
 )
-def test_malformed_synack_flags_do_not_complete_syn_sent(phantun_module, vm, flags, tag):
+def test_malformed_handshake_flags_do_not_complete_syn_sent(phantun_module, vm, flags, tag):
     phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS, handshake_timeout_ms=5000)
     ensure_netns_topology(vm)
 
@@ -291,8 +293,13 @@ def test_malformed_synack_flags_do_not_complete_syn_sent(phantun_module, vm, fla
         cleanup_netns_topology(vm)
 
 
-def test_bad_final_ack_payload_is_rejected_with_rstack(phantun_module, vm):
-    phantun_module.load(managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS)
+@pytest.mark.parametrize("flags", ["ack", "ack|psh"])
+@pytest.mark.parametrize("payload", ["", "junk"])
+def test_wrong_final_ack_retains_half_open_until_valid_completion(phantun_module, vm, flags, payload):
+    phantun_module.load(
+        managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS,
+        handshake_timeout_ms=1000, handshake_retries=60,
+    )
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -331,6 +338,24 @@ def test_bad_final_ack_payload_is_rejected_with_rstack(phantun_module, vm):
         ],
     )
 
+    synack_capture = spawn_ready_capture(
+        vm, NS_B,
+        {
+            "bind_addr": NS_ADDR_B, "bind_port": dst_port,
+            "target_addr": NS_ADDR_A, "target_port": src_port,
+            "payload": "", "flags": "syn|ack", "timeout_sec": 15,
+            "include_outgoing": True,
+        },
+    )
+    stop_file = f"/tmp/phantun-wrong-ack-stop-{uuid.uuid4().hex}"
+    receiver = spawn_ready_recv_until_timeout(
+        vm, NS_B,
+        {
+            "bind_addr": NS_ADDR_B, "bind_port": dst_port,
+            "count": 2, "timeout_sec": 60, "stop_file": stop_file,
+        },
+    )
+    baseline = read_module_stats(vm)
     try:
         run_netns_scenario(
             vm,
@@ -345,7 +370,9 @@ def test_bad_final_ack_payload_is_rejected_with_rstack(phantun_module, vm):
                 "seq": 4095,
             },
         )
-        time.sleep(0.2)
+        captured = synack_capture.communicate(timeout=15)
+        assert_completed(captured, "half-open SYNACK capture")
+        synack = parse_guest_json(captured.stdout, "half-open SYNACK")
         baseline_bad_final_rst = invalid_probe.packets(vm, "bad_final_rst")
 
         run_netns_scenario(
@@ -357,19 +384,40 @@ def test_bad_final_ack_payload_is_rejected_with_rstack(phantun_module, vm):
                 "bind_port": src_port,
                 "target_addr": NS_ADDR_B,
                 "target_port": dst_port,
-                "flags": "ack",
+                "flags": flags,
                 "seq": 4096,
-                "ack": 0,
-                "payload": "junk",
+                "ack": (synack["seq"] + 2) & 0xFFFFFFFF,
+                "payload": payload,
             },
         )
         time.sleep(0.2)
 
-        if invalid_probe.packets(vm, "bad_final_rst") <= baseline_bad_final_rst:
-            pytest.fail("expected RST|ACK for payload-bearing final ACK with wrong ack number")
+        retained = read_module_stats(vm)
+        assert retained["flows_current"] == baseline["flows_current"] + 1
+        assert retained["flows_established"] == baseline["flows_established"]
+        assert retained["tcp_protocol_rejected"] == baseline["tcp_protocol_rejected"]
+        assert invalid_probe.packets(vm, "bad_final_rst") == baseline_bad_final_rst
+        valid = run_netns_scenario(
+            vm, NS_A, "send_tcp_packet",
+            {
+                "bind_addr": NS_ADDR_A, "bind_port": src_port,
+                "target_addr": NS_ADDR_B, "target_port": dst_port,
+                "flags": "ack", "seq": 4096,
+                "ack": (synack["seq"] + 1) & 0xFFFFFFFF, "payload": "fresh",
+            },
+        )
+        assert_completed(valid, "valid final ACK after stale traffic")
+        wait_for_stat_greater(vm, "flows_established", baseline["flows_established"])
+        vm.run(["touch", stop_file])
+        result = receiver.communicate(timeout=10)
+        assert_completed(result, "wrong-final-ACK receiver")
+        assert received_messages(parse_guest_json(result.stdout, "wrong-final-ACK receiver")) == ["fresh"]
     finally:
         drop_synack.cleanup(vm)
         invalid_probe.cleanup(vm)
+        if receiver.proc.poll() is None:
+            receiver.terminate()
+        vm.run(["rm", "-f", stop_file], check=False)
         cleanup_netns_topology(vm)
 
 

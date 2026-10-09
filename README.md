@@ -275,8 +275,18 @@ Validation rules:
 | `hard_idle_timeout_sec` | `300` | Hard upper bound for idle flow lifetime. |
 | `reopen_guard_bytes` | `4194304` | Minimum sequence-space distance before reopening same tuple; accepts `0..1073741823` and rejects values `>= 1073741824`. |
 | `half_open_limit` | `4096` | Total admitted half-open ceiling `L` per network namespace, shared by families/selectors. Reserve `R = max(1, floor(L / 4))` for local-origin handshakes when `L > 1`, otherwise `R = 0`. Remote-origin flows are capped at `L - R`; local opens may use all unused total capacity. A simultaneous-open role change retains its local-origin charge. Establishment or teardown releases the slot. |
-| `replacement_quarantine_ms` | `3000` | Previous-generation quarantine window after tuple replacement. Matching old-generation packets are silently dropped during this window. |
+| `replacement_quarantine_ms` | `3000` | Non-sliding previous-generation quarantine window after tuple replacement. Matching old-generation packets are silently dropped; after half-open responder replacement this includes the exact previous bare opener SYN, but never an identical current opener. |
 | `replacement_protect_ms` | `0` (auto) | Established-initiator bare-SYN replacement protection window. During the window, aligned bare replacement SYNs to an established initiator are silently dropped to suppress stale simultaneous-initiation loser SYNs. After the window expires, normal replacement handling resumes. |
+
+During a fresh handshake, ordinary stale ACK/data (ACK required, optional PSH,
+no SYN/RST/FIN/URG) is silently ignored instead of resetting the tuple and losing
+queued UDP. Exact valid completion still wins; malformed controls, misaligned
+SYNs and known-tuple RST retain their existing policy. A different aligned bare
+SYN can replace a half-open responder atomically, retaining its admission
+origin/charge, queued datagram and transmit metadata. Duplicate current openers
+retransmit the same SYNACK; the immediately previous opener is quarantined.
+Stale traffic and half-open replacements never restart the original retry
+budget/deadline, so an uncompleted handshake still expires under ongoing traffic.
 
 Both endpoints independently send keepalives, including when receiving the
 peer's pure ACKs. Upgrade **both endpoints** for healthy idle survival; an older
@@ -432,7 +442,7 @@ can increment both an aggregate and a more specific reason counter:
 | `established_liveness_timeouts` | Established flows torn down after the configured inbound-silence timeout. |
 | **Replacement and simultaneous-init recovery** | |
 | `replacements_accepted` | Established flows that accepted a valid bare, aligned replacement SYN on the same tuple. |
-| `replacement_quarantine_dropped` | Delayed previous-generation packets silently dropped during the replacement quarantine window. Bare SYNs are not quarantine drops. |
+| `replacement_quarantine_dropped` | Delayed previous-generation packets silently dropped during the non-sliding replacement quarantine window, including exact previous bare openers after half-open responder replacement. Current-opener duplicates are exempt. |
 | `replacement_protect_dropped` | Established initiator replacement SYNs silently dropped while the replacement-protect window was active. |
 | `retired_evicted` | Best-effort retired flow metadata records evicted because a hash bucket reached its cap. |
 | `collisions_won` | Simultaneous-initiation collisions where the local side kept initiator role. |

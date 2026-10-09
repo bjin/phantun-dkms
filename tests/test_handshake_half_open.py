@@ -33,6 +33,8 @@ from helpers import (
     run_netns_scenario,
     run_ping_pong,
     spawn_netns_scenario,
+    spawn_ready_recv_until_timeout,
+    wait_for_stat_greater,
     wait_for_guest_ready_file,
 )
 
@@ -822,4 +824,134 @@ def test_cold_start_udp_gso_superframe_queues_only_first_segment(phantun_module,
         if server.proc.poll() is None:
             server.terminate()
         vm.run(["rm", "-f", first_received_file], check=False)
+        cleanup_netns_topology(vm)
+
+
+@pytest.mark.parametrize("flags", ["ack", "ack|psh"])
+def test_stale_half_open_traffic_preserves_queued_udp(phantun_module, vm, flags):
+    load_managed_module(phantun_module, handshake_timeout_ms=500, handshake_retries=120)
+    ensure_netns_topology(vm)
+    require_nft_or_skip(vm)
+    src_port, dst_port = PORTS_A[0], PORTS_B[0]
+    drop = make_netns_ingress_flag_drop_probe(
+        vm, NS_A, VETH_A,
+        [{
+            "src_addr": NS_ADDR_B, "src_port": dst_port,
+            "dst_addr": NS_ADDR_A, "dst_port": src_port,
+            "flags_expr": "syn | ack", "comment": "hold_fresh_handshake",
+        }],
+    )
+    stop_file = f"/tmp/phantun-stale-half-open-stop-{uuid.uuid4().hex}"
+    receiver = spawn_ready_recv_until_timeout(
+        vm, NS_B,
+        {
+            "bind_addr": NS_ADDR_B, "bind_port": dst_port,
+            "count": 3, "timeout_sec": 60, "stop_file": stop_file,
+        },
+    )
+    baseline = read_module_stats(vm)
+    try:
+        sent = run_netns_scenario(
+            vm, NS_A, "send_many",
+            {
+                "bind_addr": NS_ADDR_A, "bind_port": src_port,
+                "target_addr": NS_ADDR_B, "target_port": dst_port,
+                "payloads": ["queued"],
+            },
+        )
+        assert_completed(sent, "queued recovery datagram")
+        held = wait_for_stat_greater(vm, "flows_created", baseline["flows_created"] + 1)
+        assert held["flows_current"] == baseline["flows_current"] + 2
+        # The dropped SYNACK leaves A in SYN_SENT and B in SYN_RCVD.
+        for namespace, addr, port, peer, peer_port in (
+            (NS_A, NS_ADDR_A, src_port, NS_ADDR_B, dst_port),
+            (NS_B, NS_ADDR_B, dst_port, NS_ADDR_A, src_port),
+        ):
+            stale = run_netns_scenario(
+                vm, namespace, "send_tcp_packets",
+                {"packets": [
+                    {
+                        "bind_addr": addr, "bind_port": port,
+                        "target_addr": peer, "target_port": peer_port,
+                        "flags": flags, "seq": 123456, "ack": 0, "payload": payload,
+                    }
+                    for payload in ("", "old-data", "old-data")
+                ]},
+            )
+            assert_completed(stale, "old ACK/data in half-open state")
+        retained = read_module_stats(vm)
+        for counter in ("rst_sent", "tcp_protocol_rejected", "flows_established", "flows_created"):
+            assert retained[counter] == held[counter], (counter, held, retained)
+        assert retained["flows_current"] == held["flows_current"]
+        drop.cleanup(vm)
+        wait_for_stat_greater(vm, "flows_established", baseline["flows_established"] + 1)
+        # A post-completion datagram is a delivery-order barrier for the queue.
+        sent = run_netns_scenario(
+            vm, NS_A, "send_many",
+            {
+                "bind_addr": NS_ADDR_A, "bind_port": src_port,
+                "target_addr": NS_ADDR_B, "target_port": dst_port, "payloads": ["after"],
+            },
+        )
+        assert_completed(sent, "post-recovery barrier")
+        vm.run(["touch", stop_file])
+        result = receiver.communicate(timeout=10)
+        assert_completed(result, "recovery receiver")
+        assert received_messages(parse_guest_json(result.stdout, "recovery receiver")) == ["queued", "after"]
+        assert read_module_stats(vm)["udp_packets_queued"] == baseline["udp_packets_queued"] + 1
+    finally:
+        drop.cleanup(vm)
+        if receiver.proc.poll() is None:
+            receiver.terminate()
+        vm.run(["rm", "-f", stop_file], check=False)
+        cleanup_netns_topology(vm)
+
+
+@pytest.mark.parametrize("state", ["syn_sent", "syn_rcvd"])
+def test_stale_data_does_not_extend_half_open_timeout(phantun_module, vm, state):
+    load_managed_module(phantun_module, handshake_timeout_ms=200, handshake_retries=5)
+    ensure_netns_topology(vm)
+    require_nft_or_skip(vm)
+    src_port, dst_port = PORTS_A[0], PORTS_B[0]
+    initiator = state == "syn_sent"
+    drop = make_netns_ingress_flag_drop_probe(
+        vm, NS_B if initiator else NS_A, VETH_B if initiator else VETH_A,
+        [{
+            "src_addr": NS_ADDR_A if initiator else NS_ADDR_B,
+            "src_port": src_port if initiator else dst_port,
+            "dst_addr": NS_ADDR_B if initiator else NS_ADDR_A,
+            "dst_port": dst_port if initiator else src_port,
+            "flags_expr": "syn" if initiator else "syn | ack",
+            "comment": "hold_timeout_handshake",
+        }],
+    )
+    baseline = read_module_stats(vm)
+    try:
+        opener = {
+            "bind_addr": NS_ADDR_A, "bind_port": src_port,
+            "target_addr": NS_ADDR_B, "target_port": dst_port,
+        }
+        if initiator:
+            opened = run_netns_scenario(vm, NS_A, "send_many", {**opener, "payloads": ["queued"]})
+        else:
+            opened = run_netns_scenario(vm, NS_A, "send_tcp_packet", {**opener, "flags": "syn", "seq": 4095})
+        assert_completed(opened, "timeout opener")
+        stray = {
+            "bind_addr": NS_ADDR_B if initiator else NS_ADDR_A,
+            "bind_port": dst_port if initiator else src_port,
+            "target_addr": NS_ADDR_A if initiator else NS_ADDR_B,
+            "target_port": src_port if initiator else dst_port,
+            "flags": "ack|psh", "seq": 123456, "ack": 0, "payload": "old-data",
+        }
+        stream = run_netns_scenario(
+            vm, NS_B if initiator else NS_A, "send_tcp_packets",
+            {"packets": [stray] * 80, "delay_ms": 50},
+        )
+        assert_completed(stream, "continued stale data")
+        expired = wait_for_half_open_drain(vm, baseline, expected_rst=1)
+        assert expired["handshake_retries_exhausted"] == baseline["handshake_retries_exhausted"] + 1
+        assert expired["flows_established"] == baseline["flows_established"]
+        assert expired["flows_created"] == baseline["flows_created"] + 1
+    finally:
+        drop.cleanup(vm)
         cleanup_netns_topology(vm)

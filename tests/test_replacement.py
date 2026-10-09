@@ -22,11 +22,13 @@ from helpers import (
     make_netns_ingress_flag_drop_probe,
     make_netns_output_flag_probe,
     make_netns_output_ipv4_pure_ack_probe,
+    make_netns_tcp_payload_probe,
     netns_link_mac,
     parse_guest_json,
     read_module_stats,
     received_messages,
     require_guest_command,
+    require_nft_or_skip,
     run_in_netns,
     run_netns_scenario,
     spawn_netns_scenario,
@@ -1639,4 +1641,184 @@ def test_retired_record_cache_evicts_under_tuple_churn(phantun_module, vm):
             },
             check=False,
         )
+        cleanup_netns_topology(vm)
+
+
+@pytest.mark.parametrize("limit, remote_limit", [(1, 1), (4, 3)])
+def test_half_open_replacement_keeps_queue_and_admission(phantun_module, vm, limit, remote_limit):
+    phantun_module.load(
+        managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS,
+        half_open_limit=limit, handshake_timeout_ms=1000, handshake_retries=120,
+        replacement_quarantine_ms=60000,
+    )
+    ensure_netns_topology(vm)
+    require_nft_or_skip(vm)
+    src_port, dst_port = PORTS_A[0], PORTS_B[0]
+    source_ports = [src_port, 41001, 41002, 41003]
+    drop = make_netns_ingress_flag_drop_probe(
+        vm, NS_A, VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B, "src_port": dst_port,
+                "dst_addr": NS_ADDR_A, "dst_port": port,
+                "flags_expr": flags, "comment": f"raw_peer_{port}_{index}",
+            }
+            for port in source_ports
+            for index, flags in enumerate(("syn | ack", "ack", "rst", "rst | ack"))
+        ],
+    )
+    payload_probe = make_netns_tcp_payload_probe(
+        vm, NS_B,
+        [{
+            "src_addr": NS_ADDR_B, "src_port": dst_port,
+            "dst_addr": NS_ADDR_A, "dst_port": src_port,
+            "payload": "saved-queue", "comment": "replacement_queue",
+        }],
+    )
+    packet = {
+        "bind_addr": NS_ADDR_A, "bind_port": src_port,
+        "target_addr": NS_ADDR_B, "target_port": dst_port,
+    }
+
+    def capture_synack(seq):
+        return spawn_ready_capture(
+            vm, NS_B,
+            {
+                "bind_addr": NS_ADDR_B, "bind_port": dst_port,
+                "target_addr": NS_ADDR_A, "target_port": src_port,
+                "payload": "", "flags": "syn|ack", "ack": seq + 1, "timeout_sec": 15,
+                "include_outgoing": True,
+            },
+        )
+
+    def inject(**fields):
+        result = run_netns_scenario(vm, NS_A, "send_tcp_packet", {**packet, **fields})
+        assert_completed(result, "half-open replacement packet")
+
+    def finish_capture(capture):
+        result = capture.communicate(timeout=15)
+        assert_completed(result, "replacement SYNACK capture")
+        return parse_guest_json(result.stdout, "replacement SYNACK")
+
+    baseline = read_module_stats(vm)
+    try:
+        capture = capture_synack(4095)
+        inject(flags="syn", seq=4095)
+        old = finish_capture(capture)
+        for port in source_ports[1:remote_limit]:
+            inject(bind_port=port, flags="syn", seq=4095)
+        queued = run_netns_scenario(
+            vm, NS_B, "send_many",
+            {
+                "bind_addr": NS_ADDR_B, "bind_port": dst_port,
+                "target_addr": NS_ADDR_A, "target_port": src_port,
+                "payloads": ["saved-queue"], "mark": 73, "ipv4_tos": 40,
+            },
+        )
+        assert_completed(queued, "queue before half-open replacement")
+        held = read_module_stats(vm)
+        assert held["flows_current"] == baseline["flows_current"] + remote_limit
+        assert held["udp_packets_queued"] == baseline["udp_packets_queued"] + 1
+
+        capture = capture_synack(8190)
+        # A callback emitting outside its lock may defer replacement with
+        # -EAGAIN; retransmit this opener as a real peer would.
+        retried = run_netns_scenario(
+            vm, NS_A, "send_tcp_packets",
+            {"packets": [{**packet, "flags": "syn", "seq": 8190}] * 5, "delay_ms": 100},
+        )
+        assert_completed(retried, "replacement opener retransmits")
+        current = finish_capture(capture)
+        replaced = read_module_stats(vm)
+        assert replaced["flows_created"] == held["flows_created"] + 1
+        assert replaced["flows_current"] == held["flows_current"]
+        assert replaced["half_open_rejected"] == held["half_open_rejected"]
+        assert payload_probe.packets(vm, "replacement_queue") == 0
+
+        # Identical current opener retransmits this SYNACK, not a new generation.
+        capture = capture_synack(8190)
+        inject(flags="syn", seq=8190)
+        duplicate = finish_capture(capture)
+        assert duplicate["seq"] == current["seq"]
+        # The immediately previous opener cannot bounce us back, even repeatedly.
+        inject(flags="syn", seq=4095)
+        inject(flags="syn", seq=4095)
+        inject(flags="ack|psh", seq=4096, ack=(old["seq"] + 1) & 0xFFFFFFFF, payload="old")
+        retained = read_module_stats(vm)
+        assert retained["flows_created"] == replaced["flows_created"]
+        assert retained["flows_established"] == baseline["flows_established"]
+        assert retained["rst_sent"] == baseline["rst_sent"]
+        assert retained["replacement_quarantine_dropped"] >= replaced["replacement_quarantine_dropped"] + 3
+        # A replacement still owns exactly one remote charge at saturation.
+        inject(bind_port=source_ports[remote_limit], flags="syn", seq=12285)
+        full = read_module_stats(vm)
+        assert full["half_open_rejected"] == retained["half_open_rejected"] + 1
+        assert full["flows_current"] == held["flows_current"]
+
+        inject(flags="ack", seq=8191, ack=(current["seq"] + 1) & 0xFFFFFFFF)
+        wait_for_stat_greater(vm, "flows_established", baseline["flows_established"])
+        wait_for_probe_packets_after(vm, payload_probe, "replacement_queue", 0, "retained UDP queue")
+        inject(flags="ack", seq=8191, ack=(current["seq"] + 1) & 0xFFFFFFFF)
+        assert payload_probe.packets(vm, "replacement_queue") == 1
+        # Quarantine survives completion; the old opener must still be inert.
+        inject(flags="syn", seq=4095)
+        completed = read_module_stats(vm)
+        assert completed["flows_created"] == replaced["flows_created"]
+        assert completed["replacement_quarantine_dropped"] > retained["replacement_quarantine_dropped"]
+        inject(bind_port=source_ports[remote_limit], flags="syn", seq=12285)
+        released = wait_for_stat_greater(vm, "flows_created", completed["flows_created"])
+        assert released["half_open_rejected"] == full["half_open_rejected"]
+        assert released["flows_current"] == held["flows_current"] + 1
+    finally:
+        payload_probe.cleanup(vm)
+        drop.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_half_open_replacements_do_not_restart_retry_lifetime(phantun_module, vm):
+    phantun_module.load(
+        managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS,
+        half_open_limit=1, handshake_timeout_ms=500, handshake_retries=5,
+    )
+    ensure_netns_topology(vm)
+    require_nft_or_skip(vm)
+    src_port, dst_port = PORTS_A[0], PORTS_B[0]
+    drop = make_netns_ingress_flag_drop_probe(
+        vm, NS_A, VETH_A,
+        [{
+            "src_addr": NS_ADDR_B, "src_port": dst_port,
+            "dst_addr": NS_ADDR_A, "dst_port": src_port,
+            "flags_expr": "syn | ack", "comment": "hold_replacement_lifetime",
+        }],
+    )
+    packet = {
+        "bind_addr": NS_ADDR_A, "bind_port": src_port,
+        "target_addr": NS_ADDR_B, "target_port": dst_port,
+    }
+    baseline = read_module_stats(vm)
+    try:
+        # Change opener throughout the first two seconds, then keep sending old
+        # data past the original three-second retry lifetime. No new SYN after
+        # that lifetime can accidentally start a legitimately fresh generation.
+        result = run_netns_scenario(
+            vm, NS_A, "send_tcp_packets",
+            {
+                "packets": [
+                    {**packet, "flags": "syn", "seq": 4095 * index}
+                    for index in range(1, 21)
+                ] + [
+                    {**packet, "flags": "ack|psh", "seq": 123456, "ack": 0, "payload": "old"}
+                ] * 17,
+                "delay_ms": 100,
+            },
+        )
+        assert_completed(result, "bounded replacement stream")
+        expired = read_module_stats(vm)
+        assert expired["handshake_retries_exhausted"] == baseline["handshake_retries_exhausted"] + 1
+        assert expired["flows_current"] == baseline["flows_current"]
+        assert expired["flows_created"] > baseline["flows_created"] + 1
+        assert expired["flows_established"] == baseline["flows_established"]
+        assert expired["half_open_rejected"] == baseline["half_open_rejected"]
+    finally:
+        drop.cleanup(vm)
         cleanup_netns_topology(vm)

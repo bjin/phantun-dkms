@@ -256,6 +256,24 @@ If an established flow accepts a valid bare replacement `SYN` on the same tuple:
 
 Purpose: avoid poisoning recovery with delayed old-generation packets just after tuple reuse.
 
+A different aligned bare `SYN` may also replace a `SYN_RCVD` generation.
+This uses the atomic half-open handoff described below: it cannot replace a
+concurrently completed generation or release/reacquire admission capacity.
+The new generation inherits the queued skb and its packet metadata, persistent
+local transmit policy, remaining retry budget and next retry deadline, and
+activity/inbound timestamps. Its immediate `SYN|ACK` uses reply-scoped metadata;
+successful output updates only the normal transmit-probe schedule.
+
+For this half-open replacement, quarantine also remembers the exact previous
+bare opener ISN. That opener is silently dropped until the non-sliding
+quarantine deadline, including after the new handshake completes, preventing
+delayed opener bounce-back. The identical **current** opener always remains
+eligible for retransmission of the same `SYN|ACK`. Only the immediately previous
+generation is remembered; neither stale traffic nor duplicate openers refresh
+the quarantine or handshake retry deadline. Each accepted different opener
+replaces that one quarantine record, but never restarts the original half-open
+retry lifetime.
+
 Established initiator flows also arm a non-sliding bare-`SYN` replacement protection deadline when the `SYN_SENT` handshake accepts a clean `SYN|ACK`.
 During that deadline, a bare aligned replacement `SYN` is silently dropped before generic replacement handling.
 This covers delayed loser `SYN` packets from simultaneous initiation without changing responder duplicate-`SYN` handling.
@@ -379,6 +397,7 @@ Accepts:
 - valid `SYN|ACK` with exact `ack = syn_seq + 1`
 - bare aligned collision `SYN` for tie-break handling
 - `RST` → destroy flow
+- ordinary ACK-shaped packets (ACK required, PSH optional, no SYN/RST/FIN/URG) that do not complete the handshake → silently ignore; retain queue and retry/lifetime state
 
 On valid `SYN|ACK`:
 
@@ -456,6 +475,15 @@ Accepts while half-open:
 
 - duplicate inbound bare `SYN` retransmit → resend `SYN|ACK`
 - valid final `ACK`
+- different aligned bare `SYN` outside previous-opener quarantine → atomically replace the half-open generation, inheriting admission, queue/metadata and remaining lifetime
+- ordinary ACK-shaped traffic that does not carry the exact final acknowledgement → silently ignore, without establishing, emitting `RST`, or refreshing retries/activity/liveness
+
+Exact valid completion is checked first; previous-generation quarantine then
+takes precedence over generic stray-ACK tolerance. Malformed flags and
+misaligned `SYN` retain rejection, and known-tuple `RST` retains its existing
+teardown/quarantine policy. Allocation or `-EAGAIN` from replacement leaves the
+old flow, admission token, metadata and queue untouched; a subsequent opener
+can retry the transaction. No detach/reinsert fallback is used.
 
 On valid final `ACK`:
 
@@ -499,7 +527,7 @@ Inbound flag priority:
 ### 7.1 Immediate `RST` + flow destruction
 
 - bad `SYN` alignment
-- wrong final `ACK` during handshake
+- malformed handshake controls (ordinary stale ACK/data on an existing half-open tuple is an explicit silent exception)
 - impossible flag/state combination
 - oversized inbound payload beyond the translator's supported UDP reinjection size
 - non-`RST` packet for unknown tuple
@@ -512,6 +540,7 @@ Peer-only mode keeps this rule: if a packet from a managed remote peer does not 
 - inbound `RST` for known tuple: destroy local state, no reply
 - inbound packets failing TCP checksum validation
 - packets from immediately previous generation while quarantine is active
+- ordinary stale ACK/data during `SYN_SENT` or `SYN_RCVD`: keep the half-open and its queued UDP, with no timer/lifetime refresh
 - shaping-payload loss, duplication, delay, or reordering
 - established liveness failure falls back to silent teardown only when best-effort `RST` emission cannot route or transmit
 - topology-driven invalidation and hard idle expiry: local teardown without `RST`

@@ -1145,6 +1145,8 @@ def capture_tcp_packet(config):
     src_port = config["bind_port"]
     dst_port = config["target_port"]
     expected_payload = config.get("payload")
+    expected_flags = _tcp_flags_expr(config["flags"]) if "flags" in config else None
+    expected_ack = config.get("ack")
     ready_file = config.get("ready_file")
     eth_type = 0x86DD if ":" in src_addr else 0x0800
     if isinstance(expected_payload, str):
@@ -1236,6 +1238,10 @@ def capture_tcp_packet(config):
                     _,
                 ) = struct.unpack("!HHLLBBHHH", tcp_header)
                 if packet_src_port != src_port or packet_dst_port != dst_port:
+                    continue
+                if expected_flags is not None and flags != expected_flags:
+                    continue
+                if expected_ack is not None and ack != expected_ack:
                     continue
 
                 tcp_header_len = (data_offset >> 4) * 4

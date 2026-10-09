@@ -225,8 +225,20 @@ def spawn_ready_capture(vm, namespace, config):
         "capture_tcp_packet",
         {**config, "ready_file": ready_file},
     )
-    wait_for_guest_ready_file(vm, ready_file, timeout=config.get("timeout_sec", 10))
-    return capture
+    timeout = config.get("timeout_sec", 10)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        # A live retransmit can finish capture and remove its readiness file
+        # before the host polls. Successful completion also proves startup.
+        returncode = capture.proc.poll()
+        if returncode is not None:
+            assert_completed(capture.communicate(), "packet capture startup")
+            return capture
+        if vm.run(["test", "-e", ready_file], check=False).returncode == 0:
+            return capture
+        time.sleep(0.1)
+    capture.terminate()
+    pytest.fail(f"packet capture did not become ready within {timeout}s")
 
 
 def spawn_ready_recv_until_timeout(vm, namespace, config):
