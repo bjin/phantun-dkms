@@ -156,16 +156,22 @@ def echo_client(config):
 def liveness_window(config):
     """Observe packet counters and optional UDP output on the guest clock."""
     stat_names = (
-        "flows_created", "flows_current", "flows_established",
-        "established_liveness_timeouts", "rst_sent",
-        "oversized_payloads_dropped", "route_cache_hits",
+        "flows_created",
+        "flows_current",
+        "flows_established",
+        "established_liveness_timeouts",
+        "rst_sent",
+        "oversized_payloads_dropped",
+        "route_cache_hits",
     )
 
     def snapshot():
-        nft = json.loads(subprocess.check_output(
-            ["nft", "-j", "list", "chain", config["family"],
-             config["table_name"], config["chain_name"]], text=True,
-        ))
+        nft = json.loads(
+            subprocess.check_output(
+                ["nft", "-j", "list", "chain", config["family"], config["table_name"], config["chain_name"]],
+                text=True,
+            )
+        )
         packets = {}
         for item in nft.get("nftables", []):
             rule = item.get("rule", {})
@@ -197,9 +203,7 @@ def liveness_window(config):
         deadline = time.monotonic() + config["duration_sec"]
         while time.monotonic() < deadline:
             if config.get("stop_on_liveness_timeout"):
-                timeouts = int(Path(
-                    "/sys/module/phantun/stats/established_liveness_timeouts"
-                ).read_text())
+                timeouts = int(Path("/sys/module/phantun/stats/established_liveness_timeouts").read_text())
                 if timeouts > before["stats"]["established_liveness_timeouts"]:
                     break
             if sock is not None:
@@ -211,11 +215,15 @@ def liveness_window(config):
                 sent += 1
             time.sleep(config.get("period_ms", 100) / 1000)
         after = snapshot()
-        _emit({
-            "before": before, "after": after, "sent": sent,
-            "elapsed_sec": time.monotonic() - start,
-            "max_send_gap_sec": max_send_gap,
-        })
+        _emit(
+            {
+                "before": before,
+                "after": after,
+                "sent": sent,
+                "elapsed_sec": time.monotonic() - start,
+                "max_send_gap_sec": max_send_gap,
+            }
+        )
     finally:
         if sock is not None:
             sock.close()
@@ -1176,16 +1184,18 @@ def replace_responder_generations(config):
                         if len(tcp) < 20:
                             continue
                         src, dst, seq, ack, _, flags = struct.unpack("!HHIIBB", tcp[:14])
-                        if (src, dst, flags, ack) == (
-                            config["target_port"], peer["bind_port"], 0x12, isn + 1
-                        ):
+                        if (src, dst, flags, ack) == (config["target_port"], peer["bind_port"], 0x12, isn + 1):
                             break
                     sender.sendto(
-                        _build_ipv4_tcp_packet({
-                            **peer, "flags": "ack", "seq": isn + 1,
-                            "ack": (seq + 1) & 0xFFFFFFFF,
-                            "payload": f"replacement-{index}" if isn else "",
-                        }),
+                        _build_ipv4_tcp_packet(
+                            {
+                                **peer,
+                                "flags": "ack",
+                                "seq": isn + 1,
+                                "ack": (seq + 1) & 0xFFFFFFFF,
+                                "payload": f"replacement-{index}" if isn else "",
+                            }
+                        ),
                         (config["target_addr"], 0),
                     )
                 completed += 1

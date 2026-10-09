@@ -1791,8 +1791,10 @@ def test_retired_record_cache_evicts_under_tuple_churn(phantun_module, vm):
 @pytest.mark.parametrize("useful_seq, delayed_seq", [(8190, 4095), (4095, 8190)])
 def test_reordered_half_open_syn_allows_useful_retry(phantun_module, vm, useful_seq, delayed_seq):
     phantun_module.load(
-        managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS,
-        handshake_timeout_ms=1000, handshake_retries=120,
+        managed_netns="all",
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        handshake_timeout_ms=1000,
+        handshake_retries=120,
         replacement_quarantine_ms=60000,
     )
     ensure_netns_topology(vm)
@@ -1801,29 +1803,42 @@ def test_reordered_half_open_syn_allows_useful_retry(phantun_module, vm, useful_
     # Capture replies at their sender, then lose them on-path before the raw
     # peer's namespace can answer with an unrelated unknown-tuple RST.
     drop = make_netns_ingress_flag_drop_probe(
-        vm, NS_A, VETH_A,
+        vm,
+        NS_A,
+        VETH_A,
         [
             {
-                "src_addr": NS_ADDR_B, "src_port": dst_port,
-                "dst_addr": NS_ADDR_A, "dst_port": src_port,
-                "flags_expr": flags, "comment": f"raw_peer_{index}",
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": flags,
+                "comment": f"raw_peer_{index}",
             }
             for index, flags in enumerate(("syn | ack", "ack", "rst", "rst | ack"))
         ],
     )
     packet = {
-        "bind_addr": NS_ADDR_A, "bind_port": src_port,
-        "target_addr": NS_ADDR_B, "target_port": dst_port,
+        "bind_addr": NS_ADDR_A,
+        "bind_port": src_port,
+        "target_addr": NS_ADDR_B,
+        "target_port": dst_port,
     }
 
     def capture_reply(flags, **fields):
         return spawn_ready_capture(
-            vm, NS_B,
+            vm,
+            NS_B,
             {
-                "bind_addr": NS_ADDR_B, "bind_port": dst_port,
-                "target_addr": NS_ADDR_A, "target_port": src_port,
-                "payload": "", "flags": flags, "timeout_sec": 15,
-                "include_outgoing": True, **fields,
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "payload": "",
+                "flags": flags,
+                "timeout_sec": 15,
+                "include_outgoing": True,
+                **fields,
             },
         )
 
@@ -1865,15 +1880,20 @@ def test_reordered_half_open_syn_allows_useful_retry(phantun_module, vm, useful_
         assert finish_capture(capture)["seq"] == current["seq"]
 
         receiver = spawn_ready_recv_until_timeout(
-            vm, NS_B,
+            vm,
+            NS_B,
             {
-                "bind_addr": NS_ADDR_B, "bind_port": dst_port,
-                "count": 1, "timeout_sec": 30,
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 1,
+                "timeout_sec": 30,
             },
         )
         inject(
-            flags="ack|psh", seq=useful_seq + 1,
-            ack=(current["seq"] + 1) & 0xFFFFFFFF, payload="recovered",
+            flags="ack|psh",
+            seq=useful_seq + 1,
+            ack=(current["seq"] + 1) & 0xFFFFFFFF,
+            payload="recovered",
         )
         result = receiver.communicate(timeout=35)
         assert_completed(result, "reordered opener UDP receiver")
