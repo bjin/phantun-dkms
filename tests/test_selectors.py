@@ -16,6 +16,7 @@ from helpers import (
     NS_B,
     PORTS_A,
     PORTS_B,
+    VETH_A,
     assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
@@ -284,6 +285,134 @@ def test_intersection_mode_requires_local_and_remote_match(phantun_module, vm):
             pytest.fail(f"unexpected intersection server payloads: {server_data!r}")
 
     finally:
+        cleanup_netns_topology(vm)
+
+
+@pytest.mark.parametrize(
+    ("destination", "selector_mode"),
+    [
+        pytest.param("239.1.2.3", "local", id="ipv4-multicast-selected-local"),
+        pytest.param("239.1.2.3", "unmatched-local", id="ipv4-multicast-local-miss"),
+        pytest.param("255.255.255.255", "peer", id="limited-broadcast-selected-peer"),
+        pytest.param("255.255.255.255", "unmatched-peer-address", id="limited-broadcast-address-miss"),
+        pytest.param("10.200.0.255", "intersection", id="directed-broadcast-selected-intersection"),
+        pytest.param("10.200.0.255", "unmatched-peer-port", id="directed-broadcast-port-miss"),
+        pytest.param("ff02::123", "intersection", id="ipv6-link-multicast-selected-intersection"),
+        pytest.param("ff02::123", "unmatched-local", id="ipv6-link-multicast-local-miss"),
+        pytest.param("ff0e::123", "peer", id="ipv6-global-multicast-selected-peer"),
+        pytest.param("ff0e::123", "unmatched-peer-address", id="ipv6-global-multicast-address-miss"),
+    ],
+)
+def test_nonunicast_output_respects_selector_ownership(phantun_module, vm, request, destination, selector_mode):
+    ipv6 = ":" in destination
+    if ipv6:
+        request.getfixturevalue("ipv6_runtime")
+    source = NS6_ADDR_A if ipv6 else NS_ADDR_A
+    src_port, dst_port = PORTS_A[0], PORTS_B[0]
+    selected = selector_mode in ("local", "peer", "intersection")
+    peer_address = destination
+    peer_port = dst_port
+    if selector_mode == "unmatched-peer-address":
+        peer_address = NS6_ADDR_B if ipv6 else NS_ADDR_B
+    if selector_mode == "unmatched-peer-port":
+        peer_port += 1
+    peer = f"[{peer_address}]:{peer_port}" if ipv6 else f"{peer_address}:{peer_port}"
+    selectors = {}
+    if selector_mode != "peer":
+        selectors["managed_local_ports"] = str(src_port + 1 if selector_mode == "unmatched-local" else src_port)
+    if selector_mode != "local":
+        selectors["managed_remote_peers"] = peer
+    phantun_module.load(managed_netns="all", **selectors)
+    ensure_netns_topology(vm, with_ipv6=ipv6)
+    require_nft_or_skip(vm)
+    probe = None
+    try:
+        if destination == "10.200.0.255":
+            # Install an explicit subnet broadcast, so this exercises the
+            # output route's broadcast classification, not address guessing.
+            vm.run(["ip", "netns", "exec", NS_A, "ip", "addr", "change",
+                    f"{NS_ADDR_A}/24", "brd", "+", "dev", VETH_A])
+            route = vm.run(["ip", "netns", "exec", NS_A, "ip", "route", "get", destination])
+            assert "broadcast" in route.stdout, route.stdout
+        elif destination == "239.1.2.3" or ipv6:
+            family = ["-6"] if ipv6 else []
+            vm.run(["ip", "netns", "exec", NS_A, "ip", *family, "route", "replace",
+                    destination + ("/128" if ipv6 else "/32"), "dev", VETH_A])
+
+        # Priority zero observes packets after Phantun's ownership decision.
+        # Accept UDP so unselected cases exercise the normal output path.
+        probe = make_netns_output_probe(
+            vm, NS_A, [(source, src_port, destination, dst_port)], udp_action="accept"
+        )
+        before = read_module_stats(vm)
+        result = run_netns_scenario(
+            vm, NS_A, "send_many",
+            {
+                "bind_addr": source,
+                "bind_port": src_port,
+                "bind_device": VETH_A,
+                "target_addr": destination,
+                "target_port": dst_port,
+                "target_scope_dev": VETH_A if ipv6 else None,
+                "broadcast": not ipv6,
+                "payloads": ["nonunicast-ownership"],
+                "allow_send_errors": True,
+            },
+        )
+        assert_completed(result, "non-unicast sender")
+        sent = parse_guest_json(result.stdout, "non-unicast sender stdout")
+        after = read_module_stats(vm)
+        assert probe.packets(vm, probe_comment("tcp", source, src_port, destination, dst_port)) == 0
+        assert probe.packets(vm, probe_comment("udp", source, src_port, destination, dst_port)) == (
+            0 if selected else 1
+        )
+        for counter in ("flows_created", "flows_current", "udp_packets_queued"):
+            assert after[counter] == before[counter], (counter, before, after)
+        assert after["udp_packets_dropped"] - before["udp_packets_dropped"] == int(selected)
+        if selected:
+            assert len(sent["errors"]) == 1, sent
+        else:
+            assert sent["errors"] == [], sent
+    finally:
+        if probe is not None:
+            probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_loopback_multicast_on_managed_port_is_ignored(phantun_module, vm):
+    source, destination = "127.0.0.1", "239.1.2.3"
+    src_port, dst_port = PORTS_A[0], PORTS_B[0]
+    phantun_module.load(managed_netns="all", managed_local_ports=str(src_port))
+    ensure_netns_topology(vm)
+    require_nft_or_skip(vm)
+    probe = None
+    try:
+        vm.run(["ip", "netns", "exec", NS_A, "ip", "route", "add",
+                f"{destination}/32", "dev", "lo", "src", source])
+        probe = make_netns_output_probe(
+            vm, NS_A, [(source, src_port, destination, dst_port)], udp_action="accept"
+        )
+        before = read_module_stats(vm)
+        result = run_netns_scenario(
+            vm, NS_A, "send_many",
+            {
+                "bind_addr": source,
+                "bind_port": src_port,
+                "bind_device": "lo",
+                "target_addr": destination,
+                "target_port": dst_port,
+                "payloads": ["loopback-multicast"],
+            },
+        )
+        assert_completed(result, "loopback multicast sender")
+        after = read_module_stats(vm)
+        assert probe.packets(vm, probe_comment("udp", source, src_port, destination, dst_port)) == 1
+        assert probe.packets(vm, probe_comment("tcp", source, src_port, destination, dst_port)) == 0
+        for counter in ("flows_created", "flows_current", "udp_packets_queued", "udp_packets_dropped"):
+            assert after[counter] == before[counter], (counter, before, after)
+    finally:
+        if probe is not None:
+            probe.cleanup(vm)
         cleanup_netns_topology(vm)
 
 

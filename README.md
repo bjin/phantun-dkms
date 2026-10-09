@@ -189,6 +189,7 @@ Rules:
 - IPv6 `managed_remote_peers` entries must be bracketed, for example `[2001:db8::20]:51820`; unbracketed IPv6 endpoints are rejected as ambiguous.
 - `managed_remote_peers` is exact-address matching. If a remote host rotates its public source address, including IPv6 privacy-address rotation, update the configured peer address or use `managed_local_ports` for server-like endpoints that should accept any remote address on the owned local port.
 - IPv6 link-local endpoint addresses are not supported. Selector-matched traffic with a link-local local or remote endpoint is rejected instead of translated.
+- Outbound translation supports only unicast destinations. After selector matching and the loopback exemption, IPv4 multicast, limited broadcast, route-classified subnet-directed broadcast, and IPv6 multicast (including scoped groups) are dropped before UDP conntrack confirmation or flow/queue admission. These packets do not fall back to raw UDP; unselected group/broadcast traffic remains ordinary UDP.
 
 ### Namespace attachment
 

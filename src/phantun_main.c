@@ -1298,6 +1298,24 @@ static void phantun_local_out_dispatch(const struct phantun_local_out_ctx *ctx,
     } while (skb);
 }
 
+static bool phantun_outbound_destination_is_nonunicast(const struct sk_buff *skb,
+                                                      const struct pht_addr *addr) {
+    if (addr->family == AF_INET) {
+        const struct rtable *rt = skb_rtable(skb);
+
+        /* The existing output route knows subnet-directed broadcasts; do
+         * not infer them from address bits or perform another route lookup.
+         */
+        return ipv4_is_multicast(addr->v4) || ipv4_is_lbcast(addr->v4) ||
+               (rt && (rt->rt_flags & RTCF_BROADCAST));
+    }
+#if IS_ENABLED(CONFIG_IPV6)
+    if (addr->family == AF_INET6)
+        return ipv6_addr_is_multicast(&addr->v6);
+#endif
+    return false;
+}
+
 /* LOCAL_OUT owns selector-matched outbound UDP. ESTABLISHED flows send
  * immediately, half-open flows keep only one queued skb, and DEAD flows are
  * reopened from scratch with a guarded ISN.
@@ -1327,6 +1345,12 @@ unsigned int phantun_local_out(void *priv, struct sk_buff *skb, const struct nf_
     phantun_view_remote_addr(&ctx.view, false, &remote_addr);
     if (!phantun_selectors_allow(ctx.view.udp->source, &remote_addr, ctx.view.udp->dest))
         return NF_ACCEPT;
+
+    if (phantun_outbound_destination_is_nonunicast(skb, &remote_addr)) {
+        pht_stats_inc(PHT_STAT_UDP_PACKETS_DROPPED);
+        pht_pr_warn_rl("rejecting outbound UDP with non-unicast destination\n");
+        return NF_DROP;
+    }
 
     ctx.net = state->net;
     phantun_fill_udp_endpoint_pair(&ctx.view, &ctx.ep);

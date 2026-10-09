@@ -249,6 +249,7 @@ Constraints:
 - IPv6 `managed_remote_peers` entries must use bracketed `[IPv6]:port` syntax; unbracketed IPv6 is rejected
 - `managed_remote_peers` is exact-address matching; remote privacy-address rotation is a new remote endpoint and requires config update unless local-port selection is used instead
 - IPv6 link-local endpoint addresses are intentionally unsupported and rejected until scoped link-local flow identity, validation, and invalidation are implemented consistently
+- Outbound translation supports unicast destinations only. After selector ownership and the loopback exemption, IPv4 multicast, limited broadcast, subnet-directed broadcast classified by the existing output route, and IPv6 multicast at any scope are rejected with `NF_DROP` and counted in `udp_packets_dropped`. This happens before conntrack confirmation or flow/queue admission, with no fake-TCP SYN or raw-UDP fallback. No additional FIB lookup or subnet arithmetic is used; unselected traffic and inbound forwarding ownership remain unchanged.
 Peer-only caveat:
 
 - inbound TCP ownership becomes broad for that remote `IPv4:port` or `[IPv6]:port`
@@ -677,6 +678,7 @@ current-generation window check (`remote_seq_window_start..ack` /
 
 Behavior:
 
+- reject selector-owned non-unicast destinations after the loopback exemption and before conntrack confirmation, flow lookup/creation, or queue admission
 - established flow → consume UDP skb, emit fake-TCP skb
 - handshaking flow → queue one skb or drop
 - no flow → create initiator flow, queue one skb, send `SYN`

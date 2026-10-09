@@ -313,6 +313,8 @@ def send_many(config):
         config.get("bind_device"),
         config.get("gso_size"),
     ) as sock:
+        if config.get("broadcast"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         target = _addr_tuple(config["target_addr"], config["target_port"], config.get("target_scope_dev"))
         for payload in payloads:
             try:
