@@ -55,6 +55,12 @@ enum pht_flow_complete_result {
     PHT_FLOW_COMPLETE_STALE,
 };
 
+enum pht_flow_queue_result {
+    PHT_FLOW_QUEUE_QUEUED,
+    PHT_FLOW_QUEUE_FULL,
+    PHT_FLOW_QUEUE_RETRY,
+};
+
 struct pht_flow_handshake_complete_args {
     enum pht_flow_state expected_state;
     u32 local_seq_start;
@@ -63,8 +69,7 @@ struct pht_flow_handshake_complete_args {
     u32 remote_payload_seq;
     size_t remote_payload_len;
     size_t local_control_len;
-    bool reserve_shaping_rx_slot;
-    bool response_pending_ack;
+    bool reserve_one_shot_shaping_rx;
 };
 
 /* Flow identity is already local-oriented at packet boundaries: local is this
@@ -150,9 +155,7 @@ struct pht_flow {
     u32 quarantine_prev_local_seq_end;
     u32 quarantine_prev_remote_seq_start;
     u32 quarantine_prev_remote_seq_end;
-    /* Bounded one-skb queue used while a flow is half-open or responder data
-     * is waiting for the injected handshake_response to clear.
-     */
+    /* Bounded one-skb queue used only while a flow is half-open. */
     struct sk_buff *queued_skb;
     /* Valid only while queued_skb != NULL. Publish the skb and its metadata
      * together under flow->lock; an empty queue's metadata is not transmit policy.
@@ -176,22 +179,17 @@ struct pht_flow {
      * for best-effort invalidation when that device goes away.
      */
     int egress_ifindex;
-    /* Optional first-payload shaping state. reserved_shaping_rx_* identifies
-     * every control payload at the reserved sequence until acknowledged
-     * progress reaches the signed half-space boundary. opening_rx_* marks the
-     * exact payload carried by the winning responder final ACK so stale
-     * SYN_RCVD snapshots cannot reinject it while the winner finalizes it.
-     * Exact opening matches are also excluded from queue-release evidence in
-     * ordinary established dispatch, without suppressing application delivery.
-     * response_pending_ack blocks responder-owned local UDP until the injected
-     * response is ACKed or bypassed by later non-control, non-opening payload.
+    /* A pending one-shot slot suppresses at most one payload candidate per
+     * direction/generation. Consumption clears it regardless of later progress.
+     * opening_rx_* marks the winning final ACK's payload so stale SYN_RCVD
+     * snapshots cannot reinject it while the winner finalizes it; ordinary
+     * established application duplicates remain deliverable.
      */
-    u32 reserved_shaping_rx_seq;
+    u32 one_shot_shaping_rx_seq;
     u32 opening_rx_seq_start;
     u32 opening_rx_seq_end;
-    bool reserved_shaping_rx_active;
+    bool one_shot_shaping_rx_pending;
     bool opening_rx_payload_claimed;
-    bool response_pending_ack;
     bool retransmit_armed;
     bool quarantine_prev_active;
     bool replacement_protect_active;
@@ -303,8 +301,8 @@ static inline void pht_flow_touch_inbound_locked(struct pht_flow *flow) {
 }
 
 void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex);
-bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
-                                 const struct pht_tx_meta *meta);
+enum pht_flow_queue_result pht_flow_queue_half_open_skb(struct pht_flow *flow, struct sk_buff *skb,
+                                                       const struct pht_tx_meta *meta);
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb,
                              const struct pht_tx_meta *meta);
 /* Transfer the packet and its metadata; initialize @meta even for an empty queue. */

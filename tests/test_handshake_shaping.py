@@ -293,13 +293,19 @@ def test_handshake_response_without_request_is_disabled(phantun_module, vm):
         cleanup_netns_topology(vm)
 
 
+@pytest.mark.parametrize("delayed_control", [False, True], ids=["first-hint", "delayed-first-hint"])
 @pytest.mark.parametrize("control_payload", [REQ, RESP], ids=["request", "response"])
-def test_opening_shaping_payload_replays_stay_hidden(phantun_module, vm, control_payload):
+def test_consumed_shaping_slot_delivers_wrapped_application_and_duplicates(
+    phantun_module, vm, control_payload, delayed_control
+):
     response_enabled = control_payload == RESP
     load_managed_module(
         phantun_module, handshake_request=REQ, handshake_response=RESP if response_enabled else ""
     )
     ensure_netns_topology(vm)
+    if delayed_control and not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
 
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
@@ -310,24 +316,35 @@ def test_opening_shaping_payload_replays_stay_hidden(phantun_module, vm, control
         "target_addr": NS_ADDR_A if response_enabled else NS_ADDR_B,
         "target_port": src_port if response_enabled else dst_port,
     }
-    prefix = f"/tmp/phantun-final-ack-control-drop-{uuid.uuid4().hex}"
+    prefix = f"/tmp/phantun-consumed-slot-wrap-{uuid.uuid4().hex}"
     final_ack_ready = f"{prefix}-capture-ready"
     server_ready = f"{prefix}-server-ready"
     replay_ready = f"{prefix}-replay-ready"
     final_ack_capture = spawn_netns_scenario(
         vm,
-        receiver_ns,
+        sender_ns,
         "capture_tcp_packet",
         {
             **endpoints,
             "payload": control_payload,
+            "include_outgoing": True,
             "ready_file": final_ack_ready,
             "timeout_sec": 20,
         },
     )
     server = None
     replay_receiver = None
+    drop_control = None
     try:
+        if delayed_control:
+            drop_control = make_netns_ingress_payload_drop_probe(
+                vm, receiver_ns, VETH_A if response_enabled else VETH_B,
+                [{
+                    "src_addr": endpoints["bind_addr"], "src_port": endpoints["bind_port"],
+                    "dst_addr": endpoints["target_addr"], "dst_port": endpoints["target_port"],
+                    "payload": control_payload, "comment": "delay_first_hint",
+                }],
+            )
         wait_for_guest_ready_file(vm, final_ack_ready, timeout=5)
         server = spawn_netns_scenario(
             vm,
@@ -370,7 +387,7 @@ def test_opening_shaping_payload_replays_stay_hidden(phantun_module, vm, control
         if received_messages(server_data) != ["client-final-ack"]:
             pytest.fail(f"final-ACK receiver saw unexpected payloads: {server_data!r}")
 
-        expected_drops = baseline_stats["shaping_payloads_dropped"] + 1 + response_enabled
+        expected_drops = baseline_stats["shaping_payloads_dropped"] + 1 + response_enabled - delayed_control
         deadline = time.monotonic() + 10
         while True:
             first_stats = read_module_stats(vm)
@@ -390,23 +407,38 @@ def test_opening_shaping_payload_replays_stay_hidden(phantun_module, vm, control
             {
                 "bind_addr": endpoints["target_addr"],
                 "bind_port": endpoints["target_port"],
-                "count": 2,
+                "count": 3,
                 "ready_file": replay_ready,
                 "timeout_sec": 20,
             },
         )
         wait_for_guest_ready_file(vm, replay_ready, timeout=5)
 
-        replay_result = run_netns_scenario(
+        if delayed_control:
+            assert drop_control.packets(vm, "delay_first_hint") > 0
+            drop_control.cleanup(vm)
+            assert_completed(
+                run_netns_scenario(
+                    vm, sender_ns, "send_tcp_packet",
+                    {**endpoints, "flags": "ack", "seq": final_ack_data["seq"],
+                     "ack": final_ack_data["ack"], "payload": control_payload},
+                ),
+                "inject first delayed hint after application delivery",
+            )
+            expected_drops += 1
+
+        # Simulate missing more than half a sequence space after consuming the
+        # hint. No observed small hops can retire a persistent slot for us.
+        gap_result = run_netns_scenario(
             vm,
             sender_ns,
             "send_tcp_packet",
             {
                 **endpoints,
                 "flags": "ack",
-                "seq": final_ack_data["seq"],
+                "seq": (final_ack_data["seq"] + 0x90000000) & 0xFFFFFFFF,
                 "ack": final_ack_data["ack"],
-                "payload": control_payload,
+                "payload": "after-unseen-gap",
             },
         )
         for _ in range(2):
@@ -417,26 +449,28 @@ def test_opening_shaping_payload_replays_stay_hidden(phantun_module, vm, control
                 {
                     **endpoints,
                     "flags": "ack",
-                    "seq": (final_ack_data["seq"] + len(control_payload) + len("client-final-ack")) & 0xFFFFFFFF,
+                    "seq": final_ack_data["seq"],
                     "ack": final_ack_data["ack"],
-                    "payload": "later-data",
+                    "payload": "wrapped-application",
                 },
             )
             assert_completed(later_result, "later application payload sender")
         replay_receiver_result = replay_receiver.communicate(timeout=25)
-        assert_completed(replay_result, "final-ACK replay sender")
+        assert_completed(gap_result, "payload after unobserved half-space gap")
         assert_completed(replay_receiver_result, "final-ACK replay receiver")
         replay_data = parse_guest_json(replay_receiver_result.stdout, "final-ACK replay receiver stdout")
-        if received_messages(replay_data) != ["later-data", "later-data"]:
-            pytest.fail(f"control replay leaked or ordinary application duplicates were lost: {replay_data!r}")
+        if received_messages(replay_data) != ["after-unseen-gap", "wrapped-application", "wrapped-application"]:
+            pytest.fail(f"consumed shaping slot hid wrapped application data or duplicates: {replay_data!r}")
         time.sleep(0.2)
         replay_stats = read_module_stats(vm)
-        if replay_stats["shaping_payloads_dropped"] != expected_drops + 1:
+        if replay_stats["shaping_payloads_dropped"] != expected_drops:
             pytest.fail(
-                "each suppressed opening control replay must be counted: "
+                "a consumed shaping slot must never suppress another candidate: "
                 f"baseline={baseline_stats!r} first={first_stats!r} replay={replay_stats!r}"
             )
     finally:
+        if drop_control is not None:
+            drop_control.cleanup(vm)
         for process in (server, replay_receiver, final_ack_capture):
             if process is not None and process.proc.poll() is None:
                 process.terminate()
@@ -513,7 +547,8 @@ def test_handshake_request_loss_does_not_drop_later_payloads(phantun_module, vm)
         cleanup_netns_topology(vm)
 
 
-def test_handshake_response_loss_does_not_drop_later_replies(phantun_module, vm):
+@pytest.mark.parametrize("lose_request", [False, True], ids=["response-lost", "both-hints-lost"])
+def test_lost_shaping_hints_allow_reply_without_more_client_data(phantun_module, vm, lose_request):
     load_managed_module(phantun_module, handshake_request=REQ, handshake_response=RESP)
     ensure_netns_topology(vm)
 
@@ -538,6 +573,17 @@ def test_handshake_response_loss_does_not_drop_later_replies(phantun_module, vm)
             }
         ],
     )
+    request_probe = None
+    if lose_request:
+        request_probe = make_netns_ingress_payload_drop_probe(
+            vm, NS_B, VETH_B,
+            [{
+                "src_addr": NS_ADDR_A, "src_port": src_port,
+                "dst_addr": NS_ADDR_B, "dst_port": dst_port,
+                "payload": REQ, "comment": "drop_req",
+            }],
+        )
+    ready_file = f"/tmp/phantun-lost-hints-{uuid.uuid4().hex}"
     server = spawn_netns_scenario(
         vm,
         NS_B,
@@ -545,13 +591,15 @@ def test_handshake_response_loss_does_not_drop_later_replies(phantun_module, vm)
         {
             "bind_addr": NS_ADDR_B,
             "bind_port": dst_port,
-            "count": 3,
-            "replies": ["reply-0", "reply-1", "reply-2"],
+            "count": 1,
+            "replies": ["reply-0"],
+            "ready_file": ready_file,
+            "timeout_sec": 20,
         },
     )
 
     try:
-        time.sleep(0.2)
+        wait_for_guest_ready_file(vm, ready_file, timeout=10)
         client_result = run_netns_scenario(
             vm,
             NS_A,
@@ -561,14 +609,12 @@ def test_handshake_response_loss_does_not_drop_later_replies(phantun_module, vm)
                 "bind_port": src_port,
                 "target_addr": NS_ADDR_B,
                 "target_port": dst_port,
-                "payloads": ["client-0", "client-1", "client-2"],
-                "recv_count": 3,
-                "delay_ms": 400,
+                "payloads": ["client-0"],
+                "recv_count": 1,
+                "timeout_sec": 20,
             },
-            timeout=20,
+            timeout=25,
         )
-        time.sleep(1.25)
-        probe.cleanup(vm)
         server_result = server.communicate(timeout=20)
 
         assert_completed(client_result, "response-loss client")
@@ -576,15 +622,146 @@ def test_handshake_response_loss_does_not_drop_later_replies(phantun_module, vm)
 
         client_data = parse_guest_json(client_result.stdout, "response-loss client stdout")
         server_data = parse_guest_json(server_result.stdout, "response-loss server stdout")
-        if received_messages(server_data) != ["client-0", "client-1", "client-2"]:
+        assert probe.packets(vm, "drop_resp") > 0
+        if request_probe is not None:
+            assert request_probe.packets(vm, "drop_req") > 0
+        if received_messages(server_data) != ["client-0"]:
             pytest.fail(f"unexpected responder receive set after response loss: {received_messages(server_data)!r}")
-        if reply_messages(client_data) != ["reply-0", "reply-1", "reply-2"]:
+        if reply_messages(client_data) != ["reply-0"]:
             pytest.fail(
-                "lost handshake_response must not cause later higher-sequence replies to be dropped; "
+                "lost shaping hints must not require another client datagram to release replies; "
                 f"got {reply_messages(client_data)!r}"
             )
     finally:
+        if request_probe is not None:
+            request_probe.cleanup(vm)
+        if server.proc.poll() is None:
+            server.terminate()
+        vm.run(["rm", "-f", ready_file], check=False)
         probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_completion_releases_handshake_queue_with_lost_response_and_delayed_request(phantun_module, vm):
+    load_managed_module(
+        phantun_module, handshake_request=REQ, handshake_response=RESP,
+        handshake_timeout_ms=30000, handshake_retries=3, keepalive_interval_sec=60,
+    )
+    ensure_netns_topology(vm)
+    if not require_guest_command(vm, "nft"):
+        cleanup_netns_topology(vm)
+        pytest.skip("nft is not available in the guest")
+
+    src_port, dst_port = PORTS_A[0], PORTS_B[0]
+    forward = {
+        "bind_addr": NS_ADDR_A, "bind_port": src_port,
+        "target_addr": NS_ADDR_B, "target_port": dst_port,
+    }
+    reverse = {
+        "bind_addr": NS_ADDR_B, "bind_port": dst_port,
+        "target_addr": NS_ADDR_A, "target_port": src_port,
+    }
+    prefix = f"/tmp/phantun-handshake-queue-{uuid.uuid4().hex}"
+    processes, probes = [], []
+
+    def drop(namespace, device, endpoints, payload, name):
+        probe = make_netns_ingress_payload_drop_probe(
+            vm, namespace, device,
+            [{
+                "src_addr": endpoints["bind_addr"], "src_port": endpoints["bind_port"],
+                "dst_addr": endpoints["target_addr"], "dst_port": endpoints["target_port"],
+                "payload": payload, "comment": name,
+            }],
+        )
+        probes.append(probe)
+        return probe
+
+    try:
+        request_drop = drop(NS_B, VETH_B, forward, REQ, "delay_request")
+        opening_drop = drop(NS_B, VETH_B, forward, "opening-data", "hold_completion")
+        response_drop = drop(NS_A, VETH_A, reverse, RESP, "lose_response")
+        capture = spawn_netns_scenario(
+            vm, NS_A, "capture_tcp_packet",
+            {**forward, "payload": REQ, "include_outgoing": True,
+             "ready_file": f"{prefix}-capture", "timeout_sec": 30},
+        )
+        processes.append(capture)
+        wait_for_guest_ready_file(vm, f"{prefix}-capture", timeout=10)
+        baseline = read_module_stats(vm)
+        client = spawn_netns_scenario(
+            vm, NS_A, "send_many_recv",
+            {**forward, "payloads": ["opening-data"], "recv_count": 1, "timeout_sec": 30},
+        )
+        processes.append(client)
+        result = capture.communicate(timeout=35)
+        assert_completed(result, "capture held completion request")
+        request = parse_guest_json(result.stdout, "held completion request")
+        deadline = time.monotonic() + 10
+        while opening_drop.packets(vm, "hold_completion") == 0:
+            if time.monotonic() >= deadline:
+                pytest.fail("initial application final ACK was not held on ingress")
+            time.sleep(0.05)
+        half_open = read_module_stats(vm)
+        assert half_open["flows_established"] == baseline["flows_established"] + 1
+        assert_completed(
+            run_netns_scenario(vm, NS_B, "send_many", {**reverse, "payloads": ["queued-reply"]}),
+            "queue responder datagram while handshake is incomplete",
+        )
+        queued = read_module_stats(vm)
+        assert queued["udp_packets_queued"] == half_open["udp_packets_queued"] + 1
+        server = spawn_netns_scenario(
+            vm, NS_B, "recv_until_timeout",
+            {"bind_addr": NS_ADDR_B, "bind_port": dst_port, "count": 2,
+             "ready_file": f"{prefix}-server", "timeout_sec": 30},
+        )
+        processes.append(server)
+        wait_for_guest_ready_file(vm, f"{prefix}-server", timeout=10)
+        opening_drop.cleanup(vm)
+        application = {
+            **forward, "flags": "ack", "seq": (request["seq"] + len(REQ)) & 0xFFFFFFFF,
+            "ack": request["ack"], "payload": "opening-data",
+        }
+        assert_completed(
+            run_netns_scenario(vm, NS_A, "send_tcp_packet", application),
+            "complete responder with original application final ACK",
+        )
+        # No new client data, response ACK, or delayed request precedes receipt.
+        result = client.communicate(timeout=35)
+        assert_completed(result, "receive handshake-queued reply despite lost hints")
+        assert reply_messages(parse_guest_json(result.stdout, "handshake-queued reply")) == ["queued-reply"]
+        assert response_drop.packets(vm, "lose_response") > 0
+        assert request_drop.packets(vm, "delay_request") > 0
+        request_drop.cleanup(vm)
+        assert_completed(
+            run_netns_scenario(
+                vm, NS_A, "send_tcp_packet",
+                {**application, "seq": request["seq"], "payload": REQ},
+            ),
+            "deliver first delayed request after queued reply",
+        )
+        assert_completed(
+            run_netns_scenario(
+                vm, NS_A, "send_tcp_packet",
+                {**application, "seq": (application["seq"] + len("opening-data")) & 0xFFFFFFFF,
+                 "payload": "after-delayed-hint"},
+            ),
+            "send sentinel after delayed request",
+        )
+        result = server.communicate(timeout=35)
+        assert_completed(result, "application receiver across delayed request")
+        assert received_messages(parse_guest_json(result.stdout, "delayed request receiver")) == [
+            "opening-data", "after-delayed-hint"
+        ]
+        stats = read_module_stats(vm)
+        assert stats["shaping_payloads_dropped"] == baseline["shaping_payloads_dropped"] + 1
+        assert stats["flows_established"] == baseline["flows_established"] + 2
+    finally:
+        for process in processes:
+            if process.proc.poll() is None:
+                process.terminate()
+        for probe in probes:
+            probe.cleanup(vm)
+        vm.run(["rm", "-f", f"{prefix}-capture", f"{prefix}-server"], check=False)
         cleanup_netns_topology(vm)
 
 
@@ -671,7 +848,6 @@ def test_delayed_handshake_response_control_drop_acks_after_recent_tx(phantun_mo
     synack_ready = f"{prefix}-synack-ready"
     server_ready = f"{prefix}-server-ready"
     continue_file = f"{prefix}-continue"
-    replay_ready = f"{prefix}-replay-ready"
     inject_config_file = f"{prefix}-inject.json"
     syn_capture = spawn_netns_scenario(
         vm,
@@ -726,7 +902,6 @@ def test_delayed_handshake_response_control_drop_acks_after_recent_tx(phantun_mo
     )
     server = None
     client = None
-    replay_receiver = None
     try:
         wait_for_guest_ready_file(vm, syn_ready, timeout=5)
         wait_for_guest_ready_file(vm, synack_ready, timeout=5)
@@ -832,387 +1007,16 @@ def test_delayed_handshake_response_control_drop_acks_after_recent_tx(phantun_mo
                 f"before={baseline_stats!r} after={final_stats!r}"
             )
 
-        replay_receiver = spawn_netns_scenario(
-            vm,
-            NS_A,
-            "recv_until_timeout",
-            {
-                "bind_addr": NS_ADDR_A,
-                "bind_port": src_port,
-                "count": 2,
-                "ready_file": replay_ready,
-                "timeout_sec": 20,
-            },
-        )
-        wait_for_guest_ready_file(vm, replay_ready, timeout=5)
-
-        replay_result = run_netns_scenario(vm, NS_B, "send_tcp_packet", inject_config)
-        for _ in range(2):
-            later_result = run_netns_scenario(
-                vm,
-                NS_B,
-                "send_tcp_packet",
-                {**inject_config, "seq": (inject_config["seq"] + len(RESP)) & 0xFFFFFFFF,
-                 "payload": "later-response-data"},
-            )
-            assert_completed(later_result, "later responder application payload sender")
-        replay_receiver_result = replay_receiver.communicate(timeout=25)
-        assert_completed(replay_result, "control-drop replay sender")
-        assert_completed(replay_receiver_result, "control-drop replay receiver")
-        replay_data = parse_guest_json(replay_receiver_result.stdout, "control-drop replay receiver stdout")
-        if received_messages(replay_data) != ["later-response-data", "later-response-data"]:
-            pytest.fail(f"response replay leaked or application duplicates were lost: {replay_data!r}")
-        time.sleep(0.2)
-        replay_stats = read_module_stats(vm)
-        if replay_stats["shaping_payloads_dropped"] != expected_drops + 1:
-            pytest.fail(
-                "each suppressed delayed handshake_response must be counted: "
-                f"baseline={baseline_stats!r} first={final_stats!r} replay={replay_stats!r}"
-            )
     finally:
-        for process in (client, server, replay_receiver, syn_capture, synack_capture):
+        for process in (client, server, syn_capture, synack_capture):
             if process is not None and process.proc.poll() is None:
                 process.terminate()
         drop_response.cleanup(vm)
         ack_probe.cleanup(vm)
         vm.run(
-            ["rm", "-f", syn_ready, synack_ready, server_ready, replay_ready, continue_file, inject_config_file],
+            ["rm", "-f", syn_ready, synack_ready, server_ready, continue_file, inject_config_file],
             check=False,
         )
-        cleanup_netns_topology(vm)
-
-
-@pytest.mark.parametrize("delayed_request", [False, True], ids=["final-ack-request", "pure-final-ack"])
-@pytest.mark.parametrize("release", ["ack", "control-ack", "data"])
-def test_request_replays_hold_responder_queue_until_legitimate_release(
-    phantun_module, vm, delayed_request, release
-):
-    load_managed_module(
-        phantun_module, handshake_request=REQ, handshake_response=RESP, keepalive_interval_sec=60
-    )
-    ensure_netns_topology(vm)
-    if not require_guest_command(vm, "nft"):
-        cleanup_netns_topology(vm)
-        pytest.skip("nft is not available in the guest")
-
-    src_port, dst_port = PORTS_A[0], PORTS_B[0]
-    forward = {
-        "bind_addr": NS_ADDR_A, "bind_port": src_port,
-        "target_addr": NS_ADDR_B, "target_port": dst_port,
-    }
-    reverse = {
-        "bind_addr": NS_ADDR_B, "bind_port": dst_port,
-        "target_addr": NS_ADDR_A, "target_port": src_port,
-    }
-    prefix = f"/tmp/phantun-replay-gate-{uuid.uuid4().hex}"
-    processes, probes, ready_files = [], [], []
-
-    def capture(namespace, endpoints, payload, name):
-        ready = f"{prefix}-{name}"
-        ready_files.append(ready)
-        process = spawn_netns_scenario(
-            vm, namespace, "capture_tcp_packet",
-            {**endpoints, "payload": payload, "ready_file": ready, "timeout_sec": 30,
-             "include_outgoing": True},
-        )
-        processes.append(process)
-        wait_for_guest_ready_file(vm, ready, timeout=10)
-        return process
-
-    def drop_payload(namespace, device, endpoints, payload, name):
-        probe = make_netns_ingress_payload_drop_probe(
-            vm, namespace, device,
-            [{
-                "src_addr": endpoints["bind_addr"], "src_port": endpoints["bind_port"],
-                "dst_addr": endpoints["target_addr"], "dst_port": endpoints["target_port"],
-                "payload": payload, "comment": name,
-            }],
-        )
-        probes.append(probe)
-        return probe
-
-    try:
-        drop_payload(NS_A, VETH_A, reverse, RESP, "drop_response")
-        drop_payload(NS_B, VETH_B, forward, "client-0", "drop_initial_data")
-        request_drop = (
-            drop_payload(NS_B, VETH_B, forward, REQ, "drop_request") if delayed_request else None
-        )
-        request_capture = capture(NS_A, forward, REQ, "request")
-        response_capture = capture(NS_B, reverse, RESP, "response")
-        ack_probe = make_netns_output_ipv4_pure_ack_probe(
-            vm, NS_B, NS_ADDR_B, dst_port, NS_ADDR_A, src_port
-        )
-        probes.append(ack_probe)
-        reply_probe = make_netns_tcp_payload_probe(
-            vm, NS_B,
-            [{
-                "src_addr": NS_ADDR_B, "src_port": dst_port,
-                "dst_addr": NS_ADDR_A, "dst_port": src_port,
-                "payload": "server-0", "comment": "queued_reply", "action": "accept",
-            }],
-        )
-        probes.append(reply_probe)
-        assert_completed(
-            run_netns_scenario(vm, NS_A, "send_many", {**forward, "payloads": ["client-0"]}),
-            "open initiator",
-        )
-        result = request_capture.communicate(timeout=35)
-        assert_completed(result, "capture original request")
-        request = parse_guest_json(result.stdout, "original request")
-        control = {**forward, "flags": "ack", "seq": request["seq"], "ack": request["ack"], "payload": REQ}
-        if delayed_request:
-            assert_completed(
-                run_netns_scenario(vm, NS_A, "send_tcp_packet", {**control, "payload": ""}),
-                "complete responder with pure ACK",
-            )
-        result = response_capture.communicate(timeout=35)
-        assert_completed(result, "capture original response")
-        response = parse_guest_json(result.stdout, "original response")
-        assert response["seq"] == request["ack"]
-        if request_drop is not None:
-            request_drop.cleanup(vm)
-
-        # Completion is observed before submitting responder UDP, not guessed
-        # from a sleep. Both response and ordinary initiator data remain lost.
-        assert_completed(
-            run_netns_scenario(vm, NS_B, "send_many", {**reverse, "payloads": ["server-0"]}),
-            "queue responder data",
-        )
-        assert reply_probe.packets(vm, "queued_reply") == 0
-        ready = f"{prefix}-receiver"
-        ready_files.append(ready)
-        receiver = spawn_netns_scenario(
-            vm, NS_B, "recv_until_timeout",
-            {"bind_addr": NS_ADDR_B, "bind_port": dst_port, "count": 1,
-             "ready_file": ready, "timeout_sec": 30},
-        )
-        processes.append(receiver)
-        wait_for_guest_ready_file(vm, ready, timeout=10)
-        baseline = read_module_stats(vm)
-        baseline_ack = ack_probe.packets(vm, "pure_ipv4_ack")
-
-        # Matching is by reserved sequence, not the configured control bytes.
-        for payload in (REQ, "different-control-bytes"):
-            assert_completed(
-                run_netns_scenario(vm, NS_A, "send_tcp_packet", {**control, "payload": payload}),
-                "inject reserved request replay",
-            )
-        deadline = time.monotonic() + 10
-        while ack_probe.packets(vm, "pure_ipv4_ack") < baseline_ack + 2:
-            if time.monotonic() >= deadline:
-                pytest.fail("suppressed request copies did not receive mandatory ACKs")
-            time.sleep(0.05)
-        held = read_module_stats(vm)
-        assert held["shaping_payloads_dropped"] == baseline["shaping_payloads_dropped"] + 2
-        assert held["response_payloads_injected"] == baseline["response_payloads_injected"]
-        assert reply_probe.packets(vm, "queued_reply") == 0, "control replay released responder UDP"
-
-        reply_capture = capture(NS_B, reverse, "server-0", "released-reply")
-        later = {**control, "seq": (request["seq"] + 128) & 0xFFFFFFFF, "payload": "client-1"}
-        covering_ack = (response["seq"] + len(RESP)) & 0xFFFFFFFF
-        release_packet = {
-            "ack": {**later, "ack": covering_ack, "payload": ""},
-            "control-ack": {**control, "ack": covering_ack},
-            "data": later,
-        }[release]
-        assert_completed(
-            run_netns_scenario(vm, NS_A, "send_tcp_packet", release_packet),
-            "release queued responder payload",
-        )
-        result = reply_capture.communicate(timeout=35)
-        assert_completed(result, "capture released responder payload")
-        reply = parse_guest_json(result.stdout, "released responder payload")
-        assert reply["seq"] == covering_ack, "response sequence space was reserved more than once"
-        assert reply_probe.packets(vm, "queued_reply") == 1
-        if release != "data":
-            assert_completed(
-                run_netns_scenario(vm, NS_A, "send_tcp_packet", later), "send later application data"
-            )
-        result = receiver.communicate(timeout=35)
-        assert_completed(result, "request replay UDP receiver")
-        assert received_messages(parse_guest_json(result.stdout, "request replay UDP receiver")) == ["client-1"]
-        final = read_module_stats(vm)
-        assert final["shaping_payloads_dropped"] == held["shaping_payloads_dropped"] + (release == "control-ack")
-        assert final["response_payloads_injected"] == baseline["response_payloads_injected"]
-    finally:
-        for process in processes:
-            if process.proc.poll() is None:
-                process.terminate()
-        for probe in probes:
-            probe.cleanup(vm)
-        vm.run(["rm", "-f", *ready_files], check=False)
-        cleanup_netns_topology(vm)
-
-
-@pytest.mark.parametrize("release", ["ack", "opening-ack", "data"])
-def test_opening_application_replay_delivers_without_releasing_responder_queue(
-    phantun_module, vm, release
-):
-    load_managed_module(
-        phantun_module, handshake_request=REQ, handshake_response=RESP, keepalive_interval_sec=60
-    )
-    ensure_netns_topology(vm)
-    if not require_guest_command(vm, "nft"):
-        cleanup_netns_topology(vm)
-        pytest.skip("nft is not available in the guest")
-
-    src_port, dst_port = PORTS_A[0], PORTS_B[0]
-    forward = {
-        "bind_addr": NS_ADDR_A, "bind_port": src_port,
-        "target_addr": NS_ADDR_B, "target_port": dst_port,
-    }
-    reverse = {
-        "bind_addr": NS_ADDR_B, "bind_port": dst_port,
-        "target_addr": NS_ADDR_A, "target_port": src_port,
-    }
-    opening_payload = "opening-application"
-    queued_payload = "held-after-opening"
-    prefix = f"/tmp/phantun-opening-replay-gate-{uuid.uuid4().hex}"
-    processes, probes, ready_files = [], [], []
-
-    def spawn_ready(namespace, scenario, config, name):
-        ready = f"{prefix}-{name}"
-        ready_files.append(ready)
-        process = spawn_netns_scenario(
-            vm, namespace, scenario,
-            {**config, "ready_file": ready, "timeout_sec": 30},
-        )
-        processes.append(process)
-        wait_for_guest_ready_file(vm, ready, timeout=10)
-        return process
-
-    def receive_application(name):
-        return spawn_ready(
-            NS_B, "recv_until_timeout",
-            {"bind_addr": NS_ADDR_B, "bind_port": dst_port, "count": 1}, name,
-        )
-
-    def received(process, name):
-        result = process.communicate(timeout=35)
-        assert_completed(result, name)
-        return parse_guest_json(result.stdout, name)
-
-    try:
-        # Lose the request, but not the higher-sequence application final ACK.
-        # Lose the response too so no peer ACK can accidentally release the gate.
-        for namespace, device, endpoints, payload, name in (
-            (NS_B, VETH_B, forward, REQ, "drop_request"),
-            (NS_A, VETH_A, reverse, RESP, "drop_response"),
-        ):
-            probes.append(make_netns_ingress_payload_drop_probe(
-                vm, namespace, device,
-                [{
-                    "src_addr": endpoints["bind_addr"], "src_port": endpoints["bind_port"],
-                    "dst_addr": endpoints["target_addr"], "dst_port": endpoints["target_port"],
-                    "payload": payload, "comment": name,
-                }],
-            ))
-        reply_probe = make_netns_tcp_payload_probe(
-            vm, NS_B,
-            [{
-                "src_addr": NS_ADDR_B, "src_port": dst_port,
-                "dst_addr": NS_ADDR_A, "dst_port": src_port,
-                "payload": queued_payload, "comment": "queued_reply", "action": "accept",
-            }],
-        )
-        probes.append(reply_probe)
-        ack_probe = make_netns_output_ipv4_pure_ack_probe(
-            vm, NS_B, NS_ADDR_B, dst_port, NS_ADDR_A, src_port
-        )
-        probes.append(ack_probe)
-        opening_capture = spawn_ready(
-            NS_A, "capture_tcp_packet",
-            {**forward, "payload": opening_payload, "include_outgoing": True}, "opening",
-        )
-        response_capture = spawn_ready(
-            NS_B, "capture_tcp_packet",
-            {**reverse, "payload": RESP, "include_outgoing": True}, "response",
-        )
-        receiver = receive_application("original-receiver")
-        assert_completed(
-            run_netns_scenario(vm, NS_A, "send_many", {**forward, "payloads": [opening_payload]}),
-            "open with lost shaping request",
-        )
-        opening = received(opening_capture, "capture opening application final ACK")
-        response = received(response_capture, "capture response to application final ACK")
-        assert received_messages(received(receiver, "original application receiver")) == [opening_payload]
-        assert response["seq"] == opening["ack"]
-        deadline = time.monotonic() + 10
-        while ack_probe.packets(vm, "pure_ipv4_ack") == 0:
-            if time.monotonic() >= deadline:
-                pytest.fail("opening application delivery did not finish with an ACK")
-            time.sleep(0.05)
-        baseline = read_module_stats(vm)
-
-        # Both response output and UDP delivery prove completion before queueing.
-        assert_completed(
-            run_netns_scenario(vm, NS_B, "send_many", {**reverse, "payloads": [queued_payload]}),
-            "queue responder UDP after application final ACK",
-        )
-        assert reply_probe.packets(vm, "queued_reply") == 0
-        receiver = receive_application("replay-receiver")
-        baseline_ack = ack_probe.packets(vm, "pure_ipv4_ack")
-        replay = {
-            **forward, "flags": "ack", "seq": opening["seq"],
-            "ack": opening["ack"], "payload": opening_payload,
-        }
-        assert_completed(
-            run_netns_scenario(vm, NS_A, "send_tcp_packet", replay),
-            "replay opening through ordinary established dispatch",
-        )
-        # Duplicates must deliver, but their exact opening sequence range is not
-        # later-data evidence. Observe the final ACK too: reinjection precedes
-        # queue flushing, so UDP receipt alone is not the full processing barrier.
-        assert received_messages(received(receiver, "opening replay receiver")) == [opening_payload]
-        deadline = time.monotonic() + 10
-        while ack_probe.packets(vm, "pure_ipv4_ack") == baseline_ack:
-            if reply_probe.packets(vm, "queued_reply") != 0:
-                pytest.fail("opening replay released responder UDP")
-            if time.monotonic() >= deadline:
-                pytest.fail("opening replay processing did not finish with an ACK")
-            time.sleep(0.05)
-        assert reply_probe.packets(vm, "queued_reply") == 0, "opening replay released responder UDP"
-        held = read_module_stats(vm)
-        assert held["shaping_payloads_dropped"] == baseline["shaping_payloads_dropped"]
-        assert held["response_payloads_injected"] == baseline["response_payloads_injected"]
-
-        reply_capture = spawn_ready(
-            NS_B, "capture_tcp_packet",
-            {**reverse, "payload": queued_payload, "include_outgoing": True}, "released-reply",
-        )
-        covering_ack = (response["seq"] + len(RESP)) & 0xFFFFFFFF
-        later = {
-            **replay, "seq": (opening["seq"] + len(opening_payload)) & 0xFFFFFFFF,
-            "payload": "later-application",
-        }
-        release_packet = {
-            "ack": {**later, "ack": covering_ack, "payload": ""},
-            "opening-ack": {**replay, "ack": covering_ack},
-            "data": later,
-        }[release]
-        if release != "ack":
-            receiver = receive_application("release-receiver")
-        assert_completed(
-            run_netns_scenario(vm, NS_A, "send_tcp_packet", release_packet),
-            "release responder queue with legitimate evidence",
-        )
-        reply = received(reply_capture, "capture legitimately released responder UDP")
-        assert reply["seq"] == covering_ack, "response sequence space was reserved more than once"
-        assert reply_probe.packets(vm, "queued_reply") == 1
-        if release != "ack":
-            assert received_messages(received(receiver, "release application receiver")) == [
-                release_packet["payload"]
-            ]
-        final = read_module_stats(vm)
-        assert final["shaping_payloads_dropped"] == baseline["shaping_payloads_dropped"]
-        assert final["response_payloads_injected"] == baseline["response_payloads_injected"]
-    finally:
-        for process in processes:
-            if process.proc.poll() is None:
-                process.terminate()
-        for probe in probes:
-            probe.cleanup(vm)
-        vm.run(["rm", "-f", *ready_files], check=False)
         cleanup_netns_topology(vm)
 
 
@@ -1350,7 +1154,7 @@ def test_delayed_handshake_request_does_not_regress_ack(phantun_module, vm):
         cleanup_netns_topology(vm)
 
 
-def test_ignore_slot_disarms_after_half_space_ack_advance(phantun_module, vm):
+def test_unconsumed_shaping_slot_disarms_after_half_space_progress(phantun_module, vm):
     # Same shape as load_fast_liveness_module but with a 10s liveness budget: this
     # test spans several guest round-trips between establishment and the
     # forged probes, and the 2s recovery deadline can legitimately tear the
@@ -1480,15 +1284,6 @@ def test_ignore_slot_disarms_after_half_space_ack_advance(phantun_module, vm):
         # Advance the responder's ack in two sub-half-space hops so the final
         # distance from the armed slot is exactly 2**31 (the disarm boundary).
         for label, offset in (("jump1", 0x40000000), ("jump2", 0x80000000)):
-            control_result = run_netns_scenario(
-                vm, NS_A, "send_tcp_packet",
-                {
-                    "bind_addr": NS_ADDR_A, "bind_port": src_port,
-                    "target_addr": NS_ADDR_B, "target_port": dst_port,
-                    "flags": "ack", "seq": drop_seq, "ack": 1, "payload": "slot-control",
-                },
-            )
-            assert_completed(control_result, "suppress reserved slot before half-space boundary")
             jump_result = run_netns_scenario(
                 vm,
                 NS_A,
@@ -1507,7 +1302,7 @@ def test_ignore_slot_disarms_after_half_space_ack_advance(phantun_module, vm):
             assert_completed(jump_result, f"inject {label}")
 
         mid = read_module_stats(vm)
-        assert mid["shaping_payloads_dropped"] == before_controls["shaping_payloads_dropped"] + 2
+        assert mid["shaping_payloads_dropped"] == before_controls["shaping_payloads_dropped"]
         # A payload at the armed sequence itself: with the slot disarmed it
         # must reach the application instead of being eaten as shaping traffic.
         # Its payload differs from REQ so the still-installed drop rule does
@@ -1638,6 +1433,8 @@ def test_duplicate_final_ack_during_responder_completion_is_single_winner(phantu
 
         baseline_rst = rst_probe.packets(vm, "duplicate_final_ack_rst")
 
+        # Pure final-ACK retries must not complete the generation twice.
+        # Repeated shaping-payload hiding is not a one-shot guarantee.
         for _ in range(5):
             duplicate = run_netns_scenario(
                 vm,
@@ -1651,7 +1448,6 @@ def test_duplicate_final_ack_during_responder_completion_is_single_winner(phantu
                     "seq": final_ack_data["seq"],
                     "ack": final_ack_data["ack"],
                     "flags": "ack",
-                    "payload": REQ,
                 },
             )
             assert_completed(duplicate, "inject duplicate final ACK during completion")

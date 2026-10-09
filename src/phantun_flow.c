@@ -1287,20 +1287,19 @@ static void pht_flow_store_queued_tx_meta_locked(struct pht_flow *flow,
         pht_tx_meta_init(&flow->queued_tx_meta);
 }
 
-/* On success the flow takes ownership of @skb. On failure the caller still
- * owns @skb and must decide whether to free or reuse it.
+/* Only QUEUED transfers @skb. FULL retains ownership with the caller, while
+ * RETRY asks LOCAL_OUT to dispatch against fresh state without touching skb or
+ * metadata. Completion uses this lock too, so no stale half-open snapshot can
+ * enqueue after the completion flush.
  */
-bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
-                                 const struct pht_tx_meta *meta) {
-    bool queued = false;
-
-    if (!flow)
-        return false;
+enum pht_flow_queue_result pht_flow_queue_half_open_skb(struct pht_flow *flow, struct sk_buff *skb,
+                                                       const struct pht_tx_meta *meta) {
+    enum pht_flow_queue_result result = PHT_FLOW_QUEUE_FULL;
 
     spin_lock_bh(&flow->lock);
-    if (flow->state == PHT_FLOW_STATE_DEAD) {
+    if (!pht_flow_state_is_half_open(flow->state)) {
         spin_unlock_bh(&flow->lock);
-        return false;
+        return PHT_FLOW_QUEUE_RETRY;
     }
     if (meta)
         flow->local_tx_meta = *meta;
@@ -1308,11 +1307,11 @@ bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
         flow->queued_skb = skb;
         pht_flow_store_queued_tx_meta_locked(flow, meta);
         flow->last_activity_jiffies = jiffies;
-        queued = true;
+        result = PHT_FLOW_QUEUE_QUEUED;
     }
     spin_unlock_bh(&flow->lock);
 
-    return queued;
+    return result;
 }
 
 /* The flow takes ownership of @skb. Any previously queued skb is released
@@ -1384,8 +1383,8 @@ pht_flow_complete_handshake(struct pht_flow *flow,
     flow->peer_syn_next = args->peer_syn_next;
     flow->local_seq_window_start = flow->local_isn;
     flow->remote_seq_window_start = args->peer_syn_next;
-    flow->reserved_shaping_rx_seq = args->ack;
-    flow->reserved_shaping_rx_active = args->reserve_shaping_rx_slot;
+    flow->one_shot_shaping_rx_seq = args->ack;
+    flow->one_shot_shaping_rx_pending = args->reserve_one_shot_shaping_rx;
     flow->opening_rx_payload_claimed = args->remote_payload_len > 0;
     if (flow->opening_rx_payload_claimed) {
         flow->opening_rx_seq_start = args->remote_payload_seq;
@@ -1394,7 +1393,6 @@ pht_flow_complete_handshake(struct pht_flow *flow,
         flow->opening_rx_seq_start = 0;
         flow->opening_rx_seq_end = 0;
     }
-    flow->response_pending_ack = args->response_pending_ack;
     flow->state = PHT_FLOW_STATE_ESTABLISHED;
     flow->last_activity_jiffies = now;
     flow->retries_done = 0;
@@ -1406,9 +1404,11 @@ pht_flow_complete_handshake(struct pht_flow *flow,
         flow->replacement_protect_active = false;
     }
 
-    if (args->reserve_shaping_rx_slot && args->remote_payload_len > 0 &&
-        args->remote_payload_seq == args->ack)
+    if (flow->one_shot_shaping_rx_pending && args->remote_payload_len > 0 &&
+        args->remote_payload_seq == flow->one_shot_shaping_rx_seq) {
         drop_payload = true;
+        flow->one_shot_shaping_rx_pending = false;
+    }
     spin_unlock_bh(&flow->lock);
 
     if (drop_open_payload)

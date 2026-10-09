@@ -1,5 +1,6 @@
-"""Local fake-TCP send (OUTPUT) failures in every handshake and established state."""
+"""Terminal local OUTPUT failures and transient fake-TCP output queue pressure."""
 
+import json
 import time
 import uuid
 
@@ -15,17 +16,21 @@ from helpers import (
     REQ,
     RESP,
     VETH_A,
+    VETH_B,
     assert_completed,
     cleanup_netns_topology,
     ensure_netns_topology,
     load_managed_module,
     make_netns_ingress_flag_drop_probe,
+    make_netns_ingress_payload_drop_probe,
     make_netns_output_flag_probe,
     make_netns_tcp_payload_probe,
     parse_guest_json,
     read_module_stats,
     received_messages,
+    reply_messages,
     require_guest_command,
+    run_in_netns,
     run_netns_scenario,
     spawn_netns_scenario,
     wait_for_flows_current,
@@ -450,6 +455,93 @@ def test_handshake_response_emit_failure_tears_down_responder_generation(phantun
         response_drop.cleanup(vm)
         if server.proc.poll() is None:
             server.terminate()
+        cleanup_netns_topology(vm)
+
+
+@pytest.mark.parametrize("control", ["request", "response"])
+def test_transient_shaping_output_pressure_keeps_application_progress(phantun_module, vm, control):
+    load_managed_module(phantun_module, handshake_request=REQ, handshake_response=RESP)
+    ensure_netns_topology(vm)
+    for command in ("tc", "nft"):
+        if not require_guest_command(vm, command):
+            cleanup_netns_topology(vm)
+            pytest.skip(f"{command} is not available in the guest")
+
+    src_port, dst_port = PORTS_A[0], PORTS_B[0]
+    namespace, device = (NS_A, VETH_A) if control == "request" else (NS_B, VETH_B)
+    source, destination = (src_port, dst_port) if control == "request" else (dst_port, src_port)
+    payload = REQ if control == "request" else RESP
+    ready = f"/tmp/phantun-control-pressure-{uuid.uuid4().hex}"
+    server = None
+    request_drop = None
+    try:
+        # A zero-capacity child queue returns NET_XMIT_DROP for the selected
+        # hint. Unlike netem random loss, this exercises local output pressure.
+        run_in_netns(vm, namespace, ["tc", "qdisc", "add", "dev", device, "root",
+                                    "handle", "1:", "prio"])
+        run_in_netns(vm, namespace, ["tc", "qdisc", "add", "dev", device, "parent", "1:3",
+                                    "handle", "30:", "netem", "limit", "0"])
+        run_in_netns(
+            vm, namespace,
+            ["tc", "filter", "add", "dev", device, "parent", "1:", "protocol", "ip",
+             "prio", "1", "u32", "match", "ip", "protocol", "6", "0xff",
+             "match", "u16", str(source), "0xffff", "at", "20",
+             "match", "u16", str(destination), "0xffff", "at", "22",
+             "match", "u32", "0x" + payload[:4].encode().hex(), "0xffffffff", "at", "40",
+             "flowid", "1:3"],
+        )
+        if control == "response":
+            # Establish with real application data, not the missing request.
+            # The failed response cannot wait for more client data to release UDP.
+            request_drop = make_netns_ingress_payload_drop_probe(
+                vm, NS_B, VETH_B,
+                [{
+                    "src_addr": NS_ADDR_A, "src_port": src_port,
+                    "dst_addr": NS_ADDR_B, "dst_port": dst_port,
+                    "payload": REQ, "comment": "lost_request_before_pressure",
+                }],
+            )
+        server = spawn_netns_scenario(
+            vm, NS_B, "recv_many_reply",
+            {"bind_addr": NS_ADDR_B, "bind_port": dst_port, "count": 1,
+             "replies": ["reply-after-pressure"], "ready_file": ready, "timeout_sec": 20},
+        )
+        wait_for_guest_ready_file(vm, ready, timeout=10)
+        baseline = read_module_stats(vm)
+        client_result = run_netns_scenario(
+            vm, NS_A, "send_many_recv",
+            {"bind_addr": NS_ADDR_A, "bind_port": src_port,
+             "target_addr": NS_ADDR_B, "target_port": dst_port,
+             "payloads": ["one-client-datagram"], "recv_count": 1, "timeout_sec": 20},
+            timeout=25,
+        )
+        assert_completed(client_result, "client under shaping output pressure")
+        server_result = server.communicate(timeout=25)
+        assert_completed(server_result, "server under shaping output pressure")
+        assert received_messages(parse_guest_json(server_result.stdout, "pressure server")) == [
+            "one-client-datagram"
+        ]
+        assert reply_messages(parse_guest_json(client_result.stdout, "pressure client")) == [
+            "reply-after-pressure"
+        ]
+        result = run_in_netns(vm, namespace, ["tc", "-j", "-s", "qdisc", "show", "dev", device])
+        queues = json.loads(result.stdout)
+        assert any(q["kind"] == "netem" and q.get("drops", 0) > 0 for q in queues), queues
+        stats = read_module_stats(vm)
+        counter = f"{control}_payloads_injected"
+        assert stats[counter] == baseline[counter], "pressure was not reported as local output failure"
+        assert stats["flows_created"] == baseline["flows_created"] + 2
+        assert stats["flows_established"] == baseline["flows_established"] + 2
+        assert stats["rst_sent"] == baseline["rst_sent"]
+        if request_drop is not None:
+            assert request_drop.packets(vm, "lost_request_before_pressure") > 0
+    finally:
+        if server is not None and server.proc.poll() is None:
+            server.terminate()
+        if request_drop is not None:
+            request_drop.cleanup(vm)
+        run_in_netns(vm, namespace, ["tc", "qdisc", "del", "dev", device, "root"], check=False)
+        vm.run(["rm", "-f", ready], check=False)
         cleanup_netns_topology(vm)
 
 
