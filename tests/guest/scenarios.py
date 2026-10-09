@@ -129,7 +129,8 @@ def echo_server(config):
                 data, addr = sock.recvfrom(2048)
                 text = data.decode()
                 payloads.append(text)
-                sock.sendto(data, addr)
+                if len(payloads) <= config.get("echo_count", target_count):
+                    sock.sendto(data, addr)
         finally:
             if ready_file:
                 Path(ready_file).unlink(missing_ok=True)
@@ -150,6 +151,74 @@ def echo_client(config):
             echoed.append(reply.decode())
 
     _emit({"sent": payloads, "echoed": echoed})
+
+
+def liveness_window(config):
+    """Observe packet counters and optional UDP output on the guest clock."""
+    stat_names = (
+        "flows_created", "flows_current", "flows_established",
+        "established_liveness_timeouts", "rst_sent",
+        "oversized_payloads_dropped", "route_cache_hits",
+    )
+
+    def snapshot():
+        nft = json.loads(subprocess.check_output(
+            ["nft", "-j", "list", "chain", config["family"],
+             config["table_name"], config["chain_name"]], text=True,
+        ))
+        packets = {}
+        for item in nft.get("nftables", []):
+            rule = item.get("rule", {})
+            for expr in rule.get("expr", []):
+                if "counter" in expr:
+                    packets[rule.get("comment", "")] = expr["counter"]["packets"]
+        root = Path("/sys/module/phantun/stats")
+        return {
+            "packets": packets,
+            "stats": {name: int((root / name).read_text()) for name in stat_names},
+        }
+
+    sock = None
+    sent = 0
+    max_send_gap = 0
+    previous_send = None
+    try:
+        if "payload" in config:
+            sock = _socket(config["bind_addr"], config["bind_port"], config.get("timeout_sec"))
+            target = _addr_tuple(config["target_addr"], config["target_port"])
+            payload = config["payload"].encode()
+
+            # Establish recent successful TX before the probe counter baseline.
+            if config.get("warmup"):
+                sock.sendto(payload, target)
+
+        start = time.monotonic()
+        before = snapshot()
+        deadline = time.monotonic() + config["duration_sec"]
+        while time.monotonic() < deadline:
+            if config.get("stop_on_liveness_timeout"):
+                timeouts = int(Path(
+                    "/sys/module/phantun/stats/established_liveness_timeouts"
+                ).read_text())
+                if timeouts > before["stats"]["established_liveness_timeouts"]:
+                    break
+            if sock is not None:
+                now = time.monotonic()
+                if previous_send is not None:
+                    max_send_gap = max(max_send_gap, now - previous_send)
+                previous_send = now
+                sock.sendto(payload, target)
+                sent += 1
+            time.sleep(config.get("period_ms", 100) / 1000)
+        after = snapshot()
+        _emit({
+            "before": before, "after": after, "sent": sent,
+            "elapsed_sec": time.monotonic() - start,
+            "max_send_gap_sec": max_send_gap,
+        })
+    finally:
+        if sock is not None:
+            sock.close()
 
 
 def recv_many(config):
@@ -949,15 +1018,26 @@ def send_tcp_packet(config):
 def send_tcp_packets(config):
     packets = config["packets"]
     delay_sec = config.get("delay_ms", 0) / 1000.0
+    ready_file = config.get("ready_file")
+    stop_file = config.get("stop_file")
+    sent = 0
 
-    with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW) as raw_sock:
-        raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        for index, packet in enumerate(packets):
-            raw_sock.sendto(_build_ipv4_tcp_packet(packet), (packet["target_addr"], 0))
-            if delay_sec and index + 1 < len(packets):
-                time.sleep(delay_sec)
-
-    _emit({"sent": len(packets)})
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW) as raw_sock:
+            raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            for index, packet in enumerate(packets):
+                if stop_file and Path(stop_file).exists():
+                    break
+                raw_sock.sendto(_build_ipv4_tcp_packet(packet), (packet["target_addr"], 0))
+                sent += 1
+                if sent == 1 and ready_file:
+                    Path(ready_file).write_text("ready\n")
+                if delay_sec and index + 1 < len(packets):
+                    time.sleep(delay_sec)
+        _emit({"sent": sent})
+    finally:
+        if ready_file:
+            Path(ready_file).unlink(missing_ok=True)
 
 
 def send_ipv4_udp_fragments(config):
@@ -1248,6 +1328,7 @@ SCENARIOS = {
     "ping_client": ping_client,
     "echo_server": echo_server,
     "echo_client": echo_client,
+    "liveness_window": liveness_window,
     "recv_many": recv_many,
     "send_many": send_many,
     "send_ipv6_udp_options": send_ipv6_udp_options,

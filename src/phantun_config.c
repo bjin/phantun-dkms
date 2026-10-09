@@ -71,9 +71,9 @@ module_param(handshake_retries, uint, 0444);
 MODULE_PARM_DESC(handshake_retries,
                  "Maximum handshake retry count before tearing a flow down with RST");
 module_param(keepalive_interval_sec, uint, 0444);
-MODULE_PARM_DESC(keepalive_interval_sec, "Idle time in seconds before sending a keepalive ACK");
+MODULE_PARM_DESC(keepalive_interval_sec, "Transmit-idle interval in seconds before a keepalive ACK");
 module_param(keepalive_misses, uint, 0444);
-MODULE_PARM_DESC(keepalive_misses, "Number of unanswered keepalives before flow teardown");
+MODULE_PARM_DESC(keepalive_misses, "Inbound-silence response intervals after the first probe interval");
 module_param(hard_idle_timeout_sec, uint, 0444);
 MODULE_PARM_DESC(hard_idle_timeout_sec, "Maximum idle flow timeout in seconds (hard GC limit)");
 module_param(reopen_guard_bytes, uint, 0444);
@@ -342,8 +342,8 @@ static int phantun_validate_keepalive_jiffies(void) {
     unsigned long interval;
 
     interval = msecs_to_jiffies(keepalive_interval_sec * 1000U);
-    if (interval && keepalive_misses > LONG_MAX / interval) {
-        pht_pr_err("keepalive_interval_sec * keepalive_misses exceeds signed jiffies range\n");
+    if (interval && (u64)keepalive_misses + 1 > LONG_MAX / interval) {
+        pht_pr_err("keepalive_interval_sec * (keepalive_misses + 1) exceeds signed jiffies range\n");
         return -EINVAL;
     }
     return 0;

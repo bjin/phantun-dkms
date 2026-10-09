@@ -342,8 +342,8 @@ def load_managed_module(phantun_module, **kwargs):
 
 
 def load_fast_liveness_module(phantun_module, **kwargs):
-    # 1s keepalive interval x 2 misses: established flows lose liveness after
-    # about 2s, so recovery tests can force teardown/replacement quickly.
+    # 1s interval plus 2 response intervals: inbound silence loses liveness
+    # after about 3s, so recovery tests can force teardown/replacement quickly.
     load_managed_module(
         phantun_module,
         keepalive_interval_sec=1,
@@ -383,11 +383,11 @@ def cleanup_netns_topology(vm, namespaces=(NS_A, NS_B)):
         vm.run(["ip", "netns", "del", namespace], check=False)
 
 
-def ensure_netns_topology(vm, with_ipv6=False):
+def ensure_netns_topology(vm, with_ipv6=False, namespace_delay_sec=0):
     cleanup_netns_topology(vm)
 
-    vm.run(["ip", "netns", "add", NS_A])
-    vm.run(["ip", "netns", "add", NS_B])
+    # One guest command controls relative namespace/GC initialization phases.
+    vm.run(f"ip netns add {NS_A} && sleep {namespace_delay_sec} && ip netns add {NS_B}")
     vm.run(["ip", "link", "add", VETH_A, "type", "veth", "peer", "name", VETH_B])
     vm.run(["ip", "link", "set", VETH_A, "netns", NS_A])
     vm.run(["ip", "link", "set", VETH_B, "netns", NS_B])

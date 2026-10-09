@@ -270,13 +270,28 @@ Validation rules:
 | `handshake_response` | empty | Optional responder payload; effective only when `handshake_request` is also set. |
 | `handshake_timeout_ms` | `1000` | Handshake retransmit timeout. |
 | `handshake_retries` | `6` | Maximum handshake retry count before `RST` teardown. |
-| `keepalive_interval_sec` | `30` | Idle period before sending keepalive ACK. |
-| `keepalive_misses` | `3` | Unanswered keepalives allowed before teardown. |
+| `keepalive_interval_sec` | `30` | Transmit-idle interval before a keepalive ACK. Successful nonterminal output postpones it; inbound traffic does not. |
+| `keepalive_misses` | `3` | Positive number of response intervals after the first probe opportunity. Teardown follows `(keepalive_misses + 1) * keepalive_interval_sec` of inbound silence, not a count of unanswered packets. |
 | `hard_idle_timeout_sec` | `300` | Hard upper bound for idle flow lifetime. |
 | `reopen_guard_bytes` | `4194304` | Minimum sequence-space distance before reopening same tuple; accepts `0..1073741823` and rejects values `>= 1073741824`. |
 | `half_open_limit` | `4096` | Maximum concurrent half-open flows per network namespace. New SYN-created or outbound half-open flows beyond this limit are rejected until existing half-open flows establish or time out. |
 | `replacement_quarantine_ms` | `3000` | Previous-generation quarantine window after tuple replacement. Matching old-generation packets are silently dropped during this window. |
 | `replacement_protect_ms` | `0` (auto) | Established-initiator bare-SYN replacement protection window. During the window, aligned bare replacement SYNs to an established initiator are silently dropped to suppress stale simultaneous-initiation loser SYNs. After the window expires, normal replacement handling resumes. |
+
+Both endpoints independently send keepalives, including when receiving the
+peer's pure ACKs. Upgrade **both endpoints** for healthy idle survival; an older
+inbound-driven peer can still suppress its own probes. Successful local output
+does not prove peer delivery and never refreshes inbound liveness. Failed
+keepalive sends are paced at one attempt per interval, not retried every GC scan.
+The 250 ms payload-ACK suppression optimization is separate.
+
+`keepalive_misses=1` is supported: the silence timeout is two intervals, allowing
+one nominal response interval after the first probe opportunity. GC delay and
+network latency consume that margin, so choose larger values for noisy or
+high-latency paths. Defaults give a 120-second inbound-silence timeout.
+Seconds-based timers must fit their millisecond conversion, and the complete
+silence timeout must fit the kernel's signed jiffies range. Hard-idle expiry
+still takes precedence and tears down silently.
 
 ### Shaping payload formats
 
@@ -414,7 +429,7 @@ can increment both an aggregate and a more specific reason counter:
 | `flows_current` | Flow objects currently present in the flow table. |
 | `half_open_rejected` | Valid half-open openers rejected because the per-netns half-open limit was full. |
 | `handshake_retries_exhausted` | Half-open flows torn down after the handshake retransmit budget ran out. |
-| `established_liveness_timeouts` | Established flows torn down after missing too many keepalives. |
+| `established_liveness_timeouts` | Established flows torn down after the configured inbound-silence timeout. |
 | **Replacement and simultaneous-init recovery** | |
 | `replacements_accepted` | Established flows that accepted a valid bare, aligned replacement SYN on the same tuple. |
 | `replacement_quarantine_dropped` | Delayed previous-generation packets silently dropped during the replacement quarantine window. Bare SYNs are not quarantine drops. |

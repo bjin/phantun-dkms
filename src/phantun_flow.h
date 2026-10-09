@@ -155,13 +155,16 @@ struct pht_flow {
     unsigned int max_retries;
     unsigned long last_activity_jiffies;
     unsigned long last_inbound_jiffies;
+    /* TX-idle probe deadline, independent of accepted RX. Failed probes also
+     * reserve an interval; use 64 bits across long-lived 32-bit jiffies wraps.
+     */
+    u64 next_probe_jiffies;
     /* 64-bit so an expired ACK-suppression marker can never become recent
      * again when 32-bit jiffies wraps on long-lived receive-heavy flows.
      */
     u64 last_established_payload_tx_jiffies;
     unsigned long quarantine_until_jiffies;
     unsigned long replacement_protect_until_jiffies;
-    unsigned int keepalives_sent;
     /* Last successful routed egress device toward the remote peer. Used only
      * for best-effort invalidation when that device goes away.
      */
@@ -215,12 +218,12 @@ struct pht_flow_table {
     struct list_head finalize_list;
     spinlock_t finalize_lock;
     unsigned long keepalive_interval_jiffies;
+    unsigned long liveness_timeout_jiffies;
     unsigned long idle_ack_suppression_window_jiffies;
     unsigned long hard_idle_timeout_jiffies;
     unsigned long handshake_timeout_jiffies;
     unsigned long replacement_protect_jiffies;
     unsigned long gc_interval_jiffies;
-    unsigned int keepalive_misses;
     unsigned int handshake_retries;
     unsigned int half_open_limit;
     unsigned int half_open_current;
@@ -275,10 +278,26 @@ static inline void pht_flow_touch_inbound_locked(struct pht_flow *flow) {
     lockdep_assert_held(&flow->lock);
     flow->last_inbound_jiffies = now;
     flow->last_activity_jiffies = now;
-    flow->keepalives_sent = 0;
 }
 
 void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex);
+/* Successful nonterminal output only; callers retain a ref across emission.
+ * Neither helper changes inbound liveness or hard-idle activity. The locked
+ * helper returns the completion timestamp (zero for DEAD) for payload tracking.
+ */
+static inline u64 pht_flow_note_output_locked(struct pht_flow *flow, int ifindex) {
+    u64 now;
+
+    lockdep_assert_held(&flow->lock);
+    if (flow->state == PHT_FLOW_STATE_DEAD)
+        return 0;
+    now = get_jiffies_64();
+    flow->next_probe_jiffies = now + flow->table->keepalive_interval_jiffies;
+    flow->egress_ifindex = ifindex;
+    return now;
+}
+
+void pht_flow_note_output(struct pht_flow *flow, int ifindex);
 bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
                                  const struct pht_tx_meta *meta);
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb,

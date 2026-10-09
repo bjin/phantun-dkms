@@ -179,6 +179,29 @@ def test_module_rejects_oversized_second_timer_param(phantun_module, vm):
         vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
 
 
+@pytest.mark.parametrize("misses,accepted", [(1, True), (2, False), (4294967295, False)])
+def test_keepalive_silence_timeout_signed_range(phantun_module, vm, misses, accepted):
+    # A valid uint millisecond value with its sign bit set converts to
+    # MAX_JIFFY_OFFSET == (LONG_MAX >> 1) - 1 on supported kernels. Two such
+    # intervals fit; three do not, on both 32-bit and 64-bit kernels. UINT_MAX
+    # also checks that adding the first interval cannot wrap the miss count.
+    phantun_module.unload()
+    vm.run(
+        "echo 'options phantun managed_local_ports=1234 "
+        f"keepalive_interval_sec=4294967 keepalive_misses={misses}' "
+        "> /etc/modprobe.d/phantun.conf"
+    )
+    try:
+        result = vm.run(["modprobe", "phantun"], check=False)
+        if accepted:
+            assert result.returncode == 0, (result.stdout, result.stderr)
+        else:
+            assert_modprobe_rejected(result, "complete keepalive silence timeout")
+    finally:
+        phantun_module.unload()
+        vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
+
+
 def test_module_rejects_missing_selectors(phantun_module, vm):
     phantun_module.unload()
     vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])

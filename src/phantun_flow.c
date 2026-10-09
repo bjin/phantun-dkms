@@ -156,7 +156,7 @@ static int pht_flow_retransmit_now(struct pht_flow *flow) {
 
     ret = pht_emit_fake_tcp(flow->table->net, &ep, seq, ack, flags, NULL, 0, &meta, &ifindex);
     if (!ret)
-        pht_flow_set_egress_ifindex(flow, ifindex);
+        pht_flow_note_output(flow, ifindex);
     return ret;
 }
 
@@ -429,7 +429,8 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
         msecs_to_jiffies(PHT_FLOW_IDLE_ACK_SUPPRESSION_WINDOW_MS);
     if (table->idle_ack_suppression_window_jiffies == 0)
         table->idle_ack_suppression_window_jiffies = 1;
-    table->keepalive_misses = cfg->keepalive_misses;
+    table->liveness_timeout_jiffies =
+        table->keepalive_interval_jiffies * ((u64)cfg->keepalive_misses + 1);
     table->hard_idle_timeout_jiffies = msecs_to_jiffies(cfg->hard_idle_timeout_sec * 1000U);
     table->half_open_limit = cfg->half_open_limit;
     table->hash_seed = get_random_u32();
@@ -508,10 +509,8 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
             } else {
                 bool hard_expired = time_after_eq(now, flow->last_activity_jiffies +
                                                            table->hard_idle_timeout_jiffies);
-                bool liveness_failed = table->keepalive_interval_jiffies > 0 &&
-                                       time_after_eq(now, flow->last_inbound_jiffies +
-                                                              (table->keepalive_interval_jiffies *
-                                                               table->keepalive_misses));
+                bool liveness_failed = time_after_eq(now, flow->last_inbound_jiffies +
+                                                             table->liveness_timeout_jiffies);
                 if (hard_expired) {
                     expired_flow = true;
                 } else if (liveness_failed) {
@@ -521,12 +520,8 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
                     flow->state = PHT_FLOW_STATE_DEAD;
                     is_liveness_failure = true;
                 } else if (flow->state == PHT_FLOW_STATE_ESTABLISHED &&
-                           table->keepalive_interval_jiffies > 0 &&
-                           time_after_eq(now, flow->last_inbound_jiffies +
-                                                  table->keepalive_interval_jiffies *
-                                                      (flow->keepalives_sent + 1))) {
+                           time_after_eq64(get_jiffies_64(), flow->next_probe_jiffies)) {
                     send_keepalive = true;
-                    flow->keepalives_sent++;
                 }
             }
 
@@ -567,8 +562,8 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
 }
 
 /* Keepalive candidates are collected under bucket locks with a temporary ref,
- * then transmitted here lockless. flow->table is immutable after create, so
- * ESTABLISHED is the meaningful revalidation before sampling or saving state.
+ * then transmitted here without bucket/flow locks. Recheck the deadline in case
+ * concurrent output postponed it, and reserve an interval even if output fails.
  * The ACK seq is sampled under flow->lock rather than tx_lock; a concurrent
  * transmit rollback is benign because keepalives are pure ACKs with no payload.
  */
@@ -578,6 +573,7 @@ static void pht_flow_emit_keepalives(struct pht_flow_table *table, struct list_h
         struct pht_tx_meta meta;
         struct pht_flow *flow = list_first_entry(keepalives, struct pht_flow, keepalive_node);
         u32 seq;
+        u64 now;
         u32 ack;
         int ifindex;
         int ret;
@@ -586,8 +582,11 @@ static void pht_flow_emit_keepalives(struct pht_flow_table *table, struct list_h
         list_del_init(&flow->keepalive_node);
 
         spin_lock_bh(&flow->lock);
-        live = flow->state == PHT_FLOW_STATE_ESTABLISHED;
+        now = get_jiffies_64();
+        live = flow->state == PHT_FLOW_STATE_ESTABLISHED &&
+               time_after_eq64(now, flow->next_probe_jiffies);
         if (live) {
+            flow->next_probe_jiffies = now + table->keepalive_interval_jiffies;
             ep = flow->endpoints;
             seq = flow->seq;
             ack = flow->ack;
@@ -598,12 +597,8 @@ static void pht_flow_emit_keepalives(struct pht_flow_table *table, struct list_h
         if (live && table->net) {
             ret = pht_emit_fake_tcp(table->net, &ep, seq, ack, PHT_TCP_FLAG_ACK, NULL, 0, &meta,
                                     &ifindex);
-            if (!ret) {
-                spin_lock_bh(&flow->lock);
-                if (flow->state == PHT_FLOW_STATE_ESTABLISHED)
-                    flow->egress_ifindex = ifindex;
-                spin_unlock_bh(&flow->lock);
-            }
+            if (!ret)
+                pht_flow_note_output(flow, ifindex);
         }
 
         pht_flow_put(flow);
@@ -949,6 +944,7 @@ struct pht_flow *pht_flow_create(struct pht_flow_table *table, const struct pht_
     flow->max_retries = table->handshake_retries;
     flow->last_activity_jiffies = jiffies;
     flow->last_inbound_jiffies = jiffies;
+    flow->next_probe_jiffies = get_jiffies_64() + table->keepalive_interval_jiffies;
     return flow;
 }
 
@@ -1184,6 +1180,12 @@ void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex) {
 
     spin_lock_bh(&flow->lock);
     flow->egress_ifindex = ifindex;
+    spin_unlock_bh(&flow->lock);
+}
+
+void pht_flow_note_output(struct pht_flow *flow, int ifindex) {
+    spin_lock_bh(&flow->lock);
+    pht_flow_note_output_locked(flow, ifindex);
     spin_unlock_bh(&flow->lock);
 }
 

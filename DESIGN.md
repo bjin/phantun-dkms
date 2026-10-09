@@ -298,6 +298,7 @@ Each flow stores:
 - responder control-response pending-ACK / pending-release flag
 - retransmit timer state, with expiry owned by the kernel timer itself
 - idle and inbound-liveness timestamps
+- independent 64-bit next-probe deadline, initialized to creation time plus the keepalive interval
 - last successful established local-payload transmit timestamp for ACK suppression
 - initiator bare-`SYN` replacement-protection deadline
 - refcount and lock
@@ -362,12 +363,26 @@ Behavior:
 - that immediate payload `ACK` may be skipped only when this endpoint sent established fake-TCP payload data on the same flow within the fixed 250 ms suppression window
 - reserved first-payload control drops still send the immediate pure `ACK`; they are not eligible for suppression
 - receive-only flows and flows outside that window keep the previous immediate pure-`ACK` behavior
-- after `keepalive_interval_sec` without valid inbound traffic: send pure `ACK` keepalive
-- the suppression window does not change this inbound-driven liveness rule
-- after `keepalive_misses * keepalive_interval_sec` without valid inbound traffic: send a best-effort `RST` if the stored route/source identity can still transmit, then destroy local state
+- after `keepalive_interval_sec` without successful nonterminal flow output: send pure `ACK` keepalive; accepted RX never postpones this independent transmit-idle schedule
+- every successful flow-associated SYN, SYN|ACK, handshake retry, shaping control, pure ACK, or application payload (including queued/final-ACK payload and cached-route output) postpones the next probe by one interval; local output acceptance is not peer acknowledgement
+- GC collects due candidates with a temporary reference, then rechecks state and deadline under the flow lock before reserving `now + interval`; output runs outside bucket/flow locks, failed attempts keep the reservation, and successful completion advances it again using time sampled under the lock
+- the deadline uses 64-bit jiffies, with no catch-up bursts after delayed work; output completing after death and terminal RST output never reschedule the generation
+- the separate 250 ms payload-ACK suppression marker and existing hard-idle activity updates remain unchanged; keepalive attempts do not refresh hard-idle activity or inbound liveness
+- after `(keepalive_misses + 1) * keepalive_interval_sec` without valid inbound traffic: send a best-effort `RST` if the stored route/source identity can still transmit, then destroy local state
   - if RST emission fails, destroy local state silently
   - if one outbound UDP skb is already queued, create fresh `SYN_SENT`, carry that skb, send `SYN`
   - otherwise wait for future outbound UDP
+
+`keepalive_misses` counts nominal response intervals after the first probe
+opportunity, not actual unanswered packets. A value of 1 is supported and gives
+two intervals of inbound silence, leaving a full nominal response interval
+after the first probe is due. GC runs at `min(30 seconds, interval / 2)` (at
+least one jiffy); scheduling delay and RTT still consume that response window.
+The complete silence timeout is validated against the signed jiffies range
+before multiplication, including the extra interval. Hard-idle expiry retains
+precedence and is silent. Both endpoints must use independent scheduling for
+healthy idle survival: new probes can still suppress an older peer's
+inbound-driven schedule. Pure ACKs are not answered merely to sustain liveness.
 
 Inbound flag priority in established state:
 
