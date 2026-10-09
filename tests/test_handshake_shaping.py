@@ -299,9 +299,7 @@ def test_consumed_shaping_slot_delivers_wrapped_application_and_duplicates(
     phantun_module, vm, control_payload, delayed_control
 ):
     response_enabled = control_payload == RESP
-    load_managed_module(
-        phantun_module, handshake_request=REQ, handshake_response=RESP if response_enabled else ""
-    )
+    load_managed_module(phantun_module, handshake_request=REQ, handshake_response=RESP if response_enabled else "")
     ensure_netns_topology(vm)
     if delayed_control and not require_guest_command(vm, "nft"):
         cleanup_netns_topology(vm)
@@ -338,12 +336,19 @@ def test_consumed_shaping_slot_delivers_wrapped_application_and_duplicates(
     try:
         if delayed_control:
             drop_control = make_netns_ingress_payload_drop_probe(
-                vm, receiver_ns, VETH_A if response_enabled else VETH_B,
-                [{
-                    "src_addr": endpoints["bind_addr"], "src_port": endpoints["bind_port"],
-                    "dst_addr": endpoints["target_addr"], "dst_port": endpoints["target_port"],
-                    "payload": control_payload, "comment": "delay_first_hint",
-                }],
+                vm,
+                receiver_ns,
+                VETH_A if response_enabled else VETH_B,
+                [
+                    {
+                        "src_addr": endpoints["bind_addr"],
+                        "src_port": endpoints["bind_port"],
+                        "dst_addr": endpoints["target_addr"],
+                        "dst_port": endpoints["target_port"],
+                        "payload": control_payload,
+                        "comment": "delay_first_hint",
+                    }
+                ],
             )
         wait_for_guest_ready_file(vm, final_ack_ready, timeout=5)
         server = spawn_netns_scenario(
@@ -419,9 +424,16 @@ def test_consumed_shaping_slot_delivers_wrapped_application_and_duplicates(
             drop_control.cleanup(vm)
             assert_completed(
                 run_netns_scenario(
-                    vm, sender_ns, "send_tcp_packet",
-                    {**endpoints, "flags": "ack", "seq": final_ack_data["seq"],
-                     "ack": final_ack_data["ack"], "payload": control_payload},
+                    vm,
+                    sender_ns,
+                    "send_tcp_packet",
+                    {
+                        **endpoints,
+                        "flags": "ack",
+                        "seq": final_ack_data["seq"],
+                        "ack": final_ack_data["ack"],
+                        "payload": control_payload,
+                    },
                 ),
                 "inject first delayed hint after application delivery",
             )
@@ -576,12 +588,19 @@ def test_lost_shaping_hints_allow_reply_without_more_client_data(phantun_module,
     request_probe = None
     if lose_request:
         request_probe = make_netns_ingress_payload_drop_probe(
-            vm, NS_B, VETH_B,
-            [{
-                "src_addr": NS_ADDR_A, "src_port": src_port,
-                "dst_addr": NS_ADDR_B, "dst_port": dst_port,
-                "payload": REQ, "comment": "drop_req",
-            }],
+            vm,
+            NS_B,
+            VETH_B,
+            [
+                {
+                    "src_addr": NS_ADDR_A,
+                    "src_port": src_port,
+                    "dst_addr": NS_ADDR_B,
+                    "dst_port": dst_port,
+                    "payload": REQ,
+                    "comment": "drop_req",
+                }
+            ],
         )
     ready_file = f"/tmp/phantun-lost-hints-{uuid.uuid4().hex}"
     server = spawn_netns_scenario(
@@ -644,8 +663,12 @@ def test_lost_shaping_hints_allow_reply_without_more_client_data(phantun_module,
 
 def test_completion_releases_handshake_queue_with_lost_response_and_delayed_request(phantun_module, vm):
     load_managed_module(
-        phantun_module, handshake_request=REQ, handshake_response=RESP,
-        handshake_timeout_ms=30000, handshake_retries=3, keepalive_interval_sec=60,
+        phantun_module,
+        handshake_request=REQ,
+        handshake_response=RESP,
+        handshake_timeout_ms=30000,
+        handshake_retries=3,
+        keepalive_interval_sec=60,
     )
     ensure_netns_topology(vm)
     if not require_guest_command(vm, "nft"):
@@ -654,24 +677,35 @@ def test_completion_releases_handshake_queue_with_lost_response_and_delayed_requ
 
     src_port, dst_port = PORTS_A[0], PORTS_B[0]
     forward = {
-        "bind_addr": NS_ADDR_A, "bind_port": src_port,
-        "target_addr": NS_ADDR_B, "target_port": dst_port,
+        "bind_addr": NS_ADDR_A,
+        "bind_port": src_port,
+        "target_addr": NS_ADDR_B,
+        "target_port": dst_port,
     }
     reverse = {
-        "bind_addr": NS_ADDR_B, "bind_port": dst_port,
-        "target_addr": NS_ADDR_A, "target_port": src_port,
+        "bind_addr": NS_ADDR_B,
+        "bind_port": dst_port,
+        "target_addr": NS_ADDR_A,
+        "target_port": src_port,
     }
     prefix = f"/tmp/phantun-handshake-queue-{uuid.uuid4().hex}"
     processes, probes = [], []
 
     def drop(namespace, device, endpoints, payload, name):
         probe = make_netns_ingress_payload_drop_probe(
-            vm, namespace, device,
-            [{
-                "src_addr": endpoints["bind_addr"], "src_port": endpoints["bind_port"],
-                "dst_addr": endpoints["target_addr"], "dst_port": endpoints["target_port"],
-                "payload": payload, "comment": name,
-            }],
+            vm,
+            namespace,
+            device,
+            [
+                {
+                    "src_addr": endpoints["bind_addr"],
+                    "src_port": endpoints["bind_port"],
+                    "dst_addr": endpoints["target_addr"],
+                    "dst_port": endpoints["target_port"],
+                    "payload": payload,
+                    "comment": name,
+                }
+            ],
         )
         probes.append(probe)
         return probe
@@ -681,15 +715,18 @@ def test_completion_releases_handshake_queue_with_lost_response_and_delayed_requ
         opening_drop = drop(NS_B, VETH_B, forward, "opening-data", "hold_completion")
         response_drop = drop(NS_A, VETH_A, reverse, RESP, "lose_response")
         capture = spawn_netns_scenario(
-            vm, NS_A, "capture_tcp_packet",
-            {**forward, "payload": REQ, "include_outgoing": True,
-             "ready_file": f"{prefix}-capture", "timeout_sec": 30},
+            vm,
+            NS_A,
+            "capture_tcp_packet",
+            {**forward, "payload": REQ, "include_outgoing": True, "ready_file": f"{prefix}-capture", "timeout_sec": 30},
         )
         processes.append(capture)
         wait_for_guest_ready_file(vm, f"{prefix}-capture", timeout=10)
         baseline = read_module_stats(vm)
         client = spawn_netns_scenario(
-            vm, NS_A, "send_many_recv",
+            vm,
+            NS_A,
+            "send_many_recv",
             {**forward, "payloads": ["opening-data"], "recv_count": 1, "timeout_sec": 30},
         )
         processes.append(client)
@@ -710,16 +747,26 @@ def test_completion_releases_handshake_queue_with_lost_response_and_delayed_requ
         queued = read_module_stats(vm)
         assert queued["udp_packets_queued"] == half_open["udp_packets_queued"] + 1
         server = spawn_netns_scenario(
-            vm, NS_B, "recv_until_timeout",
-            {"bind_addr": NS_ADDR_B, "bind_port": dst_port, "count": 2,
-             "ready_file": f"{prefix}-server", "timeout_sec": 30},
+            vm,
+            NS_B,
+            "recv_until_timeout",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 2,
+                "ready_file": f"{prefix}-server",
+                "timeout_sec": 30,
+            },
         )
         processes.append(server)
         wait_for_guest_ready_file(vm, f"{prefix}-server", timeout=10)
         opening_drop.cleanup(vm)
         application = {
-            **forward, "flags": "ack", "seq": (request["seq"] + len(REQ)) & 0xFFFFFFFF,
-            "ack": request["ack"], "payload": "opening-data",
+            **forward,
+            "flags": "ack",
+            "seq": (request["seq"] + len(REQ)) & 0xFFFFFFFF,
+            "ack": request["ack"],
+            "payload": "opening-data",
         }
         assert_completed(
             run_netns_scenario(vm, NS_A, "send_tcp_packet", application),
@@ -734,23 +781,31 @@ def test_completion_releases_handshake_queue_with_lost_response_and_delayed_requ
         request_drop.cleanup(vm)
         assert_completed(
             run_netns_scenario(
-                vm, NS_A, "send_tcp_packet",
+                vm,
+                NS_A,
+                "send_tcp_packet",
                 {**application, "seq": request["seq"], "payload": REQ},
             ),
             "deliver first delayed request after queued reply",
         )
         assert_completed(
             run_netns_scenario(
-                vm, NS_A, "send_tcp_packet",
-                {**application, "seq": (application["seq"] + len("opening-data")) & 0xFFFFFFFF,
-                 "payload": "after-delayed-hint"},
+                vm,
+                NS_A,
+                "send_tcp_packet",
+                {
+                    **application,
+                    "seq": (application["seq"] + len("opening-data")) & 0xFFFFFFFF,
+                    "payload": "after-delayed-hint",
+                },
             ),
             "send sentinel after delayed request",
         )
         result = server.communicate(timeout=35)
         assert_completed(result, "application receiver across delayed request")
         assert received_messages(parse_guest_json(result.stdout, "delayed request receiver")) == [
-            "opening-data", "after-delayed-hint"
+            "opening-data",
+            "after-delayed-hint",
         ]
         stats = read_module_stats(vm)
         assert stats["shaping_payloads_dropped"] == baseline["shaping_payloads_dropped"] + 1

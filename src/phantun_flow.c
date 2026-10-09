@@ -435,8 +435,7 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
     table->hard_idle_timeout_jiffies = msecs_to_jiffies(cfg->hard_idle_timeout_sec * 1000U);
     table->half_open_limit = cfg->half_open_limit;
     table->half_open_remote_limit =
-        cfg->half_open_limit -
-        (cfg->half_open_limit > 1 ? max(1U, cfg->half_open_limit / 4) : 0);
+        cfg->half_open_limit - (cfg->half_open_limit > 1 ? max(1U, cfg->half_open_limit / 4) : 0);
     table->hash_seed = get_random_u32();
     table->reinject_mark = get_random_u32() | BIT(31);
     table->gc_interval_jiffies = msecs_to_jiffies(PHT_FLOW_GC_INTERVAL_SEC * 1000U);
@@ -514,7 +513,7 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
                 bool hard_expired = time_after_eq(now, flow->last_activity_jiffies +
                                                            table->hard_idle_timeout_jiffies);
                 bool liveness_failed = time_after_eq(now, flow->last_inbound_jiffies +
-                                                             table->liveness_timeout_jiffies);
+                                                              table->liveness_timeout_jiffies);
                 if (hard_expired) {
                     expired_flow = true;
                 } else if (liveness_failed) {
@@ -1297,7 +1296,7 @@ static void pht_flow_store_queued_tx_meta_locked(struct pht_flow *flow,
  * enqueue after the completion flush.
  */
 enum pht_flow_queue_result pht_flow_queue_half_open_skb(struct pht_flow *flow, struct sk_buff *skb,
-                                                       const struct pht_tx_meta *meta) {
+                                                        const struct pht_tx_meta *meta) {
     enum pht_flow_queue_result result = PHT_FLOW_QUEUE_FULL;
 
     spin_lock_bh(&flow->lock);

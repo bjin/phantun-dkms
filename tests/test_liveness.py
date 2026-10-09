@@ -225,10 +225,18 @@ def test_liveness_reinitiates_flow_with_queued_packet(phantun_module, vm):
         assert recovered["rst_sent"] == initial_stats["rst_sent"]
         assert recovered["handshake_retries_exhausted"] == initial_stats["handshake_retries_exhausted"]
         ready = f"/tmp/phantun-queued-recovery-{uuid.uuid4().hex}"
-        server = spawn_netns_scenario(vm, NS_B, "echo_server", {
-            "bind_addr": NS_ADDR_B, "bind_port": dst_port, "count": 1,
-            "timeout_sec": 20, "ready_file": ready,
-        })
+        server = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "echo_server",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": dst_port,
+                "count": 1,
+                "timeout_sec": 20,
+                "ready_file": ready,
+            },
+        )
         wait_for_guest_ready_file(vm, ready)
         probe_b.cleanup(vm)
         probe_b = None
@@ -392,13 +400,23 @@ def test_netns_recent_bidirectional_payload_suppresses_idle_ack(phantun_module, 
 def _liveness_echo_pair(vm, addr_a=NS_ADDR_A, addr_b=NS_ADDR_B, echo_count=100000, count=100000):
     ready = f"/tmp/phantun-liveness-{uuid.uuid4().hex}"
     server = spawn_netns_scenario(
-        vm, NS_B, "echo_server",
-        {"bind_addr": addr_b, "bind_port": PORTS_B[0], "count": count,
-         "timeout_sec": 60, "ready_file": ready, "echo_count": echo_count},
+        vm,
+        NS_B,
+        "echo_server",
+        {
+            "bind_addr": addr_b,
+            "bind_port": PORTS_B[0],
+            "count": count,
+            "timeout_sec": 60,
+            "ready_file": ready,
+            "echo_count": echo_count,
+        },
     )
     client = {
-        "bind_addr": addr_a, "bind_port": PORTS_A[0],
-        "target_addr": addr_b, "target_port": PORTS_B[0],
+        "bind_addr": addr_a,
+        "bind_port": PORTS_A[0],
+        "target_addr": addr_b,
+        "target_port": PORTS_B[0],
     }
     try:
         wait_for_guest_ready_file(vm, ready)
@@ -414,18 +432,35 @@ def _liveness_echo_pair(vm, addr_a=NS_ADDR_A, addr_b=NS_ADDR_B, echo_count=10000
 
 
 def _liveness_flag_probe(vm, namespace, src_addr, dst_addr, src_port, dst_port, action="accept"):
-    return make_netns_output_flag_probe(vm, namespace, [{
-        "src_addr": src_addr, "dst_addr": dst_addr,
-        "src_port": src_port, "dst_port": dst_port,
-        "flags_expr": "ack", "action": action, "comment": "liveness_ack",
-    }])
+    return make_netns_output_flag_probe(
+        vm,
+        namespace,
+        [
+            {
+                "src_addr": src_addr,
+                "dst_addr": dst_addr,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "flags_expr": "ack",
+                "action": action,
+                "comment": "liveness_ack",
+            }
+        ],
+    )
 
 
 def _liveness_window(vm, probe, **kwargs):
-    result = run_netns_scenario(vm, probe.namespace, "liveness_window", {
-        "family": probe.family, "table_name": probe.table_name,
-        "chain_name": probe.chain_name, **kwargs,
-    })
+    result = run_netns_scenario(
+        vm,
+        probe.namespace,
+        "liveness_window",
+        {
+            "family": probe.family,
+            "table_name": probe.table_name,
+            "chain_name": probe.chain_name,
+            **kwargs,
+        },
+    )
     assert_completed(result, "guest liveness observation")
     return parse_guest_json(result.stdout, "guest liveness observation")
 
@@ -434,7 +469,9 @@ def _healthy_idle_survives(phantun_module, vm, ipv6, misses, phase, shaping):
     if not require_guest_command(vm, "nft"):
         pytest.skip("nft is not available in the guest")
     load_managed_module(
-        phantun_module, keepalive_interval_sec=1, keepalive_misses=misses,
+        phantun_module,
+        keepalive_interval_sec=1,
+        keepalive_misses=misses,
         hard_idle_timeout_sec=60,
         **({"handshake_request": REQ, "handshake_response": RESP} if shaping else {}),
     )
@@ -459,7 +496,10 @@ def _healthy_idle_survives(phantun_module, vm, ipv6, misses, phase, shaping):
             for probe, count in zip(probes, ack_before):
                 assert probe.packets(vm, "liveness_ack") - count >= 2
             result = run_netns_scenario(
-                vm, NS_A, "echo_client", {**client, "payloads": ["after-idle"]},
+                vm,
+                NS_A,
+                "echo_client",
+                {**client, "payloads": ["after-idle"]},
             )
             assert_completed(result, "echo after multiple idle timeouts")
             assert parse_guest_json(result.stdout, "post-idle echo")["echoed"] == ["after-idle"]
@@ -490,7 +530,12 @@ def test_periodic_probes_survive_payload_output(phantun_module, vm, pmtu_failure
     load_managed_module(phantun_module, keepalive_interval_sec=1, keepalive_misses=20)
     ensure_netns_topology(vm)
     probe = make_netns_output_ipv4_pure_ack_probe(
-        vm, NS_A, NS_ADDR_A, PORTS_A[0], NS_ADDR_B, PORTS_B[0],
+        vm,
+        NS_A,
+        NS_ADDR_A,
+        PORTS_A[0],
+        NS_ADDR_B,
+        PORTS_B[0],
     )
     try:
         with _liveness_echo_pair(vm, echo_count=1) as client:
@@ -498,14 +543,29 @@ def test_periodic_probes_survive_payload_output(phantun_module, vm, pmtu_failure
                 # UDP still reaches the translator; fake TCP fails its routed
                 # MTU check. Its public UDP send wrapper consumes that failure.
                 run_in_netns(vm, NS_A, ["ip", "link", "set", VETH_A, "mtu", "1300"])
-                run_in_netns(vm, NS_A, [
-                    "ip", "route", "replace", f"{NS_ADDR_B}/32", "dev", VETH_A,
-                    "mtu", "lock", "1300",
-                ])
+                run_in_netns(
+                    vm,
+                    NS_A,
+                    [
+                        "ip",
+                        "route",
+                        "replace",
+                        f"{NS_ADDR_B}/32",
+                        "dev",
+                        VETH_A,
+                        "mtu",
+                        "lock",
+                        "1300",
+                    ],
+                )
             observed = _liveness_window(
-                vm, probe, **client, duration_sec=5.5,
+                vm,
+                probe,
+                **client,
+                duration_sec=5.5,
                 payload="X" * 1350 if pmtu_failure else "cached-payload",
-                warmup=not pmtu_failure, period_ms=100,
+                warmup=not pmtu_failure,
+                period_ms=100,
             )
             before, after = observed["before"], observed["after"]
             probes = after["packets"]["pure_ipv4_ack"] - before["packets"]["pure_ipv4_ack"]
@@ -514,7 +574,10 @@ def test_periodic_probes_survive_payload_output(phantun_module, vm, pmtu_failure
             assert after["stats"]["established_liveness_timeouts"] == before["stats"]["established_liveness_timeouts"]
             assert 3 <= probes <= floor(observed["elapsed_sec"]) + 1, observed
             if pmtu_failure:
-                assert after["stats"]["oversized_payloads_dropped"] - before["stats"]["oversized_payloads_dropped"] == observed["sent"]
+                assert (
+                    after["stats"]["oversized_payloads_dropped"] - before["stats"]["oversized_payloads_dropped"]
+                    == observed["sent"]
+                )
             else:
                 # B sends no payload: A's pure ACKs are periodic probes,
                 # independent of successful cached-route application output.
@@ -530,10 +593,17 @@ def test_keepalive_output_failures_are_paced_despite_continuing_rx(phantun_modul
         pytest.skip("nft is not available in the guest")
     load_managed_module(phantun_module, keepalive_interval_sec=1, keepalive_misses=20)
     ensure_netns_topology(vm)
-    capture = spawn_ready_capture(vm, NS_A, {
-        "bind_addr": NS_ADDR_B, "bind_port": PORTS_B[0],
-        "target_addr": NS_ADDR_A, "target_port": PORTS_A[0], "payload": "open",
-    })
+    capture = spawn_ready_capture(
+        vm,
+        NS_A,
+        {
+            "bind_addr": NS_ADDR_B,
+            "bind_port": PORTS_B[0],
+            "target_addr": NS_ADDR_A,
+            "target_port": PORTS_A[0],
+            "payload": "open",
+        },
+    )
     probe = None
     sender = None
     prefix = f"/tmp/phantun-liveness-rx-{uuid.uuid4().hex}"
@@ -544,21 +614,31 @@ def test_keepalive_output_failures_are_paced_despite_continuing_rx(phantun_modul
             assert_completed(captured, "liveness peer packet capture")
             packet = parse_guest_json(captured.stdout, "liveness captured peer packet")
             probe = _liveness_flag_probe(
-                vm, NS_A, NS_ADDR_A, NS_ADDR_B, PORTS_A[0], PORTS_B[0], action="drop",
+                vm,
+                NS_A,
+                NS_ADDR_A,
+                NS_ADDR_B,
+                PORTS_A[0],
+                PORTS_B[0],
+                action="drop",
             )
             # Repeated valid pure ACK RX must neither answer with an ACK nor
             # move A's probe deadline. OUTPUT drops exercise local failure,
             # rather than successful sends subsequently lost on ingress.
             ack = {
-                "bind_addr": NS_ADDR_B, "bind_port": PORTS_B[0],
-                "target_addr": NS_ADDR_A, "target_port": PORTS_A[0],
+                "bind_addr": NS_ADDR_B,
+                "bind_port": PORTS_B[0],
+                "target_addr": NS_ADDR_A,
+                "target_port": PORTS_A[0],
                 "seq": (packet["seq"] + len("open")) & 0xFFFFFFFF,
-                "ack": packet["ack"], "flags": "ack",
+                "ack": packet["ack"],
+                "flags": "ack",
             }
             sender = spawn_netns_scenario(
-                vm, NS_B, "send_tcp_packets",
-                {"packets": [ack] * 600, "delay_ms": 100,
-                 "ready_file": sender_ready, "stop_file": sender_stop},
+                vm,
+                NS_B,
+                "send_tcp_packets",
+                {"packets": [ack] * 600, "delay_ms": 100, "ready_file": sender_ready, "stop_file": sender_stop},
             )
             wait_for_guest_ready_file(vm, sender_ready)
             observed = _liveness_window(vm, probe, duration_sec=5.5)
@@ -591,19 +671,35 @@ def test_successful_payload_output_cannot_hide_inbound_loss(phantun_module, vm):
     drop = None
     try:
         with _liveness_echo_pair(vm) as client:
-            drop = make_netns_ingress_drop_probe(vm, NS_A, VETH_A, [{
-                "src_addr": NS_ADDR_B, "dst_addr": NS_ADDR_A,
-                "src_port": PORTS_B[0], "dst_port": PORTS_A[0],
-                "comment": "inbound_loss",
-            }])
+            drop = make_netns_ingress_drop_probe(
+                vm,
+                NS_A,
+                VETH_A,
+                [
+                    {
+                        "src_addr": NS_ADDR_B,
+                        "dst_addr": NS_ADDR_A,
+                        "src_port": PORTS_B[0],
+                        "dst_port": PORTS_A[0],
+                        "comment": "inbound_loss",
+                    }
+                ],
+            )
             observed = _liveness_window(
-                vm, probe, **client, duration_sec=8, payload="still-transmitting",
-                period_ms=100, stop_on_liveness_timeout=True,
+                vm,
+                probe,
+                **client,
+                duration_sec=8,
+                payload="still-transmitting",
+                period_ms=100,
+                stop_on_liveness_timeout=True,
             )
             before, after = observed["before"], observed["after"]
             assert after["packets"]["liveness_ack"] - before["packets"]["liveness_ack"] >= 5, observed
             assert drop.packets(vm, "inbound_loss") >= 5
-            assert after["stats"]["established_liveness_timeouts"] > before["stats"]["established_liveness_timeouts"], observed
+            assert (
+                after["stats"]["established_liveness_timeouts"] > before["stats"]["established_liveness_timeouts"]
+            ), observed
             # Timeout accounting precedes the unlocked best-effort RST.
             wait_for_stat_greater(vm, "rst_sent", before["stats"]["rst_sent"])
     finally:
@@ -630,35 +726,82 @@ def test_active_payload_loss_preserves_live_control_path(phantun_module, vm):
             (NS_A, VETH_A, NS_ADDR_A, NS_ADDR_B, PORTS_A[0], PORTS_B[0]),
             (NS_B, VETH_B, NS_ADDR_B, NS_ADDR_A, PORTS_B[0], PORTS_A[0]),
         ):
-            run_in_netns(vm, namespace, [
-                "tc", "qdisc", "replace", "dev", device, "root", "netem", "delay", "200ms",
-            ])
-            probes.append(make_netns_output_ipv4_pure_ack_probe(
-                vm, namespace, src, sport, dst, dport,
-            ))
+            run_in_netns(
+                vm,
+                namespace,
+                [
+                    "tc",
+                    "qdisc",
+                    "replace",
+                    "dev",
+                    device,
+                    "root",
+                    "netem",
+                    "delay",
+                    "200ms",
+                ],
+            )
+            probes.append(
+                make_netns_output_ipv4_pure_ack_probe(
+                    vm,
+                    namespace,
+                    src,
+                    sport,
+                    dst,
+                    dport,
+                )
+            )
             # Loss is on receiver ingress, so every local send still succeeds.
             # Pure ACKs remain usable across the same delayed path.
-            drops.append(make_netns_ingress_payload_drop_probe(vm, namespace, device, [{
-                "src_addr": dst, "dst_addr": src, "src_port": dport, "dst_port": sport,
-                "payload": payload, "comment": "payload_blackout",
-            }]))
+            drops.append(
+                make_netns_ingress_payload_drop_probe(
+                    vm,
+                    namespace,
+                    device,
+                    [
+                        {
+                            "src_addr": dst,
+                            "dst_addr": src,
+                            "src_port": dport,
+                            "dst_port": sport,
+                            "payload": payload,
+                            "comment": "payload_blackout",
+                        }
+                    ],
+                )
+            )
         for probe, src, dst, sport, dport in (
             (probes[0], NS_ADDR_A, NS_ADDR_B, PORTS_A[0], PORTS_B[0]),
             (probes[1], NS_ADDR_B, NS_ADDR_A, PORTS_B[0], PORTS_A[0]),
         ):
-            senders.append(spawn_netns_scenario(vm, probe.namespace, "liveness_window", {
-                "family": probe.family, "table_name": probe.table_name,
-                "chain_name": probe.chain_name, "bind_addr": src, "bind_port": sport,
-                "target_addr": dst, "target_port": dport, "payload": payload,
-                "duration_sec": 6.5, "period_ms": 100,
-            }))
+            senders.append(
+                spawn_netns_scenario(
+                    vm,
+                    probe.namespace,
+                    "liveness_window",
+                    {
+                        "family": probe.family,
+                        "table_name": probe.table_name,
+                        "chain_name": probe.chain_name,
+                        "bind_addr": src,
+                        "bind_port": sport,
+                        "target_addr": dst,
+                        "target_port": dport,
+                        "payload": payload,
+                        "duration_sec": 6.5,
+                        "period_ms": 100,
+                    },
+                )
+            )
         for sender in senders:
             result = sender.communicate(timeout=20)
             assert_completed(result, "active payload blackout sender")
             observed = parse_guest_json(result.stdout, "payload blackout sender")
             assert observed["sent"] >= 20, observed
             assert observed["max_send_gap_sec"] < 1, observed
-            assert observed["after"]["packets"]["pure_ipv4_ack"] - observed["before"]["packets"]["pure_ipv4_ack"] >= 3, observed
+            assert (
+                observed["after"]["packets"]["pure_ipv4_ack"] - observed["before"]["packets"]["pure_ipv4_ack"] >= 3
+            ), observed
         after = read_module_stats(vm)
         assert after["flows_current"] == before["flows_current"] == 2
         for name in ("flows_created", "flows_established", "established_liveness_timeouts", "rst_sent"):

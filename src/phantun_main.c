@@ -959,7 +959,7 @@ static void phantun_note_inbound_payload(struct pht_flow *flow, const struct pht
 
 /* Consume the one-shot exception under the same lock as RX classification. */
 static bool phantun_consume_one_shot_shaping_payload_locked(struct pht_flow *flow,
-                                                           const struct pht_l4_view *view) {
+                                                            const struct pht_l4_view *view) {
     lockdep_assert_held(&flow->lock);
     if (!view->payload_len || !flow->one_shot_shaping_rx_pending ||
         ntohl(view->tcp->seq) != flow->one_shot_shaping_rx_seq)
@@ -1127,9 +1127,9 @@ struct phantun_local_out_ctx {
  * Return it untouched for redispatch if the half-open snapshot became stale;
  * otherwise consume it or transfer it to the handshake queue.
  */
-static struct sk_buff *
-phantun_local_out_live_flow(const struct phantun_local_out_ctx *ctx, struct pht_flow *flow,
-                             struct sk_buff *skb, enum pht_flow_state state_now) {
+static struct sk_buff *phantun_local_out_live_flow(const struct phantun_local_out_ctx *ctx,
+                                                   struct pht_flow *flow, struct sk_buff *skb,
+                                                   enum pht_flow_state state_now) {
     enum pht_flow_queue_result queued;
     bool payload_emitted = false;
     int ret;
@@ -1299,7 +1299,7 @@ static void phantun_local_out_dispatch(const struct phantun_local_out_ctx *ctx,
 }
 
 static bool phantun_outbound_destination_is_nonunicast(const struct sk_buff *skb,
-                                                      const struct pht_addr *addr) {
+                                                       const struct pht_addr *addr) {
     if (addr->family == AF_INET) {
         const struct rtable *rt = skb_rtable(skb);
 
@@ -1836,10 +1836,10 @@ static bool phantun_prepare_established_data_locked(struct pht_flow *flow,
         u32 payload_seq = ntohl(view->tcp->seq);
         u32 payload_end = payload_seq + view->payload_len;
 
-        raced_replay = (flow->opening_rx_payload_claimed &&
-                        payload_seq == flow->opening_rx_seq_start &&
-                        payload_end == flow->opening_rx_seq_end) ||
-                       phantun_seq_after_eq(flow->ack, payload_end);
+        raced_replay =
+            (flow->opening_rx_payload_claimed && payload_seq == flow->opening_rx_seq_start &&
+             payload_end == flow->opening_rx_seq_end) ||
+            phantun_seq_after_eq(flow->ack, payload_end);
     }
     if (raced_replay && !action->shaping_dropped)
         return true;

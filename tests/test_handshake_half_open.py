@@ -834,28 +834,43 @@ def test_stale_half_open_traffic_preserves_queued_udp(phantun_module, vm, flags)
     require_nft_or_skip(vm)
     src_port, dst_port = PORTS_A[0], PORTS_B[0]
     drop = make_netns_ingress_flag_drop_probe(
-        vm, NS_A, VETH_A,
-        [{
-            "src_addr": NS_ADDR_B, "src_port": dst_port,
-            "dst_addr": NS_ADDR_A, "dst_port": src_port,
-            "flags_expr": "syn | ack", "comment": "hold_fresh_handshake",
-        }],
+        vm,
+        NS_A,
+        VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_B,
+                "src_port": dst_port,
+                "dst_addr": NS_ADDR_A,
+                "dst_port": src_port,
+                "flags_expr": "syn | ack",
+                "comment": "hold_fresh_handshake",
+            }
+        ],
     )
     stop_file = f"/tmp/phantun-stale-half-open-stop-{uuid.uuid4().hex}"
     receiver = spawn_ready_recv_until_timeout(
-        vm, NS_B,
+        vm,
+        NS_B,
         {
-            "bind_addr": NS_ADDR_B, "bind_port": dst_port,
-            "count": 3, "timeout_sec": 60, "stop_file": stop_file,
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 3,
+            "timeout_sec": 60,
+            "stop_file": stop_file,
         },
     )
     baseline = read_module_stats(vm)
     try:
         sent = run_netns_scenario(
-            vm, NS_A, "send_many",
+            vm,
+            NS_A,
+            "send_many",
             {
-                "bind_addr": NS_ADDR_A, "bind_port": src_port,
-                "target_addr": NS_ADDR_B, "target_port": dst_port,
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
                 "payloads": ["queued"],
             },
         )
@@ -868,15 +883,24 @@ def test_stale_half_open_traffic_preserves_queued_udp(phantun_module, vm, flags)
             (NS_B, NS_ADDR_B, dst_port, NS_ADDR_A, src_port),
         ):
             stale = run_netns_scenario(
-                vm, namespace, "send_tcp_packets",
-                {"packets": [
-                    {
-                        "bind_addr": addr, "bind_port": port,
-                        "target_addr": peer, "target_port": peer_port,
-                        "flags": flags, "seq": 123456, "ack": 0, "payload": payload,
-                    }
-                    for payload in ("", "old-data", "old-data")
-                ]},
+                vm,
+                namespace,
+                "send_tcp_packets",
+                {
+                    "packets": [
+                        {
+                            "bind_addr": addr,
+                            "bind_port": port,
+                            "target_addr": peer,
+                            "target_port": peer_port,
+                            "flags": flags,
+                            "seq": 123456,
+                            "ack": 0,
+                            "payload": payload,
+                        }
+                        for payload in ("", "old-data", "old-data")
+                    ]
+                },
             )
             assert_completed(stale, "old ACK/data in half-open state")
         retained = read_module_stats(vm)
@@ -887,10 +911,15 @@ def test_stale_half_open_traffic_preserves_queued_udp(phantun_module, vm, flags)
         wait_for_stat_greater(vm, "flows_established", baseline["flows_established"] + 1)
         # A post-completion datagram is a delivery-order barrier for the queue.
         sent = run_netns_scenario(
-            vm, NS_A, "send_many",
+            vm,
+            NS_A,
+            "send_many",
             {
-                "bind_addr": NS_ADDR_A, "bind_port": src_port,
-                "target_addr": NS_ADDR_B, "target_port": dst_port, "payloads": ["after"],
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "payloads": ["after"],
             },
         )
         assert_completed(sent, "post-recovery barrier")
@@ -915,21 +944,27 @@ def test_stale_data_does_not_extend_half_open_timeout(phantun_module, vm, state)
     src_port, dst_port = PORTS_A[0], PORTS_B[0]
     initiator = state == "syn_sent"
     drop = make_netns_ingress_flag_drop_probe(
-        vm, NS_B if initiator else NS_A, VETH_B if initiator else VETH_A,
-        [{
-            "src_addr": NS_ADDR_A if initiator else NS_ADDR_B,
-            "src_port": src_port if initiator else dst_port,
-            "dst_addr": NS_ADDR_B if initiator else NS_ADDR_A,
-            "dst_port": dst_port if initiator else src_port,
-            "flags_expr": "syn" if initiator else "syn | ack",
-            "comment": "hold_timeout_handshake",
-        }],
+        vm,
+        NS_B if initiator else NS_A,
+        VETH_B if initiator else VETH_A,
+        [
+            {
+                "src_addr": NS_ADDR_A if initiator else NS_ADDR_B,
+                "src_port": src_port if initiator else dst_port,
+                "dst_addr": NS_ADDR_B if initiator else NS_ADDR_A,
+                "dst_port": dst_port if initiator else src_port,
+                "flags_expr": "syn" if initiator else "syn | ack",
+                "comment": "hold_timeout_handshake",
+            }
+        ],
     )
     baseline = read_module_stats(vm)
     try:
         opener = {
-            "bind_addr": NS_ADDR_A, "bind_port": src_port,
-            "target_addr": NS_ADDR_B, "target_port": dst_port,
+            "bind_addr": NS_ADDR_A,
+            "bind_port": src_port,
+            "target_addr": NS_ADDR_B,
+            "target_port": dst_port,
         }
         if initiator:
             opened = run_netns_scenario(vm, NS_A, "send_many", {**opener, "payloads": ["queued"]})
@@ -941,10 +976,15 @@ def test_stale_data_does_not_extend_half_open_timeout(phantun_module, vm, state)
             "bind_port": dst_port if initiator else src_port,
             "target_addr": NS_ADDR_A if initiator else NS_ADDR_B,
             "target_port": src_port if initiator else dst_port,
-            "flags": "ack|psh", "seq": 123456, "ack": 0, "payload": "old-data",
+            "flags": "ack|psh",
+            "seq": 123456,
+            "ack": 0,
+            "payload": "old-data",
         }
         stream = run_netns_scenario(
-            vm, NS_B if initiator else NS_A, "send_tcp_packets",
+            vm,
+            NS_B if initiator else NS_A,
+            "send_tcp_packets",
             {"packets": [stray] * 80, "delay_ms": 50},
         )
         assert_completed(stream, "continued stale data")

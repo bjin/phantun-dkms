@@ -330,23 +330,35 @@ def test_nonunicast_output_respects_selector_ownership(phantun_module, vm, reque
         if destination == "10.200.0.255":
             # Install an explicit subnet broadcast, so this exercises the
             # output route's broadcast classification, not address guessing.
-            vm.run(["ip", "netns", "exec", NS_A, "ip", "addr", "change",
-                    f"{NS_ADDR_A}/24", "brd", "+", "dev", VETH_A])
+            vm.run(["ip", "netns", "exec", NS_A, "ip", "addr", "change", f"{NS_ADDR_A}/24", "brd", "+", "dev", VETH_A])
             route = vm.run(["ip", "netns", "exec", NS_A, "ip", "route", "get", destination])
             assert "broadcast" in route.stdout, route.stdout
         elif destination == "239.1.2.3" or ipv6:
             family = ["-6"] if ipv6 else []
-            vm.run(["ip", "netns", "exec", NS_A, "ip", *family, "route", "replace",
-                    destination + ("/128" if ipv6 else "/32"), "dev", VETH_A])
+            vm.run(
+                [
+                    "ip",
+                    "netns",
+                    "exec",
+                    NS_A,
+                    "ip",
+                    *family,
+                    "route",
+                    "replace",
+                    destination + ("/128" if ipv6 else "/32"),
+                    "dev",
+                    VETH_A,
+                ]
+            )
 
         # Priority zero observes packets after Phantun's ownership decision.
         # Accept UDP so unselected cases exercise the normal output path.
-        probe = make_netns_output_probe(
-            vm, NS_A, [(source, src_port, destination, dst_port)], udp_action="accept"
-        )
+        probe = make_netns_output_probe(vm, NS_A, [(source, src_port, destination, dst_port)], udp_action="accept")
         before = read_module_stats(vm)
         result = run_netns_scenario(
-            vm, NS_A, "send_many",
+            vm,
+            NS_A,
+            "send_many",
             {
                 "bind_addr": source,
                 "bind_port": src_port,
@@ -387,14 +399,13 @@ def test_loopback_multicast_on_managed_port_is_ignored(phantun_module, vm):
     require_nft_or_skip(vm)
     probe = None
     try:
-        vm.run(["ip", "netns", "exec", NS_A, "ip", "route", "add",
-                f"{destination}/32", "dev", "lo", "src", source])
-        probe = make_netns_output_probe(
-            vm, NS_A, [(source, src_port, destination, dst_port)], udp_action="accept"
-        )
+        vm.run(["ip", "netns", "exec", NS_A, "ip", "route", "add", f"{destination}/32", "dev", "lo", "src", source])
+        probe = make_netns_output_probe(vm, NS_A, [(source, src_port, destination, dst_port)], udp_action="accept")
         before = read_module_stats(vm)
         result = run_netns_scenario(
-            vm, NS_A, "send_many",
+            vm,
+            NS_A,
+            "send_many",
             {
                 "bind_addr": source,
                 "bind_port": src_port,

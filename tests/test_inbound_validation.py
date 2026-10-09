@@ -297,8 +297,10 @@ def test_malformed_handshake_flags_do_not_complete_syn_sent(phantun_module, vm, 
 @pytest.mark.parametrize("payload", ["", "junk"])
 def test_wrong_final_ack_retains_half_open_until_valid_completion(phantun_module, vm, flags, payload):
     phantun_module.load(
-        managed_netns="all", managed_local_ports=MANAGED_LOCAL_PORTS,
-        handshake_timeout_ms=1000, handshake_retries=60,
+        managed_netns="all",
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        handshake_timeout_ms=1000,
+        handshake_retries=60,
     )
     ensure_netns_topology(vm)
 
@@ -339,20 +341,29 @@ def test_wrong_final_ack_retains_half_open_until_valid_completion(phantun_module
     )
 
     synack_capture = spawn_ready_capture(
-        vm, NS_B,
+        vm,
+        NS_B,
         {
-            "bind_addr": NS_ADDR_B, "bind_port": dst_port,
-            "target_addr": NS_ADDR_A, "target_port": src_port,
-            "payload": "", "flags": "syn|ack", "timeout_sec": 15,
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "target_addr": NS_ADDR_A,
+            "target_port": src_port,
+            "payload": "",
+            "flags": "syn|ack",
+            "timeout_sec": 15,
             "include_outgoing": True,
         },
     )
     stop_file = f"/tmp/phantun-wrong-ack-stop-{uuid.uuid4().hex}"
     receiver = spawn_ready_recv_until_timeout(
-        vm, NS_B,
+        vm,
+        NS_B,
         {
-            "bind_addr": NS_ADDR_B, "bind_port": dst_port,
-            "count": 2, "timeout_sec": 60, "stop_file": stop_file,
+            "bind_addr": NS_ADDR_B,
+            "bind_port": dst_port,
+            "count": 2,
+            "timeout_sec": 60,
+            "stop_file": stop_file,
         },
     )
     baseline = read_module_stats(vm)
@@ -398,12 +409,18 @@ def test_wrong_final_ack_retains_half_open_until_valid_completion(phantun_module
         assert retained["tcp_protocol_rejected"] == baseline["tcp_protocol_rejected"]
         assert invalid_probe.packets(vm, "bad_final_rst") == baseline_bad_final_rst
         valid = run_netns_scenario(
-            vm, NS_A, "send_tcp_packet",
+            vm,
+            NS_A,
+            "send_tcp_packet",
             {
-                "bind_addr": NS_ADDR_A, "bind_port": src_port,
-                "target_addr": NS_ADDR_B, "target_port": dst_port,
-                "flags": "ack", "seq": 4096,
-                "ack": (synack["seq"] + 1) & 0xFFFFFFFF, "payload": "fresh",
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": dst_port,
+                "flags": "ack",
+                "seq": 4096,
+                "ack": (synack["seq"] + 1) & 0xFFFFFFFF,
+                "payload": "fresh",
             },
         )
         assert_completed(valid, "valid final ACK after stale traffic")

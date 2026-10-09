@@ -73,7 +73,8 @@ MODULE_PARM_DESC(handshake_retries,
 module_param(keepalive_interval_sec, uint, 0444);
 MODULE_PARM_DESC(keepalive_interval_sec, "Periodic keepalive ACK interval in seconds");
 module_param(keepalive_misses, uint, 0444);
-MODULE_PARM_DESC(keepalive_misses, "Inbound-silence interval budget (minimum effective budget: two)");
+MODULE_PARM_DESC(keepalive_misses,
+                 "Inbound-silence interval budget (minimum effective budget: two)");
 module_param(hard_idle_timeout_sec, uint, 0444);
 MODULE_PARM_DESC(hard_idle_timeout_sec,
                  "GC timeout since recorded activity in seconds; accepted inbound keepalives "
@@ -347,7 +348,8 @@ static int phantun_validate_keepalive_jiffies(void) {
 
     interval = msecs_to_jiffies(keepalive_interval_sec * 1000U);
     if (interval && max_t(u64, 2, keepalive_misses) > LONG_MAX / interval) {
-        pht_pr_err("keepalive_interval_sec * max(2, keepalive_misses) exceeds signed jiffies range\n");
+        pht_pr_err(
+            "keepalive_interval_sec * max(2, keepalive_misses) exceeds signed jiffies range\n");
         return -EINVAL;
     }
     return 0;

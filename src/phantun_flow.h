@@ -302,7 +302,7 @@ static inline void pht_flow_touch_inbound_locked(struct pht_flow *flow) {
 
 void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex);
 enum pht_flow_queue_result pht_flow_queue_half_open_skb(struct pht_flow *flow, struct sk_buff *skb,
-                                                       const struct pht_tx_meta *meta);
+                                                        const struct pht_tx_meta *meta);
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb,
                              const struct pht_tx_meta *meta);
 /* Transfer the packet and its metadata; initialize @meta even for an empty queue. */

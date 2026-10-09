@@ -25,7 +25,6 @@ from helpers import (
     wait_for_guest_ready_file,
 )
 
-
 PACKETS = 64
 FORWARD = {
     "bind_addr": NS_ADDR_A,
@@ -53,27 +52,51 @@ def test_packet_diagnostics_are_ratelimited(phantun_module, vm, path):
         if path == "warning":
             # Intentional local terminal emit error, not simulated path loss.
             probe = make_netns_output_flag_probe(
-                vm, NS_A,
-                [{"src_addr": NS_ADDR_A, "src_port": PORTS_A[0],
-                  "dst_addr": NS_ADDR_B, "dst_port": PORTS_B[0],
-                  "flags_expr": "syn", "action": "drop", "comment": "logging_syn_drop"}],
+                vm,
+                NS_A,
+                [
+                    {
+                        "src_addr": NS_ADDR_A,
+                        "src_port": PORTS_A[0],
+                        "dst_addr": NS_ADDR_B,
+                        "dst_port": PORTS_B[0],
+                        "flags_expr": "syn",
+                        "action": "drop",
+                        "comment": "logging_syn_drop",
+                    }
+                ],
             )
         else:
             # Raw peer ports are unmanaged. Prevent its kernel TCP stack from
             # resetting the real module's SYN|ACKs before our peer ACKs them.
             probe = make_netns_output_flag_probe(
-                vm, NS_B,
-                [{"src_addr": NS_ADDR_B, "dst_addr": NS_ADDR_A,
-                  "src_port": f"45000-{45000 + PACKETS - 1}",
-                  "dst_port": PORTS_A[0], "flags_expr": flags, "action": "drop",
-                  "comment": f"raw_peer_{index}"}
-                 for index, flags in enumerate(("rst", "rst | ack"))],
+                vm,
+                NS_B,
+                [
+                    {
+                        "src_addr": NS_ADDR_B,
+                        "dst_addr": NS_ADDR_A,
+                        "src_port": f"45000-{45000 + PACKETS - 1}",
+                        "dst_port": PORTS_A[0],
+                        "flags_expr": flags,
+                        "action": "drop",
+                        "comment": f"raw_peer_{index}",
+                    }
+                    for index, flags in enumerate(("rst", "rst | ack"))
+                ],
             )
             ready = f"/tmp/phantun-log-receiver-{uuid.uuid4().hex}"
             server = spawn_netns_scenario(
-                vm, NS_A, "recv_many",
-                {"bind_addr": NS_ADDR_A, "bind_port": PORTS_A[0], "count": PACKETS,
-                 "timeout_sec": 60, "ready_file": ready},
+                vm,
+                NS_A,
+                "recv_many",
+                {
+                    "bind_addr": NS_ADDR_A,
+                    "bind_port": PORTS_A[0],
+                    "count": PACKETS,
+                    "timeout_sec": 60,
+                    "ready_file": ready,
+                },
             )
             wait_for_guest_ready_file(vm, ready)
 
@@ -85,15 +108,25 @@ def test_packet_diagnostics_are_ratelimited(phantun_module, vm, path):
         vm.run(["dmesg", "--clear"])
         if path == "warning":
             flood = run_netns_scenario(
-                vm, NS_A, "send_many", {**FORWARD, "payloads": ["must-not-leak"] * PACKETS},
+                vm,
+                NS_A,
+                "send_many",
+                {**FORWARD, "payloads": ["must-not-leak"] * PACKETS},
             )
         else:
             # Each peer-controlled opener establishes and replaces a fresh
             # responder tuple. No comparison to random local ISNs is needed.
             flood = run_netns_scenario(
-                vm, NS_B, "replace_responder_generations",
-                {"bind_addr": NS_ADDR_B, "bind_port": 45000,
-                 "target_addr": NS_ADDR_A, "target_port": PORTS_A[0], "count": PACKETS},
+                vm,
+                NS_B,
+                "replace_responder_generations",
+                {
+                    "bind_addr": NS_ADDR_B,
+                    "bind_port": 45000,
+                    "target_addr": NS_ADDR_A,
+                    "target_port": PORTS_A[0],
+                    "count": PACKETS,
+                },
                 timeout=90,
             )
         assert_completed(flood, "packet diagnostic flood")
@@ -126,9 +159,10 @@ def test_packet_diagnostics_are_ratelimited(phantun_module, vm, path):
         if path == "warning":
             ready = f"/tmp/phantun-log-receiver-{uuid.uuid4().hex}"
             server = spawn_netns_scenario(
-                vm, NS_B, "recv_many",
-                {"bind_addr": NS_ADDR_B, "bind_port": PORTS_B[0], "count": 1,
-                 "timeout_sec": 30, "ready_file": ready},
+                vm,
+                NS_B,
+                "recv_many",
+                {"bind_addr": NS_ADDR_B, "bind_port": PORTS_B[0], "count": 1, "timeout_sec": 30, "ready_file": ready},
             )
             wait_for_guest_ready_file(vm, ready)
             probe.cleanup(vm)
