@@ -172,11 +172,12 @@ reusable probe is checked into this repository.
 
 11. **Control timing instead of hoping for it**
    - If a test requires specific events to cross in flight (e.g., simultaneous connection opens), do not rely on Python's sequential execution or small `time.sleep()` calls. The CPU scheduler will ruin your assumptions under load, causing flakiness.
-   - Instead, enforce the timing in the data plane by adding latency with `tc netem`:
+   - Use `tc netem` to exercise a delayed wire path, not as a substitute for a state barrier:
      ```python
      vm.run(["ip", "netns", "exec", NS_A, "tc", "qdisc", "add", "dev", VETH_A, "root", "netem", "delay", "150ms"])
      ```
-   - This ensures packets sit in the queue long enough for the test scenario to trigger the necessary overlapping state transitions. Remember to clean up the `qdisc` in a `finally` block or when tearing down the topology.
+   - A fixed delay does not make sequential SSH commands atomic. For simultaneous open, capture both real SYN ISNs, release the lower-ISN winner's ingress first, and observe `collisions_won` before opening the loser's ingress. Otherwise SYNACK can complete the handshake while the winner's bare-SYN gate is still closed, so no winner-side collision is processed.
+   - Keep UDP sockets alive behind a bounded setup barrier, then start their ordinary receive timeout after releasing the handshake. Preserve assertions on both collision decisions, queued payload delivery, and admission release. Clean up captures, clients, gates, and qdiscs in `finally`.
 
 ## GitHub Actions slowness warning
 

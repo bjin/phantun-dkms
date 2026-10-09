@@ -76,6 +76,9 @@ def test_syn_isn_tie_break(phantun_module, vm, saturate_remote):
     src_port = PORTS_A[0]
     dst_port = PORTS_B[0]
     admission_drops = []
+    captures = []
+    clients = []
+    receive_start_file = f"/tmp/phantun-collision-receive-{uuid.uuid4().hex}"
 
     probe_a = make_netns_ingress_flag_drop_probe(
         vm,
@@ -108,7 +111,7 @@ def test_syn_isn_tie_break(phantun_module, vm, saturate_remote):
         ],
     )
 
-    # Add delay so retransmitted SYNs cross in flight, ensuring both evaluate the collision
+    # Keep a delayed wire path, but use observed collision progress as the barrier.
     vm.run(["ip", "netns", "exec", NS_A, "tc", "qdisc", "add", "dev", VETH_A, "root", "netem", "delay", "150ms"])
     vm.run(["ip", "netns", "exec", NS_B, "tc", "qdisc", "add", "dev", VETH_B, "root", "netem", "delay", "150ms"])
 
@@ -156,13 +159,31 @@ def test_syn_isn_tie_break(phantun_module, vm, saturate_remote):
                         ]
                     },
                 )
-            saturated = wait_for_stat_greater(
-                vm, "half_open_rejected", initial_stats["half_open_rejected"] + 1
-            )
+            saturated = wait_for_stat_greater(vm, "half_open_rejected", initial_stats["half_open_rejected"] + 1)
             assert saturated["flows_created"] - initial_stats["flows_created"] == 2
             assert saturated["flows_current"] - initial_stats["flows_current"] == 2
             assert saturated["half_open_rejected"] - initial_stats["half_open_rejected"] == 2
             initial_stats = saturated
+
+        for namespace, addr, port, peer_addr, peer_port in [
+            (NS_A, NS_ADDR_A, src_port, NS_ADDR_B, dst_port),
+            (NS_B, NS_ADDR_B, dst_port, NS_ADDR_A, src_port),
+        ]:
+            captures.append(
+                spawn_ready_capture(
+                    vm,
+                    namespace,
+                    {
+                        "bind_addr": addr,
+                        "bind_port": port,
+                        "target_addr": peer_addr,
+                        "target_port": peer_port,
+                        "flags": "syn",
+                        "include_outgoing": True,
+                        "timeout_sec": 30,
+                    },
+                )
+            )
 
         client_a = spawn_netns_scenario(
             vm,
@@ -174,8 +195,11 @@ def test_syn_isn_tie_break(phantun_module, vm, saturate_remote):
                 "target_addr": NS_ADDR_B,
                 "target_port": dst_port,
                 "payload": "pingA",
+                "receive_start_file": receive_start_file,
+                "barrier_timeout_sec": 30,
             },
         )
+        clients.append(client_a)
         client_b = spawn_netns_scenario(
             vm,
             NS_B,
@@ -186,14 +210,29 @@ def test_syn_isn_tie_break(phantun_module, vm, saturate_remote):
                 "target_addr": NS_ADDR_A,
                 "target_port": src_port,
                 "payload": "pingB",
+                "receive_start_file": receive_start_file,
+                "barrier_timeout_sec": 30,
             },
         )
-        # Initial SYNs are dropped on both sides; wait past the 1s handshake
-        # retransmit timeout so the first retry wave is in flight before we
-        # stop dropping.
-        time.sleep(1.25)
-        probe_a.cleanup(vm)
-        probe_b.cleanup(vm)
+        clients.append(client_b)
+        opening_isns = []
+        for capture in captures:
+            captured = capture.communicate(timeout=30)
+            assert_completed(captured, "simultaneous-open SYN capture")
+            opening_isns.append(parse_guest_json(captured.stdout, "opening SYN")["seq"])
+        assert opening_isns[0] != opening_isns[1], "identical ISNs exercise the exact-tie timeout, not role selection"
+
+        # Releasing the loser's ingress first can complete the handshake while
+        # the winner's SYN-only gate still drops the losing opener: SYNACK is
+        # not blocked, and the loser stops sending SYN after yielding. A fixed
+        # sleep/netem delay cannot make both collision decisions observable.
+        winner_gate, loser_gate = (probe_a, probe_b) if opening_isns[0] < opening_isns[1] else (probe_b, probe_a)
+        winner_gate.cleanup(vm)
+        winner_stats = wait_for_stat_greater(vm, "collisions_won", initial_stats["collisions_won"])
+        assert winner_stats["collisions_lost"] == initial_stats["collisions_lost"]
+        assert winner_stats["flows_established"] == initial_stats["flows_established"]
+        loser_gate.cleanup(vm)
+        vm.run(["touch", receive_start_file])
 
         res_a = client_a.communicate(timeout=15)
         res_b = client_b.communicate(timeout=15)
@@ -265,6 +304,9 @@ def test_syn_isn_tie_break(phantun_module, vm, saturate_remote):
             assert released["flows_current"] - final_stats["flows_current"] == 2
             assert released["half_open_rejected"] - final_stats["half_open_rejected"] == 2
     finally:
+        for process in captures + clients:
+            process.terminate()
+        vm.run(["rm", "-f", receive_start_file], check=False)
         probe_a.cleanup(vm)
         probe_b.cleanup(vm)
         vm.run(["ip", "netns", "exec", NS_A, "tc", "qdisc", "del", "dev", VETH_A, "root", "netem"], check=False)

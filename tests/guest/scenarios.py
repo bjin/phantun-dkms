@@ -579,6 +579,10 @@ def simultaneous_exchange(config):
             config["payload"].encode(),
             (config["target_addr"], config["target_port"]),
         )
+        # Setup can deliberately hold ingress gates across slow host/SSH
+        # orchestration. Keep the socket open without spending its receive
+        # timeout until the controller releases the handshake.
+        _wait_for_file(config.get("receive_start_file"), config.get("barrier_timeout_sec", TIMEOUT_SEC))
         data, addr = sock.recvfrom(2048)
         _emit(
             {
