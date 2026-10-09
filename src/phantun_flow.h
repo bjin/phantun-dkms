@@ -271,16 +271,16 @@ bool pht_flow_lookup_retired_seq(struct pht_flow_table *table, const struct pht_
                                  u32 *prev_seq);
 int pht_flow_replace_dead(struct pht_flow_table *table, struct pht_flow *dead_flow,
                           struct pht_flow *new_flow);
-/* Atomically replace expected SYN_SENT/SYN_RCVD with an unpublished SYN_RCVD
+/* Atomically yield a local SYN_SENT initiator to an unpublished SYN_RCVD
  * responder on the same tuple/table. @new_flow must have an empty queue and no
  * admission charge or timer. Caller retains both references on every outcome.
- * Success transfers the old charge, queue+metadata, local transmit policy, and
- * remaining retry/lifetime bounds; finalization owns the old table reference.
- * -EAGAIN means old state/ownership changed or a retry callback is in flight;
- * failure leaves the old flow intact.
+ * Success transfers the local charge, queue+metadata and local transmit policy,
+ * then starts a full responder retry/lifetime budget. Finalization owns the old
+ * table reference and drains any in-flight retry callback.
+ * -EAGAIN means old state/ownership changed; failure leaves the old flow intact.
  */
-int pht_flow_replace_half_open(struct pht_flow_table *table, struct pht_flow *old_flow,
-                               struct pht_flow *new_flow, enum pht_flow_state expected_state);
+int pht_flow_yield_initiator(struct pht_flow_table *table, struct pht_flow *old_flow,
+                             struct pht_flow *new_flow);
 void pht_flow_remove(struct pht_flow *flow);
 void pht_flow_detach(struct pht_flow *flow);
 

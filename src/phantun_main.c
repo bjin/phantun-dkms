@@ -1678,7 +1678,7 @@ static void phantun_pre_routing_yield_initiator(const struct phantun_pre_routing
     if (IS_ERR(new_flow))
         return;
 
-    ret = pht_flow_replace_half_open(ctx->flows, flow, new_flow, PHT_FLOW_STATE_SYN_SENT);
+    ret = pht_flow_yield_initiator(ctx->flows, flow, new_flow);
     if (ret) {
         pht_flow_put(new_flow);
         return;

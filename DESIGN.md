@@ -359,16 +359,20 @@ This avoids NAT-sensitive endpoint heuristics and keeps shaping unambiguous.
 
 The losing handoff retains its **local-origin** admission token without
 releasing/reacquiring capacity. With the tuple bucket and old flow lock held,
-the replacement transaction revalidates the expected half-open state before
-moving the queued skb, its packet metadata, and the independently maintained
-local transmit policy. Allocation or revalidation failure leaves the old owner
-and queue intact; a concurrent handshake completion cannot be replaced.
-Publication retains the remaining retry budget, retry deadline, and lifetime
-timestamps rather than restarting them. Replacement waits for another opener
-if a retransmit callback is currently emitting, because its next timer expiry
-has not yet been committed. The old table reference transfers to process-context
-finalization only after dropping its flow lock; the new timer and table take
-their own references before the bucket is unlocked.
+the transaction revalidates a local-origin `SYN_SENT` initiator before moving
+the queued skb, its packet metadata, and the independently maintained local
+transmit policy. Allocation or revalidation failure leaves the old owner and
+queue intact; a concurrent handshake completion cannot be replaced.
+Publication starts a fresh `SYN_RCVD` phase: zero retries spent, the full table
+retry budget, a new next retry deadline, and fresh activity, inbound, and periodic
+probe timestamps. Only this one-time role change restarts the phase; a different
+opener in `SYN_RCVD` still follows the strict rejection policy.
+An old retransmit callback already emitting retains its own timer reference,
+observes `DEAD` on return, and is drained by finalization. The old table reference
+transfers to process-context finalization only after dropping its flow lock;
+the new timer and table take their own references before the bucket is unlocked.
+Old and new flow locks are never held together, and packet emission occurs only
+after dropping the bucket, flow, and admission locks.
 
 ### 5.5 One queued UDP skb
 

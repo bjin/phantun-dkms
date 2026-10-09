@@ -1139,6 +1139,84 @@ def send_l2_tcp_packet(config):
     _emit({"done": True})
 
 
+def late_collision_peer(config):
+    """Drive one delayed role handoff without host-side timing windows."""
+    ready_file = Path(config["ready_file"])
+    local_isn = None
+    first_syn_at = None
+    synack_at = None
+    syn_packets = 0
+    synack_packets = 0
+    peer = {
+        "bind_addr": config["bind_addr"],
+        "bind_port": config["bind_port"],
+        "target_addr": config["target_addr"],
+        "target_port": config["target_port"],
+    }
+    with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP) as raw_sock:
+        raw_sock.bind((config["bind_addr"], 0))
+        deadline = time.monotonic() + config.get("timeout_sec", 30)
+        ready_file.write_text("ready\n")
+        try:
+            while True:
+                raw_sock.settimeout(max(0.001, deadline - time.monotonic()))
+                packet, addr = raw_sock.recvfrom(65535)
+                if addr[0] != config["target_addr"] or len(packet) < 40:
+                    continue
+                ip_len = (packet[0] & 0x0F) * 4
+                tcp = packet[ip_len:]
+                if len(tcp) < 20:
+                    continue
+                src_port, dst_port, seq, ack, offset, flags = struct.unpack("!HHIIBB", tcp[:14])
+                if src_port != config["target_port"] or dst_port != config["bind_port"]:
+                    continue
+                now = time.monotonic()
+                if flags == 0x02:
+                    syn_packets += 1
+                    if local_isn is None:
+                        local_isn = seq
+                        first_syn_at = now
+                        if local_isn == 0:
+                            # No unsigned ISN can beat zero; report this rare
+                            # fixture limitation rather than test an exact tie.
+                            _emit({"local_isn": local_isn})
+                            return
+                        _send_ipv4_tcp_packet({**peer, "flags": "syn", "seq": 0})
+                elif flags == 0x12:
+                    synack_packets += 1
+                    if synack_at is None:
+                        synack_at = now
+                        if ack != 1:
+                            raise RuntimeError(f"unexpected collision SYNACK ACK: {ack}")
+                        # The same egress netem delay applies independently to
+                        # the opener and this final ACK/application datagram.
+                        _send_ipv4_tcp_packet(
+                            {
+                                **peer,
+                                "flags": "ack",
+                                "seq": 1,
+                                "ack": (seq + 1) & 0xFFFFFFFF,
+                                "payload": config["reply"],
+                            }
+                        )
+                elif flags & 0x04:
+                    raise RuntimeError("role handoff expired before queued UDP arrived")
+                elif synack_at is not None and len(tcp) > (offset >> 4) * 4:
+                    _emit(
+                        {
+                            "local_isn": local_isn,
+                            "syn_packets": syn_packets,
+                            "synack_packets": synack_packets,
+                            "synack_after_sec": synack_at - first_syn_at,
+                            "queued_after_sec": now - first_syn_at,
+                            "payload": tcp[(offset >> 4) * 4 :].decode(),
+                        }
+                    )
+                    return
+        finally:
+            ready_file.unlink(missing_ok=True)
+
+
 def capture_tcp_packet(config):
     src_addr = config["bind_addr"]
     dst_addr = config["target_addr"]
@@ -1353,6 +1431,7 @@ SCENARIOS = {
     "send_ipv4_udp_fragments": send_ipv4_udp_fragments,
     "send_l2_tcp_packet": send_l2_tcp_packet,
     "capture_tcp_packet": capture_tcp_packet,
+    "late_collision_peer": late_collision_peer,
     "capture_udp_packets": capture_udp_packets,
     "recv_many_reply": recv_many_reply,
     "send_many_with_barrier": send_many_with_barrier,

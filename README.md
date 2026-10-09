@@ -287,6 +287,11 @@ Duplicate current openers retransmit the same SYNACK. A different SYN in
 retry to create a fresh responder without being quarantined by arrival-order
 inference. Stale ACK/data does not restart the original retry budget/deadline.
 
+The simultaneous-open loser makes a one-time `SYN_SENT` to `SYN_RCVD` role
+handoff with a full responder retry/lifetime budget, even near initiator expiry.
+Its local-origin admission slot, queued UDP and packet metadata transfer
+atomically, so saturated remote admission cannot evict that queued datagram.
+
 Both endpoints independently send periodic keepalives, even while receiving
 pure ACKs or successfully transmitting application/control packets. Upgrade
 **both endpoints** for healthy idle survival; an older inbound-driven peer can

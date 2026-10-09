@@ -274,6 +274,108 @@ def test_syn_isn_tie_break(phantun_module, vm, saturate_remote):
         cleanup_netns_topology(vm)
 
 
+def test_late_collision_gets_full_responder_budget(phantun_module, vm):
+    phantun_module.load(
+        managed_netns="all",
+        managed_local_ports=MANAGED_LOCAL_PORTS,
+        handshake_timeout_ms=1000,
+        handshake_retries=2,
+    )
+    ensure_netns_topology(vm)
+    peer = None
+    client = None
+    rst_drop = None
+    try:
+        require_nft_or_skip(vm)
+        if not require_guest_command(vm, "tc"):
+            pytest.skip("tc is not available in the guest")
+        src_port = PORTS_A[0]
+        peer_port = 45000  # Unmanaged raw peer, not another module endpoint.
+        rst_drop = make_netns_output_flag_probe(
+            vm,
+            NS_B,
+            [
+                {
+                    "src_addr": NS_ADDR_B,
+                    "dst_addr": NS_ADDR_A,
+                    "src_port": peer_port,
+                    "dst_port": src_port,
+                    "flags_expr": flags,
+                    "action": "drop",
+                    "comment": f"raw_peer_{label}",
+                }
+                for flags, label in (("rst", "rst"), ("rst | ack", "rstack"))
+            ],
+        )
+        # Resolve neighbors before netem; delaying ARP would spend the old
+        # retry lifetime before the raw peer even observes its first SYN.
+        run_in_netns(vm, NS_A, ["ping", "-c", "1", "-W", "2", NS_ADDR_B])
+        # T=1s, N=2: the initiator expires at 3s. The lower SYN arrives
+        # around 2.2s, after both initiator retries; the final ACK at 4.4s
+        # requires both a fresh timer and a fresh responder retry budget.
+        # Both delays live in the guest data plane, not host SSH sleeps.
+        run_in_netns(vm, NS_B, ["tc", "qdisc", "add", "dev", VETH_B, "root", "netem", "delay", "2200ms"])
+        initial = read_module_stats(vm)
+        ready_file = f"/tmp/phantun_late_collision_{uuid.uuid4().hex}.ready"
+        peer = spawn_netns_scenario(
+            vm,
+            NS_B,
+            "late_collision_peer",
+            {
+                "bind_addr": NS_ADDR_B,
+                "bind_port": peer_port,
+                "target_addr": NS_ADDR_A,
+                "target_port": src_port,
+                "ready_file": ready_file,
+                "reply": "late-peer-data",
+                "timeout_sec": 30,
+            },
+        )
+        wait_for_guest_ready_file(vm, ready_file)
+        client = spawn_netns_scenario(
+            vm,
+            NS_A,
+            "send_many_recv",
+            {
+                "bind_addr": NS_ADDR_A,
+                "bind_port": src_port,
+                "target_addr": NS_ADDR_B,
+                "target_port": peer_port,
+                "payloads": ["queued-before-late-handoff"],
+                "recv_count": 1,
+                "timeout_sec": 20,
+            },
+        )
+        peer_result = peer.communicate(timeout=35)
+        assert_completed(peer_result, "late collision raw peer")
+        observed = parse_guest_json(peer_result.stdout, "late collision raw peer")
+        if observed["local_isn"] == 0:
+            pytest.skip("random initiator ISN is zero; no lower collision ISN exists")
+        assert observed["payload"] == "queued-before-late-handoff"
+        assert observed["syn_packets"] >= 2
+        assert observed["synack_packets"] >= 2
+        assert observed["synack_after_sec"] > 2
+        assert observed["queued_after_sec"] > 4
+        client_result = client.communicate(timeout=25)
+        assert_completed(client_result, "late collision UDP client")
+        delivered = parse_guest_json(client_result.stdout, "late collision UDP client")
+        assert [reply["message"] for reply in delivered["replies"]] == ["late-peer-data"]
+        final = read_module_stats(vm)
+        assert final["collisions_lost"] - initial["collisions_lost"] == 1
+        assert final["flows_created"] - initial["flows_created"] == 2
+        assert final["flows_established"] - initial["flows_established"] == 1
+        assert final["handshake_retries_exhausted"] == initial["handshake_retries_exhausted"]
+        assert final["half_open_rejected"] == initial["half_open_rejected"]
+    finally:
+        if peer is not None:
+            peer.terminate()
+        if client is not None:
+            client.terminate()
+        if rst_drop is not None:
+            rst_drop.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
 def test_established_bare_syn_replacement(phantun_module, vm):
     load_fast_liveness_module(phantun_module)
     ensure_netns_topology(vm)

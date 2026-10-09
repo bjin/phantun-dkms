@@ -1111,13 +1111,12 @@ int pht_flow_replace_dead(struct pht_flow_table *table, struct pht_flow *dead_fl
     return 0;
 }
 
-int pht_flow_replace_half_open(struct pht_flow_table *table, struct pht_flow *old_flow,
-                               struct pht_flow *new_flow, enum pht_flow_state expected_state) {
+int pht_flow_yield_initiator(struct pht_flow_table *table, struct pht_flow *old_flow,
+                             struct pht_flow *new_flow) {
     struct pht_flow_bucket *bucket;
-    unsigned long expires;
+    unsigned long now;
 
-    if (!table || !old_flow || !new_flow || old_flow == new_flow ||
-        !pht_flow_state_is_half_open(expected_state))
+    if (!table || !old_flow || !new_flow || old_flow == new_flow)
         return -EINVAL;
     if (old_flow->table != table || new_flow->table != table ||
         !pht_endpoint_pair_equal(&old_flow->endpoints, &new_flow->endpoints) ||
@@ -1129,13 +1128,8 @@ int pht_flow_replace_half_open(struct pht_flow_table *table, struct pht_flow *ol
     bucket = &table->buckets[pht_flow_hash_key(table, &old_flow->endpoints)];
     spin_lock_bh(&bucket->lock);
     spin_lock(&old_flow->lock);
-    if (hlist_unhashed(&old_flow->hnode) || old_flow->state != expected_state)
-        goto out_old;
-    /* While a callback emits unlocked, retries_done includes its attempt but
-     * timer.expires still holds the preceding deadline. Leave ownership alone
-     * until it rearms rather than consuming the next retry immediately.
-     */
-    if (old_flow->retransmit_armed && !timer_pending(&old_flow->retransmit_timer))
+    if (hlist_unhashed(&old_flow->hnode) || old_flow->state != PHT_FLOW_STATE_SYN_SENT ||
+        old_flow->role != PHT_FLOW_ROLE_INITIATOR)
         goto out_old;
 
     /* Completion sets ESTABLISHED before releasing its charge. Revalidate and
@@ -1143,7 +1137,7 @@ int pht_flow_replace_half_open(struct pht_flow_table *table, struct pht_flow *ol
      * serializes token ownership with every untrack path.
      */
     spin_lock(&table->half_open_lock);
-    if (old_flow->half_open_origin == PHT_HALF_OPEN_NONE) {
+    if (old_flow->half_open_origin != PHT_HALF_OPEN_LOCAL) {
         spin_unlock(&table->half_open_lock);
         goto out_old;
     }
@@ -1159,27 +1153,26 @@ int pht_flow_replace_half_open(struct pht_flow_table *table, struct pht_flow *ol
     new_flow->local_tx_meta = old_flow->local_tx_meta;
     old_flow->queued_skb = NULL;
     pht_tx_meta_init(&old_flow->queued_tx_meta);
-    new_flow->retries_done = old_flow->retries_done;
-    new_flow->max_retries = old_flow->max_retries;
-    new_flow->last_activity_jiffies = old_flow->last_activity_jiffies;
-    new_flow->last_inbound_jiffies = old_flow->last_inbound_jiffies;
-    new_flow->next_probe_jiffies = old_flow->next_probe_jiffies;
-    expires = old_flow->retransmit_armed
-                  ? old_flow->retransmit_timer.expires
-                  : old_flow->last_activity_jiffies + table->handshake_timeout_jiffies;
     old_flow->state = PHT_FLOW_STATE_DEAD;
     hlist_del_init(&old_flow->hnode);
     pht_stats_dec(PHT_STAT_FLOWS_CURRENT);
     spin_unlock(&old_flow->lock);
 
-    /* Arm before making the tuple reachable and hold the new lock across
-     * both steps: no late finish-publish may revive a concurrently dead timer.
-     * A callback already running on old_flow retains its own timer reference.
+    /* Start a full responder phase, not the initiator's remaining lifetime.
+     * Arm before publication under the new lock; never nest old/new locks.
+     * An old callback already emitting owns its timer reference, observes DEAD
+     * on return, and is drained by finalization before the old table ref drops.
      */
     spin_lock(&new_flow->lock);
+    now = jiffies;
+    new_flow->retries_done = 0;
+    new_flow->max_retries = table->handshake_retries;
+    new_flow->last_activity_jiffies = now;
+    new_flow->last_inbound_jiffies = now;
+    new_flow->next_probe_jiffies = get_jiffies_64() + table->keepalive_interval_jiffies;
     pht_flow_get(new_flow);
     new_flow->retransmit_armed = true;
-    mod_timer(&new_flow->retransmit_timer, expires);
+    mod_timer(&new_flow->retransmit_timer, now + table->handshake_timeout_jiffies);
     pht_flow_publish_locked(bucket, new_flow);
     pht_stats_inc(PHT_STAT_FLOWS_CREATED);
     spin_unlock(&new_flow->lock);
