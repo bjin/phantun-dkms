@@ -98,10 +98,12 @@ packet hook can read the configuration. Configuration is immutable while the
 module is attached and is released only after all namespaces have detached.
 
 `src/phantun_netns.c` owns namespace attachment, TCP port reservations,
-defragmentation, and topology notifiers. Failed attachment and normal exit use
-the same readiness-guarded cleanup: unregister packet hooks before destroying
-their flow table. `src/phantun_main.c` retains module entry/exit and the packet
-hooks and protocol state machine.
+defragmentation, and topology notifiers. Normal exit withdraws packet hooks in
+pernet `.pre_exit`, then destroys their state in `.exit` after the kernel's
+intervening RCU grace period. Failed attachment explicitly waits for networking
+readers after hook withdrawal before using the same readiness-guarded resource
+cleanup. `src/phantun_main.c` retains module entry/exit and the packet hooks and
+protocol state machine.
 
 ### 4.1 Symmetric nodes
 
@@ -123,6 +125,23 @@ Per flow, roles are only:
 | `all` | Attach to every network namespace through pernet init. |
 
 Only selected namespaces receive a flow table, per-net netdevice notifier, reserved local TCP sockets, and IPv4/IPv6 netfilter hooks. The selector rules below still decide traffic ownership inside each selected namespace. Skipped namespaces must remain invisible to global address notifiers and exit as no-ops because their pernet storage has no initialized flow table.
+
+Hook withdrawal clears `active` and unregisters every installed hook family,
+but keeps the initialized flow table available to in-flight hook readers.
+Neither `active = false` nor hook unregistration alone drains those readers.
+For failed attachment, `synchronize_net()` runs on every initialized-table
+rollback, even when neither family registration flag was set: registration can
+publish the first hook in a family and internally withdraw it when a later hook
+fails. Successful attachment uses the pernet `.pre_exit` / grace period / `.exit`
+ordering, including module unload from live namespaces.
+
+Only after that grace period does resource cleanup disable defragmentation,
+unregister the per-net netdevice notifier, release reserved sockets, and destroy
+the flow table. Table destruction retains GC cancellation, retransmit-timer
+shutdown, and both finalization-work flushes before pernet storage is released.
+Readiness and registration flags keep skipped namespaces inert and partial
+withdrawal/resource cleanup idempotent; the grace period is never conditional on
+the hook registration flags.
 
 ### 4.3 Interception selectors
 

@@ -350,11 +350,11 @@ static struct nf_hook_ops phantun_nf_ops_v6[] = {
 };
 #endif
 
-/* Failed attachment and normal exit quiesce hooks before destroying any
- * state they can borrow. Readiness distinguishes selected/initialized netns
- * from skipped namespaces and makes partial cleanup idempotent.
+/* Withdrawal leaves table storage and its other users intact until callers
+ * have supplied a grace period. Readiness keeps skipped namespaces inert and
+ * registration flags make partial withdrawal idempotent.
  */
-static void phantun_net_cleanup(struct net *net, struct phantun_net *pnet) {
+static void phantun_net_withdraw_hooks(struct net *net, struct phantun_net *pnet) {
     if (!pnet || !pnet->flow_table_ready)
         return;
 
@@ -369,6 +369,15 @@ static void phantun_net_cleanup(struct net *net, struct phantun_net *pnet) {
         nf_unregister_net_hooks(net, phantun_nf_ops_v4, ARRAY_SIZE(phantun_nf_ops_v4));
         pnet->hooks_v4_registered = false;
     }
+}
+
+/* Call only after hook withdrawal and an intervening RCU/networking grace
+ * period. Table destruction also drains independent timer/workqueue users.
+ */
+static void phantun_net_cleanup(struct net *net, struct phantun_net *pnet) {
+    if (!pnet || !pnet->flow_table_ready)
+        return;
+
     phantun_net_disable_defrag(net, pnet);
     if (pnet->netdev_notifier_registered) {
         unregister_netdevice_notifier_net(net, &pnet->netdev_nb);
@@ -441,8 +450,18 @@ static int __net_init phantun_net_init(struct net *net) {
     return 0;
 
 err_attach:
+    phantun_net_withdraw_hooks(net, pnet);
+    /* A failed nf_register_net_hooks() can have published and withdrawn
+     * individual hooks without setting either family registration flag.
+     * Every initialized-table rollback must therefore wait unconditionally.
+     */
+    synchronize_net();
     phantun_net_cleanup(net, pnet);
     return ret;
+}
+
+static void __net_exit phantun_net_pre_exit(struct net *net) {
+    phantun_net_withdraw_hooks(net, net_generic(net, phantun_net_id));
 }
 
 static void __net_exit phantun_net_exit(struct net *net) {
@@ -451,6 +470,7 @@ static void __net_exit phantun_net_exit(struct net *net) {
     if (!pnet || !pnet->flow_table_ready)
         return;
 
+    /* The pernet core guarantees an RCU grace period after .pre_exit. */
     phantun_net_cleanup(net, pnet);
     pht_pr_info("unregistered netfilter hooks and topology notifiers: netns %u\n",
                 phantun_netns_id(net));
@@ -460,6 +480,7 @@ static struct pernet_operations phantun_pernet_ops = {
     .id = &phantun_net_id,
     .size = sizeof(struct phantun_net),
     .init = phantun_net_init,
+    .pre_exit = phantun_net_pre_exit,
     .exit = phantun_net_exit,
 };
 
