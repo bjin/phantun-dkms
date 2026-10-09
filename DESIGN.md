@@ -73,6 +73,80 @@ Preferred happy path:
 
 Implementation must also accept a pure final `ACK` followed by later payload because shaping remains optional.
 
+### 2.3 UDP tolerance is a protocol requirement
+
+The fake-TCP carrier transports **unreliable, unordered UDP datagrams**, not a
+reliable byte stream. Design targets include paths with 70% packet loss and
+200ms-or-greater latency, as well as 10Gbps LANs with sub-millisecond latency.
+These are workload characteristics, not a guarantee that finite retry/expiry
+budgets survive every such path. A percentage does not bound consecutive loss,
+outage length, reordering age, or whether loss depends on packet size.
+
+An earlier receive-window experiment, even with a window of at least 10MB,
+was reverted after loss desynchronized its rolling state and caused valid
+payloads to be dropped. A larger window does not fix a state transition that
+requires unreliable packets to arrive.
+
+The following requirements take precedence over an optimization or stronger
+replay-filtering promise:
+
+- **No general established receive window.** Gaps, reordering, duplication,
+  and modulo sequence wrap do not require receipt of earlier payloads before
+  ordinary UDP can be delivered. ACK bookkeeping is not proof of contiguous
+  delivery and must not become an application-data admission gate.
+- **No reliable shaping sub-protocol.** A configured hint may be lost,
+  delayed, or duplicated. Reserve its sequence space without waiting for its
+  ACK or for another client datagram before releasing responder UDP. Perfect
+  duplicate-control suppression is less important than data-plane progress.
+  A one-shot reserved-slot exception has a bounded suppression cost; it is not
+  permission for a persistent mask retired only by observed receive progress.
+- **Independent control opportunities.** Accepted inbound traffic and local
+  transmit acceptance must not indefinitely suppress periodic liveness probes.
+  Successful local output does not establish peer receipt. A healthy control
+  exchange must not keep a blocked application queue alive indefinitely.
+- **A usable budget for a new handshake phase.** The one-time local
+  initiator-to-responder collision handoff retains atomic admission/queue
+  ownership but receives a full responder retry and lifetime opportunity.
+  It must not require the final exchange to fit an arbitrarily small remainder
+  of the abandoned initiator phase. This does not authorize unbounded lifetime
+  extension by repeated remote openers.
+- **No inferred generation chronology.** Random ISNs identify an opener and
+  resolve the existing simultaneous-open role tie; their magnitude is not
+  age. Receiving a different SYN later does not prove it is newer. Do not
+  quarantine a useful half-open opener solely from that inference.
+- **Resource bounds remain explicit.** Admission ceilings, bounded handshake
+  buffering/retries, liveness suspicion, and hard-idle expiry can still lose
+  individual datagrams or end a flow. Capacity reservations and changes in
+  expiry precedence require a before/after tolerance review, rather than being
+  treated as reliability-neutral implementation details.
+
+The wire has no unbounded generation identity: sufficiently delayed control
+copies and wrapped sequence reuse can be ambiguous. Shaping recognition is
+best effort, not a promise to hide every old copy. Existing flag/checksum/size
+validation and bounded previous-generation quarantine are separate contracts;
+they are not a general receive window. No delivery guarantee is made across an
+arbitrarily long outage or after a configured lifetime has expired.
+
+At a hypothetical 10Gbps of sequence-counted payload, the signed half-space
+is traversed in about 1.72 seconds and a full 32-bit wrap in about 3.44 seconds.
+Those are calculations, not measured module throughput; packet overhead makes
+the corresponding link-rate times longer. A proof that depends on observing
+receive progress before either boundary must state that extra assumption.
+
+Validation must distinguish independent random loss from burst/size-selective
+loss, one-way delay from RTT, and a fresh application retransmission from an
+exact duplicate network packet. Compare against the immediate parent, including
+late collisions, reordered openers, lost shaping responses, active output with
+lost payload, and sequence gaps across the half-space boundary.
+
+**Implementation status at introduction:** the persistent shaping mask,
+response-ACK queue gate, transmit-idle probe suppression, and inherited
+collision/half-open replacement policies described elsewhere below do not all
+satisfy this contract. Their mechanism descriptions must be updated with the
+corresponding corrective changes; this documentation-first addition does not
+claim those changes have already landed.
+
+
 ## 3. Chosen implementation vehicle
 
 ### Decision

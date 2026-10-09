@@ -32,11 +32,23 @@ This repo builds a Linux kernel module that runs Phantun-style fake-TCP in-kerne
 ## Important reminders
 - Managed traffic is intercepted in netfilter `LOCAL_OUT` and `PRE_ROUTING`.
 - Fake TCP is strict: 3-way handshake, seq/ack accounting, no FIN, RST on error.
-- First payloads are mandatory control payloads and are never delivered to the UDP app.
+- Configured first-payload shaping hints are optional, best-effort control bytes. Losing or reordering them must not block ordinary UDP progress.
 - Initial initiator seq must be a random `u32` aligned so `seq % 4095 == 0`.
 - For packet-loss tests, drop packets on veth ingress with nft `netdev` rules, not on sender `OUTPUT`, so loss is simulated on-path instead of as a local send failure.
 - Prefer checked-in guest helper scripts under `tests/guest/` over embedded Python strings in tests; virtme-ng COW snapshots make tracked repo files visible inside the guest.
 - Braces are structure, not text: if an edit emits `}`, prove the old `}` was removed, then re-read the surrounding block immediately.
+
+## Tolerance contract
+- The carrier is raw UDP, not a reliable TCP byte stream. Design and test for both heavy loss (including 70% loss with 200ms+ latency) and fast LANs (10Gbps with sub-millisecond latency). A loss percentage does not bound bursts, outage duration, or reordering.
+- Do not introduce an established receive window, contiguous-delivery prerequisite, or general payload deduplication. Sequence/ACK bookkeeping must not turn missing earlier packets into rejection of later valid UDP data.
+- A previous >=10MB receive-window experiment was reverted because rolling its state depended on unreliable packets. Enlarging such a window does not repair the dependency.
+- Prefer ordinary UDP progress over perfect shaping replay suppression. Do not add persistent payload-drop masks whose retirement depends on observing peer sequence progress, or wait for shaping ACKs/further client data before releasing responder UDP. A documented one-shot shaping exception is bounded; arbitrarily delayed duplicates and sequence reuse are not perfectly distinguishable on this wire format.
+- Keepalive opportunities must not be indefinitely postponed by accepted RX or unconfirmed local TX. Local output success is not peer receipt, and live keepalives do not prove a queued application datagram can make progress.
+- Preserve a full responder completion opportunity for the one-time simultaneous-open role handoff. Keep admission/queue ownership atomic without silently spending the new phase's budget in the old phase.
+- Do not infer generation age from SYN arrival order or random ISN magnitude. Do not add half-open replacement/quarantine policies that exclude a useful opener solely because another opener arrived later.
+- Bounded admission, handshake retries, liveness, and hard-idle expiry remain valid resource policies, not loss-free service guarantees. Document capacity and timer tradeoffs; do not require every prior payload or any single best-effort shaping packet to arrive.
+- Review protocol changes against their immediate parent with loss, reordering, duplication, wrap, late handoff, and one-way traffic traces. Distinguish random loss from correlated/size-selective loss, application retransmission (new sequence) from a network duplicate, and simulated sequence wrap from measured line-rate throughput.
+- See DESIGN.md section 2.3 for the normative contract and its limits.
 
 ## Coding style / safety
 - LLVM styles with 4 space tab width, small static helpers, explicit return-value checks.
