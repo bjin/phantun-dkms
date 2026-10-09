@@ -1139,6 +1139,53 @@ def send_l2_tcp_packet(config):
     _emit({"done": True})
 
 
+def replace_responder_generations(config):
+    """Establish and replace fresh tuples, then deliver one UDP per replacement."""
+    completed = 0
+    with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP) as receiver:
+        receiver.bind((config["bind_addr"], 0))
+        with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW) as sender:
+            sender.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            for index in range(config["count"]):
+                peer = {
+                    "bind_addr": config["bind_addr"],
+                    "bind_port": config["bind_port"] + index,
+                    "target_addr": config["target_addr"],
+                    "target_port": config["target_port"],
+                }
+                # Each tuple gets exactly one replacement, so an earlier
+                # replacement's protection deadline never gates the flood.
+                for isn in (0, 4095 * 1024):
+                    sender.sendto(
+                        _build_ipv4_tcp_packet({**peer, "flags": "syn", "seq": isn}),
+                        (config["target_addr"], 0),
+                    )
+                    deadline = time.monotonic() + config.get("timeout_sec", TIMEOUT_SEC)
+                    while True:
+                        receiver.settimeout(max(0.001, deadline - time.monotonic()))
+                        packet, addr = receiver.recvfrom(65535)
+                        if addr[0] != config["target_addr"] or len(packet) < 40:
+                            continue
+                        tcp = packet[(packet[0] & 0x0F) * 4 :]
+                        if len(tcp) < 20:
+                            continue
+                        src, dst, seq, ack, _, flags = struct.unpack("!HHIIBB", tcp[:14])
+                        if (src, dst, flags, ack) == (
+                            config["target_port"], peer["bind_port"], 0x12, isn + 1
+                        ):
+                            break
+                    sender.sendto(
+                        _build_ipv4_tcp_packet({
+                            **peer, "flags": "ack", "seq": isn + 1,
+                            "ack": (seq + 1) & 0xFFFFFFFF,
+                            "payload": f"replacement-{index}" if isn else "",
+                        }),
+                        (config["target_addr"], 0),
+                    )
+                completed += 1
+    _emit({"replacements": completed})
+
+
 def late_collision_peer(config):
     """Drive one delayed role handoff without host-side timing windows."""
     ready_file = Path(config["ready_file"])
@@ -1432,6 +1479,7 @@ SCENARIOS = {
     "send_l2_tcp_packet": send_l2_tcp_packet,
     "capture_tcp_packet": capture_tcp_packet,
     "late_collision_peer": late_collision_peer,
+    "replace_responder_generations": replace_responder_generations,
     "capture_udp_packets": capture_udp_packets,
     "recv_many_reply": recv_many_reply,
     "send_many_with_barrier": send_many_with_barrier,

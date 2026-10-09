@@ -477,6 +477,13 @@ The module exports counters under:
 
 Counters under `/sys/module/phantun/stats/*` are module-global and aggregate all managed network namespaces; they are not per-netns counters when `managed_netns=all`.
 
+Packet-triggered warnings (including local send failures) and collision/replacement
+info logs use the kernel's per-callsite rate limiting. Repeated events can therefore
+outnumber their log lines; suppressed diagnostics do not suppress packet processing
+or counter updates. Use these counters to measure failures and collision/replacement
+activity rather than counting log messages. Startup, configuration, and unload logs
+remain unthrottled.
+
 Example:
 
 ```bash

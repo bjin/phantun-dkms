@@ -1139,7 +1139,7 @@ phantun_local_out_live_flow(const struct phantun_local_out_ctx *ctx, struct pht_
                                            true, true, &payload_emitted);
         if (ret && ret != -EMSGSIZE) {
             phantun_account_udp_translation_failure();
-            pht_pr_warn("failed to emit fake-TCP payload for established flow: %d\n", ret);
+            pht_pr_warn_rl("failed to emit fake-TCP payload for established flow: %d\n", ret);
         }
         /* Freeing the original UDP skb after its payload was emitted as
          * fake TCP is consumption, not a drop.
@@ -1186,14 +1186,14 @@ static struct sk_buff *phantun_local_out_open_initiator(const struct phantun_loc
         pht_flow_create(ctx->flows, &ctx->ep, PHT_FLOW_ROLE_INITIATOR, PHT_FLOW_STATE_SYN_SENT);
     if (IS_ERR(new_flow)) {
         phantun_account_udp_translation_failure();
-        pht_pr_warn("failed to create initiator flow: %ld\n", PTR_ERR(new_flow));
+        pht_pr_warn_rl("failed to create initiator flow: %ld\n", PTR_ERR(new_flow));
         kfree_skb(skb);
         return NULL;
     }
 
     if (!phantun_pick_reopen_isn(prev_seq, has_prev_seq, &init_seq)) {
         phantun_account_udp_translation_failure();
-        pht_pr_warn("failed to choose reopen ISN for new flow\n");
+        pht_pr_warn_rl("failed to choose reopen ISN for new flow\n");
         pht_flow_put(new_flow);
         kfree_skb(skb);
         return NULL;
@@ -1241,7 +1241,7 @@ static struct sk_buff *phantun_local_out_open_initiator(const struct phantun_loc
     if (!ret) {
         pht_flow_set_egress_ifindex(new_flow, ifindex);
     } else {
-        pht_pr_warn("failed to emit fake-TCP SYN: %d\n", ret);
+        pht_pr_warn_rl("failed to emit fake-TCP SYN: %d\n", ret);
         /* Transient local drops leave the SYN to the handshake retransmit timer. */
         if (!phantun_io_error_is_transient(ret)) {
             phantun_account_udp_translation_failure();
@@ -1384,7 +1384,7 @@ static unsigned int phantun_pre_routing_segment_gso(void *priv, struct sk_buff *
     segs = __skb_gso_segment(skb, features, false);
     if (IS_ERR_OR_NULL(segs)) {
         err = IS_ERR(segs) ? PTR_ERR(segs) : -EINVAL;
-        pht_pr_warn("failed to segment inbound TCP GRO skb: %ld\n", err);
+        pht_pr_warn_rl("failed to segment inbound TCP GRO skb: %ld\n", err);
         return NF_DROP;
     }
 
@@ -1496,7 +1496,7 @@ static bool phantun_pre_routing_flush_queue(const struct phantun_pre_routing_ctx
         return true;
 
     phantun_discard_queued_udp_translation_failure(flow);
-    pht_pr_warn("failed to flush responder queue: %d\n", ret);
+    pht_pr_warn_rl("failed to flush responder queue: %d\n", ret);
     pht_flow_remove(flow);
     return false;
 }
@@ -1532,7 +1532,7 @@ static void phantun_pre_routing_finish_rx(const struct phantun_pre_routing_ctx *
         return;
     }
 
-    pht_pr_warn("failed to process %s: %d\n", what, ret);
+    pht_pr_warn_rl("failed to process %s: %d\n", what, ret);
     if (ret == -EMSGSIZE) {
         phantun_account_tcp_protocol_rejected();
         phantun_send_rstack(ctx->net, &ctx->ep, &ctx->view, &ctx->tx_meta);
@@ -1591,7 +1591,7 @@ static void phantun_pre_routing_accept_syn(const struct phantun_pre_routing_ctx 
 
     new_flow = phantun_pre_routing_new_responder(ctx);
     if (IS_ERR(new_flow)) {
-        pht_pr_warn("failed to create responder flow: %ld\n", PTR_ERR(new_flow));
+        pht_pr_warn_rl("failed to create responder flow: %ld\n", PTR_ERR(new_flow));
         return;
     }
     if (prev)
@@ -1610,7 +1610,7 @@ static void phantun_pre_routing_accept_syn(const struct phantun_pre_routing_ctx 
 
     ret = phantun_send_synack(new_flow, ctx->net, &ctx->tx_meta);
     if (ret) {
-        pht_pr_warn("failed to emit SYN|ACK: %d\n", ret);
+        pht_pr_warn_rl("failed to emit SYN|ACK: %d\n", ret);
         /* Transient local drops leave SYN|ACK to the handshake retransmit timer. */
         if (!phantun_io_error_is_transient(ret))
             pht_flow_detach(new_flow);
@@ -1663,12 +1663,12 @@ static void phantun_pre_routing_yield_initiator(const struct phantun_pre_routing
         pht_flow_put(new_flow);
         return;
     }
-    pht_pr_info("collision on tuple; switching to responder role\n");
+    pht_pr_info_rl("collision on tuple; switching to responder role\n");
     pht_stats_inc(PHT_STAT_COLLISIONS_LOST);
 
     ret = phantun_send_synack(new_flow, ctx->net, &ctx->tx_meta);
     if (ret) {
-        pht_pr_warn("failed to emit SYN|ACK after collision handoff: %d\n", ret);
+        pht_pr_warn_rl("failed to emit SYN|ACK after collision handoff: %d\n", ret);
         if (!phantun_io_error_is_transient(ret))
             pht_flow_detach(new_flow);
     }
@@ -1695,7 +1695,7 @@ static void phantun_pre_routing_collision(const struct phantun_pre_routing_ctx *
         return;
 
     if (snap->local_isn < peer_isn) {
-        pht_pr_info("collision on tuple; keeping initiator role\n");
+        pht_pr_info_rl("collision on tuple; keeping initiator role\n");
         pht_flow_touch_inbound(flow);
         pht_stats_inc(PHT_STAT_COLLISIONS_WON);
         return;
@@ -1733,7 +1733,7 @@ phantun_pre_routing_complete_initiator(const struct phantun_pre_routing_ctx *ctx
     if (complete == PHT_FLOW_COMPLETE_ALREADY_ESTABLISHED) {
         ret = phantun_send_idle_ack(flow, ctx->net, &ctx->tx_meta);
         if (ret)
-            pht_pr_warn("failed to ACK duplicate SYN|ACK: %d\n", ret);
+            pht_pr_warn_rl("failed to ACK duplicate SYN|ACK: %d\n", ret);
         return;
     }
 
@@ -1741,7 +1741,7 @@ phantun_pre_routing_complete_initiator(const struct phantun_pre_routing_ctx *ctx
     if (phantun_request_enabled()) {
         ret = phantun_send_handshake_request(flow, ctx->net);
         if (ret) {
-            pht_pr_warn("failed to emit handshake request: %d\n", ret);
+            pht_pr_warn_rl("failed to emit handshake request: %d\n", ret);
             if (!phantun_io_error_is_transient(ret)) {
                 pht_flow_remove(flow);
                 return;
@@ -1757,7 +1757,7 @@ phantun_pre_routing_complete_initiator(const struct phantun_pre_routing_ctx *ctx
     }
     if (ret) {
         phantun_discard_queued_udp_translation_failure(flow);
-        pht_pr_warn("failed to finalize initiator open: %d\n", ret);
+        pht_pr_warn_rl("failed to finalize initiator open: %d\n", ret);
         pht_flow_remove(flow);
     }
 }
@@ -1879,7 +1879,7 @@ phantun_pre_routing_complete_responder(const struct phantun_pre_routing_ctx *ctx
          */
         ret = phantun_send_handshake_response(flow, ctx->net, &ctx->tx_meta);
         if (ret) {
-            pht_pr_warn("failed to emit handshake response: %d\n", ret);
+            pht_pr_warn_rl("failed to emit handshake response: %d\n", ret);
             if (!phantun_io_error_is_transient(ret)) {
                 pht_flow_remove(flow);
                 return;
@@ -1914,7 +1914,7 @@ static void phantun_pre_routing_syn_rcvd(const struct phantun_pre_routing_ctx *c
         ntohl(view->tcp->seq) + 1 == snap->peer_syn_next) {
         ret = phantun_send_synack(flow, ctx->net, &ctx->tx_meta);
         if (ret)
-            pht_pr_warn("failed to re-emit SYN|ACK: %d\n", ret);
+            pht_pr_warn_rl("failed to re-emit SYN|ACK: %d\n", ret);
         return;
     }
 
@@ -1955,7 +1955,7 @@ static void phantun_pre_routing_established_syn(const struct phantun_pre_routing
         ntohl(view->tcp->seq) + 1 == snap->peer_syn_next) {
         ret = phantun_send_idle_ack(flow, ctx->net, &ctx->tx_meta);
         if (ret)
-            pht_pr_warn("failed to ACK duplicate current-generation SYN|ACK: %d\n", ret);
+            pht_pr_warn_rl("failed to ACK duplicate current-generation SYN|ACK: %d\n", ret);
         return;
     }
 
@@ -1973,7 +1973,7 @@ static void phantun_pre_routing_established_syn(const struct phantun_pre_routing
     if (snap->role == PHT_FLOW_ROLE_RESPONDER && ntohl(view->tcp->seq) + 1 == snap->peer_syn_next) {
         ret = phantun_send_synack(flow, ctx->net, &ctx->tx_meta);
         if (ret)
-            pht_pr_warn("failed to re-emit SYN|ACK for duplicate established SYN: %d\n", ret);
+            pht_pr_warn_rl("failed to re-emit SYN|ACK for duplicate established SYN: %d\n", ret);
         return;
     }
 
@@ -1990,7 +1990,7 @@ static void phantun_pre_routing_established_syn(const struct phantun_pre_routing
     prev.remote_seq_start = flow->remote_seq_window_start;
     prev.remote_seq_end = flow->ack;
     spin_unlock_bh(&flow->lock);
-    pht_pr_info("received bare SYN on ESTABLISHED tuple, replacing generation\n");
+    pht_pr_info_rl("received bare SYN on ESTABLISHED tuple, replacing generation\n");
     kfree_skb(pht_flow_take_queued_skb(flow, NULL));
     pht_flow_detach(flow);
     phantun_pre_routing_accept_syn(ctx, NULL, &prev);
