@@ -75,7 +75,9 @@ MODULE_PARM_DESC(keepalive_interval_sec, "Periodic keepalive ACK interval in sec
 module_param(keepalive_misses, uint, 0444);
 MODULE_PARM_DESC(keepalive_misses, "Inbound-silence interval budget (minimum effective budget: two)");
 module_param(hard_idle_timeout_sec, uint, 0444);
-MODULE_PARM_DESC(hard_idle_timeout_sec, "Maximum idle flow timeout in seconds (hard GC limit)");
+MODULE_PARM_DESC(hard_idle_timeout_sec,
+                 "GC timeout since recorded activity in seconds; accepted inbound keepalives "
+                 "refresh it, periodic probe attempts do not (not an absolute lifetime)");
 module_param(reopen_guard_bytes, uint, 0444);
 MODULE_PARM_DESC(reopen_guard_bytes, "Minimum sequence space separation for new connections");
 module_param(half_open_limit, uint, 0444);

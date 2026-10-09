@@ -201,6 +201,12 @@ Rules:
 
 This boundary controls which namespaces receive flow tables, topology notifiers, optional reserved TCP sockets, and IPv4/IPv6 netfilter hooks. Inside each attached namespace, `managed_local_ports` and `managed_remote_peers` still decide traffic ownership. If your UDP application intentionally runs in a separate network namespace, container namespace, or test namespace, set `managed_netns=all`.
 
+VRF/l3mdev deployments are not supported. Namespace attachment does not add VRF
+isolation: IPv4 inbound ownership checks use the namespace's `local` routing
+table, not a VRF table, and flow identity has no VRF discriminator. Outbound UDP
+may therefore be intercepted while inbound fake TCP falls through to the real
+TCP stack. Use separate network namespaces rather than overlapping VRF tuples.
+
 ### Selector modes
 
 | Mode | What you set | Tradeoff |
@@ -272,7 +278,7 @@ Validation rules:
 | `handshake_retries` | `6` | Maximum handshake retry count before `RST` teardown. |
 | `keepalive_interval_sec` | `30` | Periodic keepalive ACK interval, independent of accepted RX and ordinary/control TX. |
 | `keepalive_misses` | `3` | Positive inbound-silence interval budget. Teardown follows `max(2, keepalive_misses) * keepalive_interval_sec`, not a count of unanswered packets. |
-| `hard_idle_timeout_sec` | `300` | Hard upper bound for idle flow lifetime. |
+| `hard_idle_timeout_sec` | `300` | GC timeout since the last recorded activity, including accepted inbound keepalives; not an absolute or application-idle flow lifetime. |
 | `reopen_guard_bytes` | `4194304` | Minimum sequence-space distance before reopening same tuple; accepts `0..1073741823` and rejects values `>= 1073741824`. |
 | `half_open_limit` | `4096` | Total admitted half-open ceiling `L` per network namespace, shared by families/selectors. Reserve `R = max(1, floor(L / 4))` for local-origin handshakes when `L > 1`, otherwise `R = 0`. Remote-origin flows are capped at `L - R`; local opens may use all unused total capacity. A simultaneous-open role change retains its local-origin charge. Establishment or teardown releases the slot. |
 | `replacement_quarantine_ms` | `3000` | Non-sliding previous-generation quarantine window after established tuple replacement. Matching old-generation packets are silently dropped; bare SYNs are exempt and use state-specific duplicate/replacement handling. |
@@ -307,6 +313,14 @@ high-latency paths. Defaults give a 90-second inbound-silence timeout.
 Seconds-based timers must fit their millisecond conversion, and the complete
 silence timeout must fit the kernel's signed jiffies range. Hard-idle expiry
 still takes precedence and tears down silently.
+
+`hard_idle_timeout_sec` uses the flow's last recorded activity, not its creation
+time or last application payload. Accepted inbound packets, including pure ACKs
+and keepalives, refresh that clock; local queue admission and successful
+payload/immediate-control sends can also refresh it. Periodic keepalive attempts
+do not. A healthy application-idle flow can therefore remain established
+indefinitely while keepalives arrive often enough. DEAD tombstones receive no
+new activity and are collected against their retained activity timestamp.
 
 ### Shaping payload formats
 
@@ -369,13 +383,50 @@ sudo modprobe phantun
 | Topic | What changes here |
 |---|---|
 | **No TUN plumbing** | Do not copy Phantun's TUN DNAT/SNAT/masquerade setup into this project. |
-| **Conntrack** | The module stays on the normal host path and integrates with conntrack instead of creating a separate TUN routing topology. |
+| **Conntrack** | Original UDP conntrack state supports stateful firewall handling of reinjected replies, not ordinary UDP NAT traversal; see [Conntrack and NAT](#conntrack-and-nat). |
 | **Loopback** | Loopback traffic is still left alone by the data path, so default local Phantun-on-loopback setups can coexist. Only an effective `reserved_local_ports` wildcard bind in pure local-only mode blocks loopback listeners on the same port in a selected namespace; ignored or failed reservations do not. |
-| **MTU** | Same basic fake-TCP packet overhead as Phantun; Phantun's MTU guidance still applies. |
+| **MTU** | Fake TCP adds 12 bytes relative to UDP. Fixed outbound payload caps apply even on jumbo paths; see [Payload size and path MTU](#payload-size-and-path-mtu). |
 | **Handshake buffering** | During handshake, the module queues at most **one** outbound UDP packet per flow; later packets may be dropped and must rely on normal app retransmission. |
 | **Zero-length UDP** | A zero-length outbound UDP datagram on a managed tuple is consumed and counted as dropped; it does not create a flow and is not delivered, because fake-TCP data is carried in ACK payload bytes and the wire protocol has no representation for an empty datagram. |
 | **Shaping semantics** | `handshake_request` / `handshake_response` are hints, not a verified sub-protocol. |
 | **Keepalive** | `phantun-dkms` has TCP-like keepalive behavior; that is another reason mixed Phantun / `phantun-dkms` endpoints should not be assumed to interoperate. |
+
+### Conntrack and NAT
+
+Phantun confirms the original tracked UDP entry before stealing the outbound
+packet so translated replies can match established host-firewall policy. The
+stolen UDP does not reach later `OUTPUT` DNAT or `POSTROUTING`
+SNAT/MASQUERADE hooks; those rules do not rewrite the managed outbound UDP.
+
+Generated fake TCP is explicitly conntrack-untracked, and owned inbound fake
+TCP is intercepted before normal ingress conntrack/NAT. Do not expect ordinary
+conntrack-based NAT on the Phantun host to translate that carrier. Reinjected
+UDP still traverses later ingress conntrack and firewall hooks.
+
+This is distinct from NAT performed by another device on the network path.
+Validate the intended endpoint and NAT arrangement separately; conntrack
+integration here is not a general host-NAT compatibility guarantee.
+
+### Payload size and path MTU
+
+The generated fake-TCP IP packet is limited to 1500 bytes, independently of the
+interface or route MTU. The maximum **outbound UDP payload**, excluding the UDP
+header, is:
+
+| Underlay family | Maximum UDP payload |
+|---|---:|
+| IPv4 | 1460 bytes |
+| IPv6 | 1440 bytes |
+
+Larger payloads are consumed/dropped during translation without returning a
+size error or generating PMTU feedback to the UDP application; `sendto()`
+success does not mean delivery. These drops increment `oversized_payloads_dropped`
+and `udp_packets_dropped`. UDP GSO is segmented first, so the cap applies to each
+resulting datagram, not the entire superframe.
+
+A smaller path MTU can impose a lower usable limit; a jumbo MTU does not raise
+these caps. Budget the application's encapsulation headers as well when setting
+a tunnel MTU.
 
 ### IPv4 reverse-path filtering
 
@@ -401,6 +452,20 @@ Use one of these methods:
    The `main` table must route the peer over the physical underlay. Update the rule when the endpoint changes. This also routes matching raw WireGuard UDP through `main` if phantun is absent; add a fail-closed OUTPUT rule when that fallback is not acceptable.
 
 phantun does not modify `rp_filter`; source-validation policy remains under operator control.
+
+### Reinjection and packet marks
+
+Decapsulated UDP temporarily uses one random per-network-namespace `skb->mark`
+value with its high bit set. Phantun clears any exact matching ingress mark
+before loopback or protocol dispatch, including on externally marked packets.
+Only UDP receives the reinjection exemption from selector-owned raw-UDP
+dropping; TCP still undergoes normal ownership and fake-TCP validation.
+
+An externally applied matching UDP mark also receives that exemption: the hook
+cannot distinguish it from genuine reinjection. Avoid treating this cookie as
+a public bypass API or assuming every high-bit mark is preserved. For mark
+debugging, observe packets before Phantun's `PRE_ROUTING` priority of `-399`;
+the cookie is not a configurable or stable value.
 
 ## Runtime stats
 

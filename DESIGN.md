@@ -194,6 +194,13 @@ Per flow, roles are only:
 
 Only selected namespaces receive a flow table, per-net netdevice notifier, reserved local TCP sockets, and IPv4/IPv6 netfilter hooks. The selector rules below still decide traffic ownership inside each selected namespace. Skipped namespaces must remain invisible to global address notifiers and exit as no-ops because their pernet storage has no initialized flow table.
 
+VRF/l3mdev support is outside this attachment contract. IPv4 local-delivery
+classification consults `RT_TABLE_LOCAL`, and flow identity does not distinguish
+VRFs within a namespace. Outbound interception can therefore be asymmetric with
+inbound ownership, and overlapping VRF tuples are unsupported. Consulting an
+l3mdev table alone would not establish support: routing, flow identity,
+reinjection, and topology invalidation would also need a consistent contract.
+
 Hook withdrawal clears `active` and unregisters every installed hook family,
 but keeps the initialized flow table available to in-flight hook readers.
 Neither `active = false` nor hook unregistration alone drains those readers.
@@ -502,6 +509,15 @@ precedence and is silent. Both endpoints must use independent scheduling for
 healthy idle survival: new probes can still suppress an older peer's
 inbound-driven schedule. Pure ACKs are not answered merely to sustain liveness.
 
+The hard-idle check measures elapsed jiffies since `last_activity_jiffies`,
+using the configured timeout; it is not a maximum generation age or application-idle
+deadline. Accepted inbound packets, including pure ACKs/keepalives, refresh
+activity alongside the inbound-liveness clock. Local queue admission and
+successful payload/immediate-control sends can also refresh activity, but
+periodic keepalive attempts do not. Healthy control traffic can thus sustain an
+application-idle generation indefinitely. A DEAD tombstone is collected using
+its retained activity timestamp, without granting a new timeout at retirement.
+
 Inbound flag priority in established state:
 
 1. `RST` → destroy local state silently
@@ -664,6 +680,23 @@ Behavior:
 - copy the outbound UDP packet's transmit metadata to the generated fake-TCP packet
 - original UDP skb is stolen from the stack
 
+Early confirmation preserves the original UDP conntrack identity for stateful
+firewall handling of reinjected replies; it does not provide ordinary UDP NAT
+traversal. The stolen packet never reaches later `LOCAL_OUT` DNAT or
+`POST_ROUTING` SNAT/MASQUERADE hooks. Generated fake TCP is untracked, and owned
+inbound fake TCP is consumed before carrier conntrack/NAT, so ordinary
+conntrack-based host NAT must not be assumed to translate the carrier either.
+Reinjected UDP still traverses later ingress conntrack/filter processing. NAT
+performed elsewhere on the path is a separate deployment concern.
+
+Outbound translation caps generated fake-TCP IP packets at 1500 bytes, allowing
+UDP payloads of at most 1460 bytes over IPv4 or 1440 bytes over IPv6. This is a
+fixed builder limit, not a discovered path MTU; smaller paths can impose a lower
+limit, and larger paths do not raise it. Oversized outbound payloads are
+consumed/dropped without a size error or PMTU feedback to the original UDP
+socket, incrementing both `oversized_payloads_dropped` and `udp_packets_dropped`.
+The limit applies per datagram after UDP GSO segmentation.
+
 ### 8.2 Inbound fake-TCP interception
 
 | Item | Value |
@@ -707,6 +740,12 @@ The dispatcher consumes the private reinjection mark before loopback and
 protocol dispatch, but exempts only UDP from raw-UDP dropping. TCP carrying an
 externally applied matching mark still follows normal selector checks and
 fake-TCP validation; the cookie must never become a TCP bypass.
+The cookie occupies one random high-bit value in the shared `skb->mark` space
+per attached namespace, not an isolated metadata field. An externally applied
+exact match is therefore cleared even on loopback or non-UDP packets; a matching
+UDP packet is indistinguishable from reinjection and also bypasses raw-UDP
+dropping. Randomization avoids common low marks but does not eliminate
+collisions or provide an authenticated exemption.
 
 ### 8.4 Decapsulated UDP reinjection
 

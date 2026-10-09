@@ -274,7 +274,7 @@ in
     hardIdleTimeoutSec = mkOption {
       type = nullableIntType;
       default = null;
-      description = "Positive hard upper bound for idle flow lifetime, or null to use the kernel default.";
+      description = "Positive GC timeout in seconds since the last recorded flow activity, including accepted inbound keepalives; not an absolute or application-idle lifetime. Periodic keepalive attempts do not refresh activity. Null uses the kernel default.";
     };
 
     reopenGuardBytes = mkOption {
