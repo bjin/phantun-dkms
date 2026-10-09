@@ -162,8 +162,8 @@ struct pht_flow {
     unsigned int max_retries;
     unsigned long last_activity_jiffies;
     unsigned long last_inbound_jiffies;
-    /* TX-idle probe deadline, independent of accepted RX. Failed probes also
-     * reserve an interval; use 64 bits across long-lived 32-bit jiffies wraps.
+    /* Periodic probe deadline, independent of RX and ordinary/control TX.
+     * Failed probes reserve an interval; 64 bits survive 32-bit jiffies wraps.
      */
     u64 next_probe_jiffies;
     /* 64-bit so an expired ACK-suppression marker can never become recent
@@ -303,23 +303,6 @@ static inline void pht_flow_touch_inbound_locked(struct pht_flow *flow) {
 }
 
 void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex);
-/* Successful nonterminal output only; callers retain a ref across emission.
- * Neither helper changes inbound liveness or hard-idle activity. The locked
- * helper returns the completion timestamp (zero for DEAD) for payload tracking.
- */
-static inline u64 pht_flow_note_output_locked(struct pht_flow *flow, int ifindex) {
-    u64 now;
-
-    lockdep_assert_held(&flow->lock);
-    if (flow->state == PHT_FLOW_STATE_DEAD)
-        return 0;
-    now = get_jiffies_64();
-    flow->next_probe_jiffies = now + flow->table->keepalive_interval_jiffies;
-    flow->egress_ifindex = ifindex;
-    return now;
-}
-
-void pht_flow_note_output(struct pht_flow *flow, int ifindex);
 bool pht_flow_queue_skb_if_empty(struct pht_flow *flow, struct sk_buff *skb,
                                  const struct pht_tx_meta *meta);
 void pht_flow_set_queued_skb(struct pht_flow *flow, struct sk_buff *skb,

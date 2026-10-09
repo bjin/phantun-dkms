@@ -26,6 +26,7 @@ from helpers import (
     load_fast_liveness_module,
     load_managed_module,
     make_netns_ingress_drop_probe,
+    make_netns_ingress_payload_drop_probe,
     make_netns_output_flag_probe,
     make_netns_output_ipv4_pure_ack_probe,
     parse_guest_json,
@@ -61,8 +62,8 @@ def test_liveness_timeout_recovers(phantun_module, vm):
             "bind_addr": NS_ADDR_B,
             "bind_port": dst_port,
             "count": 2,
-            # The test blocks traffic well past the 3s liveness deadline
-            # (1s interval * (2 misses + 1)). The default 5s socket timeout in the
+            # The test blocks traffic well past the 2s liveness deadline
+            # (1s interval * 2 misses). The default 5s socket timeout in the
             # guest scenario runner is too tight and causes the server to crash
             # before the second payload arrives.
             "timeout_sec": 20,
@@ -119,7 +120,7 @@ def test_liveness_timeout_recovers(phantun_module, vm):
             ],
         )
 
-        # The 3s liveness deadline is driven by delayed GC work. Poll for the
+        # The 2s liveness deadline is driven by delayed GC work. Poll for the
         # contract change instead of sleeping a fixed interval: once local
         # liveness fails, the old generation should emit at least one RST before
         # recovery opens a replacement generation.
@@ -175,7 +176,7 @@ def test_liveness_timeout_recovers(phantun_module, vm):
 
 
 def test_liveness_reinitiates_flow_with_queued_packet(phantun_module, vm):
-    load_fast_liveness_module(phantun_module)
+    load_fast_liveness_module(phantun_module, hard_idle_timeout_sec=3)
     ensure_netns_topology(vm)
 
     if not require_guest_command(vm, "nft"):
@@ -215,37 +216,35 @@ def test_liveness_reinitiates_flow_with_queued_packet(phantun_module, vm):
         },
     )
 
+    server = None
     try:
-        time.sleep(0.5)
-        stats_after_first_syn = read_module_stats(vm)
-        flows_created_1 = stats_after_first_syn["flows_created"] - initial_stats["flows_created"]
-        if flows_created_1 != 1:
-            pytest.fail(f"expected 1 flow created (1 initiator), got {flows_created_1}")
-
-        # The flow is created at t=0.
-        # Retransmits happen at t=1s, 2s, 3s, 4s...
-        # Liveness timeout happens at t=3s. When liveness timeout occurs, the queued UDP
-        # packet is reinjected, creating a new flow.
-        # Since VM time can drift or be delayed relative to host time, poll the stats
-        # for up to 10 seconds (20 iterations of 0.5s).
-        success = False
-        for _ in range(20):
-            time.sleep(0.5)
-            stats_after_liveness = read_module_stats(vm)
-            flows_created_2 = stats_after_liveness["flows_created"] - stats_after_first_syn["flows_created"]
-            if flows_created_2 >= 2:
-                success = True
-                break
-
-        if not success:
-            pytest.fail(f"expected flow to be re-initiated 2 times due to liveness, got {flows_created_2}")
-
-        rst_sent = stats_after_liveness["rst_sent"] - initial_stats["rst_sent"]
-        if rst_sent != 0:
-            pytest.fail(f"half-open liveness reinitiation must not emit RST before retry exhaustion, got {rst_sent}")
-    finally:
+        # With I=1, M=2, H=3, liveness must preserve/reinject the half-open
+        # queue before hard-idle's silent discard. No further local UDP is sent.
+        wait_for_stat_greater(vm, "flows_created", initial_stats["flows_created"] + 1)
+        recovered = read_module_stats(vm)
+        assert recovered["rst_sent"] == initial_stats["rst_sent"]
+        assert recovered["handshake_retries_exhausted"] == initial_stats["handshake_retries_exhausted"]
+        ready = f"/tmp/phantun-queued-recovery-{uuid.uuid4().hex}"
+        server = spawn_netns_scenario(vm, NS_B, "echo_server", {
+            "bind_addr": NS_ADDR_B, "bind_port": dst_port, "count": 1,
+            "timeout_sec": 20, "ready_file": ready,
+        })
+        wait_for_guest_ready_file(vm, ready)
         probe_b.cleanup(vm)
-        vm.run(["ip", "netns", "exec", NS_A, "nft", "flush", "ruleset"], check=False)
+        probe_b = None
+        result = client.communicate(timeout=20)
+        assert_completed(result, "original queued client")
+        assert parse_guest_json(result.stdout, "queued client")["echoed"] == ["msg1"]
+        result = server.communicate(timeout=10)
+        assert_completed(result, "queued recovery server")
+        assert received_messages(parse_guest_json(result.stdout, "queued server")) == ["msg1"]
+    finally:
+        if probe_b is not None:
+            probe_b.cleanup(vm)
+        for process in (client, server):
+            if process is not None and process.proc.poll() is None:
+                process.terminate()
+        cleanup_netns_topology(vm)
 
 
 def test_netns_recent_bidirectional_payload_suppresses_idle_ack(phantun_module, vm):
@@ -390,11 +389,11 @@ def test_netns_recent_bidirectional_payload_suppresses_idle_ack(phantun_module, 
 
 
 @contextmanager
-def _liveness_echo_pair(vm, addr_a=NS_ADDR_A, addr_b=NS_ADDR_B, echo_count=100000):
+def _liveness_echo_pair(vm, addr_a=NS_ADDR_A, addr_b=NS_ADDR_B, echo_count=100000, count=100000):
     ready = f"/tmp/phantun-liveness-{uuid.uuid4().hex}"
     server = spawn_netns_scenario(
         vm, NS_B, "echo_server",
-        {"bind_addr": addr_b, "bind_port": PORTS_B[0], "count": 100000,
+        {"bind_addr": addr_b, "bind_port": PORTS_B[0], "count": count,
          "timeout_sec": 60, "ready_file": ready, "echo_count": echo_count},
     )
     client = {
@@ -406,6 +405,8 @@ def _liveness_echo_pair(vm, addr_a=NS_ADDR_A, addr_b=NS_ADDR_B, echo_count=10000
         result = run_netns_scenario(vm, NS_A, "echo_client", {**client, "payloads": ["open"]})
         assert_completed(result, "liveness initial echo")
         assert parse_guest_json(result.stdout, "initial echo")["echoed"] == ["open"]
+        if count == 1:
+            assert_completed(server.communicate(timeout=10), "single liveness echo server")
         yield client
     finally:
         if server.proc.poll() is None:
@@ -450,7 +451,7 @@ def _healthy_idle_survives(phantun_module, vm, ipv6, misses, phase, shaping):
             before = read_module_stats(vm)
             ack_before = [probe.packets(vm, "liveness_ack") for probe in probes]
             # Use guest elapsed time, spanning at least three silence timeouts.
-            vm.run(["sleep", str(3 * (misses + 1))])
+            vm.run(["sleep", str(3 * max(2, misses))])
             idle = read_module_stats(vm)
             assert idle["flows_current"] == before["flows_current"] == 2
             assert idle["established_liveness_timeouts"] == before["established_liveness_timeouts"]
@@ -483,7 +484,7 @@ def test_ipv6_healthy_idle_survives_multiple_timeouts(phantun_module, vm, misses
 
 
 @pytest.mark.parametrize("pmtu_failure", [False, True], ids=["successful-payload", "failed-payload"])
-def test_probe_deadline_tracks_actual_payload_output(phantun_module, vm, pmtu_failure):
+def test_periodic_probes_survive_payload_output(phantun_module, vm, pmtu_failure):
     if not require_guest_command(vm, "nft"):
         pytest.skip("nft is not available in the guest")
     load_managed_module(phantun_module, keepalive_interval_sec=1, keepalive_misses=20)
@@ -511,14 +512,13 @@ def test_probe_deadline_tracks_actual_payload_output(phantun_module, vm, pmtu_fa
             assert observed["sent"] >= 10, observed
             assert after["stats"]["flows_created"] == before["stats"]["flows_created"]
             assert after["stats"]["established_liveness_timeouts"] == before["stats"]["established_liveness_timeouts"]
+            assert 3 <= probes <= floor(observed["elapsed_sec"]) + 1, observed
             if pmtu_failure:
                 assert after["stats"]["oversized_payloads_dropped"] - before["stats"]["oversized_payloads_dropped"] == observed["sent"]
-                assert 3 <= probes <= floor(observed["elapsed_sec"]) + 1, observed
             else:
-                # B ACKs this one-way stream without sending payload, so A
-                # owes no payload ACKs that could obscure the probe count.
+                # B sends no payload: A's pure ACKs are periodic probes,
+                # independent of successful cached-route application output.
                 assert observed["max_send_gap_sec"] < 1, observed
-                assert probes == 0, observed
                 assert after["stats"]["route_cache_hits"] > before["stats"]["route_cache_hits"]
     finally:
         probe.cleanup(vm)
@@ -610,4 +610,77 @@ def test_successful_payload_output_cannot_hide_inbound_loss(phantun_module, vm):
         if drop is not None:
             drop.cleanup(vm)
         probe.cleanup(vm)
+        cleanup_netns_topology(vm)
+
+
+def test_active_payload_loss_preserves_live_control_path(phantun_module, vm):
+    if not require_guest_command(vm, "nft") or not require_guest_command(vm, "tc"):
+        pytest.skip("nft and tc are required")
+    load_managed_module(phantun_module, keepalive_interval_sec=1, keepalive_misses=3)
+    ensure_netns_topology(vm)
+    probes, drops, senders = [], [], []
+    payload = "lost-application-datagram"
+    try:
+        # Establish both real endpoints, then close the sockets so independent
+        # local UDP senders can sustain traffic even while all payload is lost.
+        with _liveness_echo_pair(vm, count=1):
+            pass
+        before = read_module_stats(vm)
+        for namespace, device, src, dst, sport, dport in (
+            (NS_A, VETH_A, NS_ADDR_A, NS_ADDR_B, PORTS_A[0], PORTS_B[0]),
+            (NS_B, VETH_B, NS_ADDR_B, NS_ADDR_A, PORTS_B[0], PORTS_A[0]),
+        ):
+            run_in_netns(vm, namespace, [
+                "tc", "qdisc", "replace", "dev", device, "root", "netem", "delay", "200ms",
+            ])
+            probes.append(make_netns_output_ipv4_pure_ack_probe(
+                vm, namespace, src, sport, dst, dport,
+            ))
+            # Loss is on receiver ingress, so every local send still succeeds.
+            # Pure ACKs remain usable across the same delayed path.
+            drops.append(make_netns_ingress_payload_drop_probe(vm, namespace, device, [{
+                "src_addr": dst, "dst_addr": src, "src_port": dport, "dst_port": sport,
+                "payload": payload, "comment": "payload_blackout",
+            }]))
+        for probe, src, dst, sport, dport in (
+            (probes[0], NS_ADDR_A, NS_ADDR_B, PORTS_A[0], PORTS_B[0]),
+            (probes[1], NS_ADDR_B, NS_ADDR_A, PORTS_B[0], PORTS_A[0]),
+        ):
+            senders.append(spawn_netns_scenario(vm, probe.namespace, "liveness_window", {
+                "family": probe.family, "table_name": probe.table_name,
+                "chain_name": probe.chain_name, "bind_addr": src, "bind_port": sport,
+                "target_addr": dst, "target_port": dport, "payload": payload,
+                "duration_sec": 6.5, "period_ms": 100,
+            }))
+        for sender in senders:
+            result = sender.communicate(timeout=20)
+            assert_completed(result, "active payload blackout sender")
+            observed = parse_guest_json(result.stdout, "payload blackout sender")
+            assert observed["sent"] >= 20, observed
+            assert observed["max_send_gap_sec"] < 1, observed
+            assert observed["after"]["packets"]["pure_ipv4_ack"] - observed["before"]["packets"]["pure_ipv4_ack"] >= 3, observed
+        after = read_module_stats(vm)
+        assert after["flows_current"] == before["flows_current"] == 2
+        for name in ("flows_created", "flows_established", "established_liveness_timeouts", "rst_sent"):
+            assert after[name] == before[name], (name, before, after)
+        # Remove delayed packets before opening fresh recovery sockets, while
+        # ingress loss still prevents a trailing sender packet from arriving.
+        for namespace, device in ((NS_A, VETH_A), (NS_B, VETH_B)):
+            run_in_netns(vm, namespace, ["tc", "qdisc", "del", "dev", device, "root"])
+        for drop in drops:
+            assert drop.packets(vm, "payload_blackout") >= 20
+            drop.cleanup(vm)
+        drops.clear()
+        # A new application exchange must use the same two established flows.
+        with _liveness_echo_pair(vm, count=1):
+            pass
+        recovered = read_module_stats(vm)
+        assert recovered["flows_created"] == before["flows_created"]
+        assert recovered["flows_established"] == before["flows_established"]
+    finally:
+        for sender in senders:
+            if sender.proc.poll() is None:
+                sender.terminate()
+        for probe in probes + drops:
+            probe.cleanup(vm)
         cleanup_netns_topology(vm)

@@ -262,13 +262,13 @@ in
     keepaliveIntervalSec = mkOption {
       type = nullableIntType;
       default = null;
-      description = "Positive transmit-idle interval in seconds before a keepalive ACK; accepted inbound traffic does not postpone it. Null uses the kernel default.";
+      description = "Positive periodic keepalive ACK interval in seconds, independent of accepted RX and ordinary/control TX. Null uses the kernel default.";
     };
 
     keepaliveMisses = mkOption {
       type = nullableIntType;
       default = null;
-      description = "Positive response intervals after the first probe opportunity; teardown follows (keepaliveMisses + 1) * keepaliveIntervalSec of inbound silence. Null uses the kernel default.";
+      description = "Positive inbound-silence interval budget; teardown follows max(2, keepaliveMisses) * keepaliveIntervalSec. Null uses the kernel default.";
     };
 
     hardIdleTimeoutSec = mkOption {

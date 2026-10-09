@@ -486,23 +486,24 @@ Behavior:
 - that immediate payload `ACK` may be skipped only when this endpoint sent established fake-TCP payload data on the same flow within the fixed 250 ms suppression window
 - reserved first-payload control drops still send the immediate pure `ACK`; they are not eligible for suppression
 - receive-only flows and flows outside that window keep the previous immediate pure-`ACK` behavior
-- after `keepalive_interval_sec` without successful nonterminal flow output: send pure `ACK` keepalive; accepted RX never postpones this independent transmit-idle schedule
-- every successful flow-associated SYN, SYN|ACK, handshake retry, shaping control, pure ACK, or application payload (including queued/final-ACK payload and cached-route output) postpones the next probe by one interval; local output acceptance is not peer acknowledgement
-- GC collects due candidates with a temporary reference, then rechecks state and deadline under the flow lock before reserving `now + interval`; output runs outside bucket/flow locks, failed attempts keep the reservation, and successful completion advances it again using time sampled under the lock
-- the deadline uses 64-bit jiffies, with no catch-up bursts after delayed work; output completing after death and terminal RST output never reschedule the generation
+- every `keepalive_interval_sec`: send a periodic pure `ACK` keepalive, independently of accepted RX and successful ordinary/control TX; local output acceptance is not peer acknowledgement
+- GC collects due candidates with a temporary reference, then rechecks state and deadline under the flow lock before reserving `now + interval`; output runs outside bucket/flow locks and both failed and successful attempts keep the reservation
+- only probe attempt reservation advances the 64-bit deadline during a flow phase; delayed work does not create catch-up bursts, and output completing after death never reschedules the generation
 - the separate 250 ms payload-ACK suppression marker and existing hard-idle activity updates remain unchanged; keepalive attempts do not refresh hard-idle activity or inbound liveness
-- after `(keepalive_misses + 1) * keepalive_interval_sec` without valid inbound traffic: send a best-effort `RST` if the stored route/source identity can still transmit, then destroy local state
+- after `max(2, keepalive_misses) * keepalive_interval_sec` without valid inbound traffic: send a best-effort `RST` if the stored route/source identity can still transmit, then destroy local state
   - if RST emission fails, destroy local state silently
   - if one outbound UDP skb is already queued, create fresh `SYN_SENT`, carry that skb, send `SYN`
   - otherwise wait for future outbound UDP
 
-`keepalive_misses` counts nominal response intervals after the first probe
-opportunity, not actual unanswered packets. A value of 1 is supported and gives
-two intervals of inbound silence, leaving a full nominal response interval
-after the first probe is due. GC runs at `min(30 seconds, interval / 2)` (at
-least one jiffy); scheduling delay and RTT still consume that response window.
-The complete silence timeout is validated against the signed jiffies range
-before multiplication, including the extra interval. Hard-idle expiry retains
+`keepalive_misses` sets an inbound-silence interval budget, not a count of
+actual unanswered packets. Values of 1 and 2 both give two intervals of
+inbound silence, leaving a full nominal response interval after the first
+probe is due. The default interval of 30 seconds and budget of 3 give a
+90-second timeout. GC runs at `min(30 seconds, interval / 2)` (at least one
+jiffy); scheduling delay and RTT still consume the response window.
+The complete silence timeout uses the same minimum-two factor in validation
+and construction and is checked against the signed jiffies range before
+multiplication. Hard-idle expiry retains
 precedence and is silent. Both endpoints must use independent scheduling for
 healthy idle survival: new probes can still suppress an older peer's
 inbound-driven schedule. Pure ACKs are not answered merely to sustain liveness.
@@ -570,7 +571,7 @@ Behavior:
 - accepted inbound packet refreshes liveness suspicion
 - accepted inbound payload normally sends an immediate pure `ACK`
 - that immediate payload `ACK` may be skipped only when this endpoint sent established fake-TCP payload data on the same flow within the fixed 250 ms suppression window
-- reserved shaping-control drops, including raced final ACKs and subsequent duplicates, still send the immediate pure `ACK`; they are not eligible for suppression and successful output advances the independent keepalive deadline
+- reserved shaping-control drops, including raced final ACKs and subsequent duplicates, still send the immediate pure `ACK`; they are not eligible for suppression and never postpone periodic keepalives
 - receive-only flows and flows outside that window keep the previous immediate pure-`ACK` behavior
 - if a payload-bearing final `ACK` transitions the responder to established and also flushes queued responder UDP first, the flushed data can carry the pre-payload `ack`; suppressing the follow-up pure `ACK` briefly leaves that acknowledgement lagging until later traffic because the protocol has no data retransmit
 - keepalive, liveness failure, and hard idle teardown use the same policy as initiator-established flows

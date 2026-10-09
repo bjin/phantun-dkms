@@ -179,12 +179,12 @@ def test_module_rejects_oversized_second_timer_param(phantun_module, vm):
         vm.run(["rm", "-f", "/etc/modprobe.d/phantun.conf"])
 
 
-@pytest.mark.parametrize("misses,accepted", [(1, True), (2, False), (4294967295, False)])
+@pytest.mark.parametrize("misses,accepted", [(1, True), (2, True), (3, False), (4294967295, False)])
 def test_keepalive_silence_timeout_signed_range(phantun_module, vm, misses, accepted):
     # A valid uint millisecond value with its sign bit set converts to
     # MAX_JIFFY_OFFSET == (LONG_MAX >> 1) - 1 on supported kernels. Two such
     # intervals fit; three do not, on both 32-bit and 64-bit kernels. UINT_MAX
-    # also checks that adding the first interval cannot wrap the miss count.
+    # also checks that the effective silence budget cannot overflow.
     phantun_module.unload()
     vm.run(
         "echo 'options phantun managed_local_ports=1234 "

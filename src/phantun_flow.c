@@ -156,7 +156,7 @@ static int pht_flow_retransmit_now(struct pht_flow *flow) {
 
     ret = pht_emit_fake_tcp(flow->table->net, &ep, seq, ack, flags, NULL, 0, &meta, &ifindex);
     if (!ret)
-        pht_flow_note_output(flow, ifindex);
+        pht_flow_set_egress_ifindex(flow, ifindex);
     return ret;
 }
 
@@ -431,7 +431,7 @@ int pht_flow_table_init(struct pht_flow_table *table, struct net *net,
     if (table->idle_ack_suppression_window_jiffies == 0)
         table->idle_ack_suppression_window_jiffies = 1;
     table->liveness_timeout_jiffies =
-        table->keepalive_interval_jiffies * ((u64)cfg->keepalive_misses + 1);
+        table->keepalive_interval_jiffies * max_t(u64, 2, cfg->keepalive_misses);
     table->hard_idle_timeout_jiffies = msecs_to_jiffies(cfg->hard_idle_timeout_sec * 1000U);
     table->half_open_limit = cfg->half_open_limit;
     table->half_open_remote_limit =
@@ -566,8 +566,8 @@ static bool pht_flow_gc_detach_expired(struct pht_flow_table *table, struct list
 }
 
 /* Keepalive candidates are collected under bucket locks with a temporary ref,
- * then transmitted here without bucket/flow locks. Recheck the deadline in case
- * concurrent output postponed it, and reserve an interval even if output fails.
+ * then transmitted here without bucket/flow locks. Recheck state and deadline
+ * before reserving an interval even if output fails; ordinary TX never delays it.
  * The ACK seq is sampled under flow->lock rather than tx_lock; a concurrent
  * transmit rollback is benign because keepalives are pure ACKs with no payload.
  */
@@ -602,7 +602,7 @@ static void pht_flow_emit_keepalives(struct pht_flow_table *table, struct list_h
             ret = pht_emit_fake_tcp(table->net, &ep, seq, ack, PHT_TCP_FLAG_ACK, NULL, 0, &meta,
                                     &ifindex);
             if (!ret)
-                pht_flow_note_output(flow, ifindex);
+                pht_flow_set_egress_ifindex(flow, ifindex);
         }
 
         pht_flow_put(flow);
@@ -1277,13 +1277,8 @@ void pht_flow_set_egress_ifindex(struct pht_flow *flow, int ifindex) {
         return;
 
     spin_lock_bh(&flow->lock);
-    flow->egress_ifindex = ifindex;
-    spin_unlock_bh(&flow->lock);
-}
-
-void pht_flow_note_output(struct pht_flow *flow, int ifindex) {
-    spin_lock_bh(&flow->lock);
-    pht_flow_note_output_locked(flow, ifindex);
+    if (flow->state != PHT_FLOW_STATE_DEAD)
+        flow->egress_ifindex = ifindex;
     spin_unlock_bh(&flow->lock);
 }
 

@@ -270,8 +270,8 @@ Validation rules:
 | `handshake_response` | empty | Optional responder payload; effective only when `handshake_request` is also set. |
 | `handshake_timeout_ms` | `1000` | Handshake retransmit timeout. |
 | `handshake_retries` | `6` | Maximum handshake retry count before `RST` teardown. |
-| `keepalive_interval_sec` | `30` | Transmit-idle interval before a keepalive ACK. Successful nonterminal output postpones it; inbound traffic does not. |
-| `keepalive_misses` | `3` | Positive number of response intervals after the first probe opportunity. Teardown follows `(keepalive_misses + 1) * keepalive_interval_sec` of inbound silence, not a count of unanswered packets. |
+| `keepalive_interval_sec` | `30` | Periodic keepalive ACK interval, independent of accepted RX and ordinary/control TX. |
+| `keepalive_misses` | `3` | Positive inbound-silence interval budget. Teardown follows `max(2, keepalive_misses) * keepalive_interval_sec`, not a count of unanswered packets. |
 | `hard_idle_timeout_sec` | `300` | Hard upper bound for idle flow lifetime. |
 | `reopen_guard_bytes` | `4194304` | Minimum sequence-space distance before reopening same tuple; accepts `0..1073741823` and rejects values `>= 1073741824`. |
 | `half_open_limit` | `4096` | Total admitted half-open ceiling `L` per network namespace, shared by families/selectors. Reserve `R = max(1, floor(L / 4))` for local-origin handshakes when `L > 1`, otherwise `R = 0`. Remote-origin flows are capped at `L - R`; local opens may use all unused total capacity. A simultaneous-open role change retains its local-origin charge. Establishment or teardown releases the slot. |
@@ -287,17 +287,18 @@ Duplicate current openers retransmit the same SYNACK. A different SYN in
 retry to create a fresh responder without being quarantined by arrival-order
 inference. Stale ACK/data does not restart the original retry budget/deadline.
 
-Both endpoints independently send keepalives, including when receiving the
-peer's pure ACKs. Upgrade **both endpoints** for healthy idle survival; an older
-inbound-driven peer can still suppress its own probes. Successful local output
-does not prove peer delivery and never refreshes inbound liveness. Failed
+Both endpoints independently send periodic keepalives, even while receiving
+pure ACKs or successfully transmitting application/control packets. Upgrade
+**both endpoints** for healthy idle survival; an older inbound-driven peer can
+still suppress its own probes. Successful local output does not prove peer
+delivery and never refreshes inbound liveness or postpones probes. Failed
 keepalive sends are paced at one attempt per interval, not retried every GC scan.
 The 250 ms payload-ACK suppression optimization is separate.
 
 `keepalive_misses=1` is supported: the silence timeout is two intervals, allowing
 one nominal response interval after the first probe opportunity. GC delay and
 network latency consume that margin, so choose larger values for noisy or
-high-latency paths. Defaults give a 120-second inbound-silence timeout.
+high-latency paths. Defaults give a 90-second inbound-silence timeout.
 Seconds-based timers must fit their millisecond conversion, and the complete
 silence timeout must fit the kernel's signed jiffies range. Hard-idle expiry
 still takes precedence and tears down silently.

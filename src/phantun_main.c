@@ -635,8 +635,8 @@ static int phantun_send_established_udp(struct pht_flow *flow, const struct pht_
         spin_lock_bh(&flow->lock);
         if (flow->state == PHT_FLOW_STATE_ESTABLISHED) {
             flow->last_activity_jiffies = jiffies;
-            flow->last_established_payload_tx_jiffies =
-                pht_flow_note_output_locked(flow, ifindex);
+            flow->last_established_payload_tx_jiffies = get_jiffies_64();
+            flow->egress_ifindex = ifindex;
             if (persist_meta && meta)
                 flow->local_tx_meta = *meta;
         }
@@ -709,7 +709,7 @@ static int phantun_send_synack(struct pht_flow *flow, struct net *net,
     ret = pht_emit_fake_tcp(net, &ep, seq, ack, PHT_TCP_FLAG_SYN | PHT_TCP_FLAG_ACK, NULL, 0, &meta,
                             &ifindex);
     if (!ret)
-        pht_flow_note_output(flow, ifindex);
+        pht_flow_set_egress_ifindex(flow, ifindex);
     return ret;
 }
 
@@ -751,7 +751,7 @@ static int phantun_send_handshake_request(struct pht_flow *flow, struct net *net
         spin_lock_bh(&flow->lock);
         if (flow->state != PHT_FLOW_STATE_DEAD) {
             flow->last_activity_jiffies = jiffies;
-            pht_flow_note_output_locked(flow, ifindex);
+            flow->egress_ifindex = ifindex;
         }
         spin_unlock_bh(&flow->lock);
         pht_stats_inc(PHT_STAT_REQUEST_PAYLOADS_INJECTED);
@@ -783,7 +783,7 @@ static int phantun_send_handshake_response(struct pht_flow *flow, struct net *ne
         spin_lock_bh(&flow->lock);
         if (flow->state != PHT_FLOW_STATE_DEAD) {
             flow->last_activity_jiffies = jiffies;
-            pht_flow_note_output_locked(flow, ifindex);
+            flow->egress_ifindex = ifindex;
         }
         spin_unlock_bh(&flow->lock);
         pht_stats_inc(PHT_STAT_RESPONSE_PAYLOADS_INJECTED);
@@ -812,7 +812,7 @@ static int phantun_send_idle_ack(struct pht_flow *flow, struct net *net,
         spin_lock_bh(&flow->lock);
         if (flow->state != PHT_FLOW_STATE_DEAD) {
             flow->last_activity_jiffies = jiffies;
-            pht_flow_note_output_locked(flow, ifindex);
+            flow->egress_ifindex = ifindex;
         }
         spin_unlock_bh(&flow->lock);
     }
@@ -1252,7 +1252,7 @@ static struct sk_buff *phantun_local_out_open_initiator(const struct phantun_loc
     ret = pht_emit_fake_tcp(ctx->net, &ctx->ep, init_seq, 0, PHT_TCP_FLAG_SYN, NULL, 0,
                             &ctx->tx_meta, &ifindex);
     if (!ret) {
-        pht_flow_note_output(new_flow, ifindex);
+        pht_flow_set_egress_ifindex(new_flow, ifindex);
     } else {
         pht_pr_warn("failed to emit fake-TCP SYN: %d\n", ret);
         /* Transient local drops leave the SYN to the handshake retransmit timer. */

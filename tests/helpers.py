@@ -354,8 +354,8 @@ def load_managed_module(phantun_module, **kwargs):
 
 
 def load_fast_liveness_module(phantun_module, **kwargs):
-    # 1s interval plus 2 response intervals: inbound silence loses liveness
-    # after about 3s, so recovery tests can force teardown/replacement quickly.
+    # 1s interval * 2 misses: inbound silence loses liveness after about 2s,
+    # so recovery tests can force teardown/replacement quickly.
     load_managed_module(
         phantun_module,
         keepalive_interval_sec=1,
