@@ -98,7 +98,7 @@ Test modules are grouped by the behavior under test, not by address family; IPv6
 | `tests/test_handshake_shaping.py` | `handshake_request` / `handshake_response` injection, persistent reserved-slot replay suppression, mandatory control ACKs, responder queue hold/release (including opening application replay delivery without release), loss, and exact half-space disarm |
 | `tests/test_emit_failures.py` | Local fake-TCP send failures (drops on the sender's `OUTPUT`) in each handshake and established state |
 | `tests/test_liveness.py` | Healthy idle survival, independent keepalive scheduling, successful/failed output pacing, inbound-loss timeout and reinitiation, idle-ACK suppression |
-| `tests/test_replacement.py` | Simultaneous-open collisions, generation replacement and replacement protection, quarantine, half-open replacement queue/admission ownership and bounded retry lifetime, retired-record eviction |
+| `tests/test_replacement.py` | Simultaneous-open collisions, established generation replacement and protection, quarantine, reordered opener retry and data recovery, retired-record eviction |
 | `tests/test_inbound_validation.py` | Inbound flag, ACK, and sequence validation; wrong-final-ACK retention followed by valid completion; unknown-tuple RSTs |
 | `tests/test_wireguard.py` | End-to-end kernel WireGuard over IPv4 and IPv6 underlays, endpoint roaming, TIME_WAIT ACK metadata |
 

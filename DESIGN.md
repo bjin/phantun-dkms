@@ -330,23 +330,13 @@ If an established flow accepts a valid bare replacement `SYN` on the same tuple:
 
 Purpose: avoid poisoning recovery with delayed old-generation packets just after tuple reuse.
 
-A different aligned bare `SYN` may also replace a `SYN_RCVD` generation.
-This uses the atomic half-open handoff described below: it cannot replace a
-concurrently completed generation or release/reacquire admission capacity.
-The new generation inherits the queued skb and its packet metadata, persistent
-local transmit policy, remaining retry budget and next retry deadline, and
-activity/inbound timestamps. Its immediate `SYN|ACK` uses reply-scoped metadata;
-successful output updates only the normal transmit-probe schedule.
-
-For this half-open replacement, quarantine also remembers the exact previous
-bare opener ISN. That opener is silently dropped until the non-sliding
-quarantine deadline, including after the new handshake completes, preventing
-delayed opener bounce-back. The identical **current** opener always remains
-eligible for retransmission of the same `SYN|ACK`. Only the immediately previous
-generation is remembered; neither stale traffic nor duplicate openers refresh
-the quarantine or handshake retry deadline. Each accepted different opener
-replaces that one quarantine record, but never restarts the original half-open
-retry lifetime.
+A different bare `SYN` in `SYN_RCVD` is rejected with `RST` and removes the
+half-open flow; it does not replace it or quarantine the previous opener.
+A useful opener can retry to create a fresh responder and complete normally.
+Arrival order and random ISN magnitude do not identify generation age.
+Identical current openers still retransmit the same `SYN|ACK`.
+Bare `SYN` packets are exempt from previous-generation quarantine and use the
+state-specific duplicate/replacement rules instead.
 
 Established initiator flows also arm a non-sliding bare-`SYN` replacement protection deadline when the `SYN_SENT` handshake accepts a clean `SYN|ACK`.
 During that deadline, a bare aligned replacement `SYN` is silently dropped before generic replacement handling.
@@ -549,15 +539,12 @@ Accepts while half-open:
 
 - duplicate inbound bare `SYN` retransmit → resend `SYN|ACK`
 - valid final `ACK`
-- different aligned bare `SYN` outside previous-opener quarantine → atomically replace the half-open generation, inheriting admission, queue/metadata and remaining lifetime
 - ordinary ACK-shaped traffic that does not carry the exact final acknowledgement → silently ignore, without establishing, emitting `RST`, or refreshing retries/activity/liveness
 
 Exact valid completion is checked first; previous-generation quarantine then
 takes precedence over generic stray-ACK tolerance. Malformed flags and
-misaligned `SYN` retain rejection, and known-tuple `RST` retains its existing
-teardown/quarantine policy. Allocation or `-EAGAIN` from replacement leaves the
-old flow, admission token, metadata and queue untouched; a subsequent opener
-can retry the transaction. No detach/reinsert fallback is used.
+different or misaligned `SYN` retain rejection/removal, and known-tuple `RST`
+retains its existing teardown/quarantine policy.
 
 On valid final `ACK`:
 

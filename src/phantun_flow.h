@@ -194,10 +194,6 @@ struct pht_flow {
     bool response_pending_ack;
     bool retransmit_armed;
     bool quarantine_prev_active;
-    /* Half-open replacement also quarantines the exact previous bare SYN:
-     * its ISN is quarantine_prev_remote_seq_start, not a payload-only edge.
-     */
-    bool quarantine_prev_opener;
     bool replacement_protect_active;
     /* Protected by table->half_open_lock, not inferred from state or role. */
     enum pht_half_open_origin half_open_origin;

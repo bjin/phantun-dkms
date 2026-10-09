@@ -424,20 +424,12 @@ static bool phantun_flow_matches_current_generation_locked(const struct pht_flow
 static bool phantun_flow_should_drop_quarantined_packet_locked(struct pht_flow *flow,
                                                                const struct pht_l4_view *view) {
     lockdep_assert_held(&flow->lock);
-    if (!flow->quarantine_prev_active)
+    if (phantun_tcp_is_bare_syn(view) || !flow->quarantine_prev_active)
         return false;
     if (time_after_eq(jiffies, flow->quarantine_until_jiffies)) {
         flow->quarantine_prev_active = false;
         return false;
     }
-    /* Half-open replacement remembers the previous bare opener as well.
-     * Never suppress a retransmission of the current opener, including after
-     * completion. Neither match slides the quarantine deadline.
-     */
-    if (phantun_tcp_is_bare_syn(view))
-        return flow->quarantine_prev_opener &&
-               ntohl(view->tcp->seq) + 1 != flow->peer_syn_next &&
-               ntohl(view->tcp->seq) == flow->quarantine_prev_remote_seq_start;
     if (!phantun_flow_matches_quarantine_locked(flow, view))
         return false;
     if (flow->state == PHT_FLOW_STATE_ESTABLISHED &&
@@ -450,7 +442,7 @@ static bool phantun_flow_should_drop_quarantined_packet(struct pht_flow *flow,
                                                         const struct pht_l4_view *view) {
     bool drop;
 
-    if (!flow || !view)
+    if (!flow || !view || phantun_tcp_is_bare_syn(view))
         return false;
     spin_lock_bh(&flow->lock);
     drop = phantun_flow_should_drop_quarantined_packet_locked(flow, view);
@@ -1968,40 +1960,6 @@ phantun_pre_routing_complete_responder(const struct phantun_pre_routing_ctx *ctx
     phantun_pre_routing_deliver(ctx, flow, !drop_open_payload, "responder open payload");
 }
 
-/* A different aligned opener may recover a peer that restarted mid-handshake.
- * The old half-open's ISNs are immutable; the publication transaction checks
- * that it is still SYN_RCVD before transferring its token, queue and deadlines.
- */
-static void phantun_pre_routing_replace_responder(const struct phantun_pre_routing_ctx *ctx,
-                                                  struct pht_flow *flow,
-                                                  const struct phantun_pre_routing_snapshot *snap) {
-    struct pht_flow *new_flow;
-    int ret;
-
-    new_flow = phantun_pre_routing_new_responder(ctx);
-    if (IS_ERR(new_flow))
-        return;
-
-    phantun_flow_arm_prev_generation_quarantine(new_flow, snap->local_isn,
-                                                snap->local_isn + 1, snap->peer_syn_next - 1,
-                                                snap->peer_syn_next);
-    /* Unpublished and exclusively owned until replace_half_open succeeds. */
-    new_flow->quarantine_prev_opener = true;
-    ret = pht_flow_replace_half_open(ctx->flows, flow, new_flow, PHT_FLOW_STATE_SYN_RCVD);
-    if (ret) {
-        pht_flow_put(new_flow);
-        return;
-    }
-
-    ret = phantun_send_synack(new_flow, ctx->net, &ctx->tx_meta);
-    if (ret) {
-        pht_pr_warn("failed to emit SYN|ACK after half-open replacement: %d\n", ret);
-        if (!phantun_io_error_is_transient(ret))
-            pht_flow_detach(new_flow);
-    }
-    pht_flow_put(new_flow);
-}
-
 /* Responder half-open state: duplicate SYN retransmits SYN|ACK, and only
  * the exact final ACK can complete the handshake.
  */
@@ -2029,11 +1987,6 @@ static void phantun_pre_routing_syn_rcvd(const struct phantun_pre_routing_ctx *c
 
     if (phantun_tcp_is_established_ack(view))
         return;
-
-    if (phantun_tcp_is_bare_syn(view) && phantun_tcp_syn_is_aligned(view)) {
-        phantun_pre_routing_replace_responder(ctx, flow, snap);
-        return;
-    }
 
     if (phantun_tcp_is_bare_syn(view) && !phantun_tcp_syn_is_aligned(view)) {
         phantun_account_tcp_misaligned_syn_rejected();
