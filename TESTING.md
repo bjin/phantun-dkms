@@ -95,7 +95,7 @@ Test modules are grouped by the behavior under test, not by address family; IPv6
 | `tests/test_metadata_routing.py` | Mark, DSCP, traffic class, UID, and oif propagation to fake TCP and route-cache keying |
 | `tests/test_topology.py` | Secondary, deprecated, and link-local addresses; route changes, device down, and address removal |
 | `tests/test_handshake_half_open.py` | SYN and SYN\|ACK loss retries, retry exhaustion, half-open limits, `SYN_SENT` queueing |
-| `tests/test_handshake_shaping.py` | `handshake_request` / `handshake_response` injection, hiding from UDP apps, loss, and reserved sequence slots |
+| `tests/test_handshake_shaping.py` | `handshake_request` / `handshake_response` injection, persistent reserved-slot replay suppression, mandatory control ACKs, responder queue hold/release (including opening application replay delivery without release), loss, and exact half-space disarm |
 | `tests/test_emit_failures.py` | Local fake-TCP send failures (drops on the sender's `OUTPUT`) in each handshake and established state |
 | `tests/test_liveness.py` | Healthy idle survival, independent keepalive scheduling, successful/failed output pacing, inbound-loss timeout and reinitiation, idle-ACK suppression |
 | `tests/test_replacement.py` | Simultaneous-open collisions, generation replacement and replacement protection, quarantine, retired-record eviction |

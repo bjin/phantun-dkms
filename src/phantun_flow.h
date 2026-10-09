@@ -63,7 +63,7 @@ struct pht_flow_handshake_complete_args {
     u32 remote_payload_seq;
     size_t remote_payload_len;
     size_t local_control_len;
-    bool arm_drop_next_rx_payload;
+    bool reserve_shaping_rx_slot;
     bool response_pending_ack;
 };
 
@@ -91,7 +91,7 @@ struct pht_flow {
     /*
      * lock protects mutable protocol state: state/seq/ack tracking, rolling
      * sequence-window lower edges, persistent local-outbound transmit policy
-     * metadata, the per-generation fake-TCP dst cache, quarantine/drop-next
+     * metadata, the per-generation fake-TCP dst cache, quarantine/reserved
      * shaping flags, replacement-protection deadline, the one-skb queue, retry
      * counters, timestamps, and retransmit bookkeeping.
      *
@@ -176,18 +176,20 @@ struct pht_flow {
      * for best-effort invalidation when that device goes away.
      */
     int egress_ifindex;
-    /* Optional first-payload shaping state. drop_next_rx_* arms a one-shot
-     * reserved inbound payload sequence and is cleared as soon as that payload
-     * is suppressed. opening_rx_* marks the exact payload carried by the
-     * winning responder final ACK so stale SYN_RCVD snapshots cannot reinject
-     * the same skb while the winner is still finalizing it. response_pending_ack
-     * blocks responder-owned local UDP until the injected response is ACKed or
-     * bypassed by later initiator traffic.
+    /* Optional first-payload shaping state. reserved_shaping_rx_* identifies
+     * every control payload at the reserved sequence until acknowledged
+     * progress reaches the signed half-space boundary. opening_rx_* marks the
+     * exact payload carried by the winning responder final ACK so stale
+     * SYN_RCVD snapshots cannot reinject it while the winner finalizes it.
+     * Exact opening matches are also excluded from queue-release evidence in
+     * ordinary established dispatch, without suppressing application delivery.
+     * response_pending_ack blocks responder-owned local UDP until the injected
+     * response is ACKed or bypassed by later non-control, non-opening payload.
      */
-    u32 drop_next_rx_seq;
+    u32 reserved_shaping_rx_seq;
     u32 opening_rx_seq_start;
     u32 opening_rx_seq_end;
-    bool drop_next_rx_payload;
+    bool reserved_shaping_rx_active;
     bool opening_rx_payload_claimed;
     bool response_pending_ack;
     bool retransmit_armed;

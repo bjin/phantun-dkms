@@ -440,7 +440,7 @@ can increment both an aggregate and a more specific reason counter:
 | **Shaping and control payloads** | |
 | `request_payloads_injected` | `handshake_request` payloads injected by the module. |
 | `response_payloads_injected` | `handshake_response` payloads injected by the module. |
-| `shaping_payloads_dropped` | Reserved first-payload slots hidden from the UDP app by handshake shaping. |
+| `shaping_payloads_dropped` | Control packets hidden from UDP at a reserved shaping sequence; each suppressed duplicate is counted separately. |
 | **RST and UDP packet accounting** | |
 | `rst_sent` | Fake-TCP RST packets successfully sent. A RST is often a reaction to a rejection or teardown; use the rejection/drop counters to tell why it was sent. |
 | `idle_acks_suppressed` | Immediate pure ACKs skipped for inbound established payloads because the flow recently sent local UDP payload within the short idle-ACK suppression window. |
@@ -477,8 +477,8 @@ can increment both an aggregate and a more specific reason counter:
 - Mixed **Phantun** / **`phantun-dkms`** deployments are **untested** and should be treated as **likely non-seamless**.
 - **No FIN close state machine**.
 - This is a **kernel-to-kernel protocol variant** in practice, even though the basic packet shape stays close to Phantun.
-- First payloads reserved for shaping may be intentionally hidden from the UDP application.
-- Missing, delayed, duplicated, or lost shaping payloads do not by themselves fail the connection.
+- Shaping controls are hidden from UDP by their reserved starting sequence, not their bytes or arrival order. Every copy remains hidden until acknowledged receive progress advances at least 2^31 bytes past that sequence; wrapped application data then delivers normally.
+- Missing, delayed, duplicated, or lost shaping payloads do not by themselves fail the connection. A duplicate control or exact opening-payload replay cannot prematurely release queued responder UDP, but an ACK covering the response (even on a control or opening copy) or later real application data can release it. Ordinary established application duplicates remain deliverable; their delivery is separate from queue-release evidence.
 
 For protocol internals and state-machine details, see [**`DESIGN.md`**](./DESIGN.md).
 

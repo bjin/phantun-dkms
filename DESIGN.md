@@ -56,10 +56,12 @@ Rules:
 
 - `handshake_request` optionally occupies the initiator's first payload slot.
 - `handshake_response` optionally occupies the responder's first payload slot, but only when `handshake_request` is also configured.
-- The payload to ignore is identified by the **reserved lowest payload sequence number** for that flow generation, **not** by arrival order.
+- Every payload starting at the **reserved lowest payload sequence number** for that flow generation is suppressed, including duplicates of a request carried by the final ACK or a delayed response. Matching uses sequence, **not** arrival order or contents; suppression does not consume the slot.
 - The reserved-slot identity is bounded to the signed half-space of the receiver's acknowledged progress: once the receiver's `ack` has advanced **at least 2^31 bytes** past the reserved sequence, the slot is disarmed and a payload starting at that (wrapped) sequence is delivered as normal data. This bounds delayed-shaping suppression; suppression of control payloads delayed beyond half the sequence space is explicitly not promised.
 - Missing, delayed, duplicated, or reordered shaping payloads do **not** fail establishment by themselves.
 - Only payloads intentionally suppressed by shaping logic are hidden from the local UDP socket.
+- Each suppressed control packet, including duplicates, increments `shaping_payloads_dropped`. Ordinary application payloads are not deduplicated.
+- A suppressed request or exact opening-payload replay cannot release responder-owned queued UDP through the later-payload fallback, regardless of whether it races completion or arrives through ordinary established dispatch. An ACK covering the injected response still releases it even when that ACK carries a suppressed control or opening replay.
 
 Preferred happy path:
 
@@ -328,7 +330,7 @@ Each flow stores:
 - send sequence number
 - receive acknowledgement number
 - one queued UDP skb pointer
-- reserved first-payload ignore slot
+- persistent reserved first-payload shaping slot
 - responder control-response pending-ACK / pending-release flag
 - retransmit timer state, with expiry owned by the kernel timer itself
 - idle and inbound-liveness timestamps
@@ -339,12 +341,16 @@ Each flow stores:
 
 Established ACK/data processing has a locked preparation phase and an unlocked
 execution phase. The initial flow lock covers generation classification,
-quarantine, response-release and replay decisions, shaping-slot consumption,
+quarantine, shaping/opening-replay classification before response-release decisions,
 ACK/window progress, and liveness updates. A small stack action then selects
 ignore/quarantine, queue flush, payload delivery, or oversized rejection.
-Pure ACKs refresh liveness without advancing the payload ACK; replayed opening
-payloads do not refresh progress, and oversized delivery is rejected before
-ACK/liveness changes.
+Pure ACKs refresh liveness without advancing the payload ACK. Exact opening
+sequence-range matches are excluded from later-data queue-release evidence in
+both receive paths. Only raced opening application replays suppress delivery
+and progress; ordinary established application copies still deliver and refresh
+normal monotonic progress/liveness. Reserved shaping replays retain monotonic
+progress and mandatory ACKs. Oversized delivery is rejected before ACK/liveness
+changes.
 
 The hook retains its lookup reference across both phases. Handshake payload
 delivery rechecks `ESTABLISHED` when committing progress; an already committed
@@ -380,7 +386,7 @@ On valid `SYN|ACK`:
 - if `handshake_request` configured: send `ACK + handshake_request`
 - else if queued UDP exists: send `ACK + first queued UDP payload`
 - else: send pure final `ACK`
-- if both `handshake_request` and `handshake_response` configured: arm ignore slot for payload starting at `responder_seq + 1`
+- if both `handshake_request` and `handshake_response` configured: reserve the shaping slot for payload starting at `responder_seq + 1`, retained until half-space disarm
 - arm the non-sliding established-initiator replacement-protection deadline
 - transition immediately to `ESTABLISHED`
 
@@ -389,7 +395,7 @@ On valid `SYN|ACK`:
 Behavior:
 
 - if `handshake_request` was injected, flush initiator-owned queued UDP after that injected request
-- if responder first-payload ignore slot is armed, suppress only payload whose starting sequence matches reserved responder control sequence
+- while the responder shaping slot is active, suppress every payload whose starting sequence matches the reserved responder control sequence
 - later higher-sequence responder payloads deliver normally
 - normal UDP ↔ fake-TCP translation follows
 - accepted inbound packet refreshes liveness suspicion, including pure `ACK` and handshake-response acknowledgement traffic
@@ -454,12 +460,12 @@ Accepts while half-open:
 On valid final `ACK`:
 
 - advance local `seq` to `responder_seq + 1`
-- if `handshake_request` configured and final `ACK` already carries payload: suppress that payload immediately because it occupies reserved initiator first-payload sequence
-- if `handshake_request` configured and final `ACK` carries no payload: arm ignore slot for inbound payload starting at `initiator_seq + 1`
+- if `handshake_request` configured: reserve the inbound shaping slot at `initiator_seq + 1`, whether the final ACK is pure or carries payload
+- suppress final-ACK payload only when it starts at that reserved sequence; retain the slot for subsequent control copies until half-space disarm
 - if both shaping hints configured:
   - send `ACK + handshake_response`
   - advance `seq` by `handshake_response.len()`
-  - keep responder-owned queued UDP blocked until later initiator `ACK` covers injected response or later initiator traffic establishes reserved responder sequence was skipped
+  - keep responder-owned queued UDP blocked until a later initiator `ACK` covers the injected response (even on suppressed control), or later non-control, non-opening-replay payload bypasses the lost response
 - otherwise transition directly to `ESTABLISHED`
 
 #### `ESTABLISHED`
@@ -467,7 +473,7 @@ On valid final `ACK`:
 Behavior:
 
 - outbound UDP becomes `ACK + payload`
-- inbound fake-TCP payload becomes local UDP unless payload start sequence matches an armed ignore slot
+- inbound fake-TCP payload becomes local UDP unless its start sequence matches the active reserved shaping slot
 - payload larger than the translator's maximum supported UDP reinjection size is invalid and rejected with `RST|ACK`
 - `seq` grows by outbound payload length
 - `ack` tracks peer `seq + payload_len`
@@ -475,7 +481,7 @@ Behavior:
 - accepted inbound packet refreshes liveness suspicion
 - accepted inbound payload normally sends an immediate pure `ACK`
 - that immediate payload `ACK` may be skipped only when this endpoint sent established fake-TCP payload data on the same flow within the fixed 250 ms suppression window
-- reserved first-payload control drops still send the immediate pure `ACK`; they are not eligible for suppression
+- reserved shaping-control drops, including raced final ACKs and subsequent duplicates, still send the immediate pure `ACK`; they are not eligible for suppression and successful output advances the independent keepalive deadline
 - receive-only flows and flows outside that window keep the previous immediate pure-`ACK` behavior
 - if a payload-bearing final `ACK` transitions the responder to established and also flushes queued responder UDP first, the flushed data can carry the pre-payload `ack`; suppressing the follow-up pure `ACK` briefly leaves that acknowledgement lagging until later traffic because the protocol has no data retransmit
 - keepalive, liveness failure, and hard idle teardown use the same policy as initiator-established flows

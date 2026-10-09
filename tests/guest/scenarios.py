@@ -1150,7 +1150,9 @@ def capture_tcp_packet(config):
     if isinstance(expected_payload, str):
         expected_payload = expected_payload.encode()
 
-    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(eth_type)) as raw_sock:
+    # ETH_P_ALL taps sender output too, before a peer's netdev ingress drop.
+    protocol = 0x0003 if config.get("include_outgoing") else eth_type
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(protocol)) as raw_sock:
         raw_sock.settimeout(config.get("timeout_sec", TIMEOUT_SEC))
         if ready_file:
             Path(ready_file).write_text("ready\n")

@@ -1396,8 +1396,8 @@ pht_flow_complete_handshake(struct pht_flow *flow,
     flow->peer_syn_next = args->peer_syn_next;
     flow->local_seq_window_start = flow->local_isn;
     flow->remote_seq_window_start = args->peer_syn_next;
-    flow->drop_next_rx_seq = args->ack;
-    flow->drop_next_rx_payload = args->arm_drop_next_rx_payload;
+    flow->reserved_shaping_rx_seq = args->ack;
+    flow->reserved_shaping_rx_active = args->reserve_shaping_rx_slot;
     flow->opening_rx_payload_claimed = args->remote_payload_len > 0;
     if (flow->opening_rx_payload_claimed) {
         flow->opening_rx_seq_start = args->remote_payload_seq;
@@ -1418,12 +1418,9 @@ pht_flow_complete_handshake(struct pht_flow *flow,
         flow->replacement_protect_active = false;
     }
 
-    if (args->arm_drop_next_rx_payload && args->remote_payload_len > 0 &&
-        args->remote_payload_seq == args->ack) {
-        flow->drop_next_rx_payload = false;
-        flow->drop_next_rx_seq = 0;
+    if (args->reserve_shaping_rx_slot && args->remote_payload_len > 0 &&
+        args->remote_payload_seq == args->ack)
         drop_payload = true;
-    }
     spin_unlock_bh(&flow->lock);
 
     if (drop_open_payload)
