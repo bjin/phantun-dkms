@@ -53,17 +53,19 @@ EOF
 #include <linux/timer.h>
 #include <linux/module.h>
 
-struct my_struct {
-    struct timer_list my_timer;
+struct conftest_timer_owner {
+    struct timer_list timer;
 };
 
-static void my_timer_func(struct timer_list *t)
+static int conftest_timer_container_of(void)
 {
-    struct my_struct *my = NULL;
-    my = timer_container_of(my, t, my_timer);
-    (void)my;
+    struct timer_list *t = NULL;
+    struct conftest_timer_owner *owner = timer_container_of(owner, t, timer);
+
+    return owner != NULL;
 }
 
+module_init(conftest_timer_container_of);
 MODULE_LICENSE("GPL");
 EOF
 
@@ -71,6 +73,7 @@ EOF
       >"$conftest_dir/build.log" 2>&1; then
     ac_cv_have_timer_container_of=yes
   else
+    cat "$conftest_dir/build.log" >&5
     ac_cv_have_timer_container_of=no
   fi
 
@@ -175,12 +178,6 @@ AS_IF([test "x$ac_cv_have_timer_delete" = xyes], [
             [Define to 1 if timer_delete is available])
 ])
 
-AS_IF([test "x$ac_cv_have_ip_route_input_dscp" = xyes], [
-  AC_DEFINE(
-    [HAVE_IP_ROUTE_INPUT_DSCP], [1],
-    [Define to 1 if ip_route_input takes DSCP and works with ip4h_dscp()]
-  )
-])
 AC_CACHE_CHECK([whether kernel_bind takes struct sockaddr_unsized], [ac_cv_have_kernel_bind_sockaddr_unsized], [
   conftest_dir="$ac_pwd/conftest-kbuild-$$"
 
