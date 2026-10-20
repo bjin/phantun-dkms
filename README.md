@@ -146,6 +146,12 @@ Set `services.phantun.managedNetns = "all";` when the managed application intent
 The `nixpkgs.follows` line makes this module use the consumer flake's `nixpkgs` input instead of keeping a second transitive `nixpkgs` pinned by this repository.
 
 
+### Install on a stock OpenWrt router
+
+Follow the [OpenWrt installation guide](https://bjin.github.io/phantun-dkms-openwrt/).
+Currently, selected subtargets are supported on OpenWrt 25.12 and newer stable releases and recent snapshots. Your router's exact OpenWrt version, target/subtarget, and kernel must be listed on the installation page.
+To request support for another subtarget, follow the [target request instructions](https://github.com/bjin/phantun-dkms-openwrt#requesting-a-target): add it to `matrix.json` and open a pull request (PR), or open an issue naming your device and target.
+
 ### Simplest load: own one local UDP port
 
 ```bash
