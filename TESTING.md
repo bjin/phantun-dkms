@@ -84,7 +84,7 @@ Test modules are grouped by the behavior under test, not by address family; IPv6
 | Module | Covers |
 |---|---|
 | `tests/test_module_lifecycle.py` | Kernel-version sanity, DKMS-installed module load, unload, and reload |
-| `tests/test_configure_probes.py` | `configure` kbuild feature probes give the same `config.h` with `KCFLAGS=-Werror` (stand-in for `CONFIG_WERROR=y` kernels such as OpenWrt's) |
+| `tests/test_configure_probes.py` | `configure` kbuild feature probes give the same `config.h` with `KCFLAGS=-Werror` (stand-in for `CONFIG_WERROR=y` kernels such as OpenWrt's); warnings a probe-free module already raises under the test compiler are demoted |
 | `tests/test_module_params.py` | Load-time parameter parsing and rejection (shaping payload encodings and sizes, `reopen_guard_bytes`, timers, selectors, `managed_netns`) and derived settings such as auto `replacement_protect_ms` |
 | `tests/test_module_stats.py` | `/sys/module/phantun/stats/*` counters and `skb:kfree_skb` drop attribution |
 | `tests/test_port_reservation.py` | `reserved_local_ports` TCP reservations across selector modes, namespaces, and address families |
