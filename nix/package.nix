@@ -48,13 +48,14 @@ stdenv.mkDerivation {
   configureFlags = [ "--with-kernel=${kdir}" ];
   makeFlags = kernelModuleMakeFlags ++ [ "KDIR=${kdir}" ];
 
-  installPhase = ''
-    runHook preInstall
-
-    install -D -m 0644 phantun.ko "$out/lib/modules/${kernel.modDirVersion}/updates/phantun.ko"
-
-    runHook postInstall
-  '';
+  # Install through kbuild so the kernel's strip, signing (nixpkgs' kmodigest
+  # via kernelModuleMakeFlags, which also writes phantun.ko.cer), and
+  # compression steps run; NixOS's module aggregator requires the .cer.
+  installTargets = [ "modules_install" ];
+  installFlags = [
+    "INSTALL_MOD_PATH=${placeholder "out"}"
+    "INSTALL_MOD_DIR=updates"
+  ];
 
   meta = {
     description = "Kernel module re-implementation of phantun, transforming UDP streams into fake-TCP streams";
